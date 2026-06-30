@@ -19,6 +19,7 @@ import ccReviewExtension, {
   classifyCcReviewSummary,
   computeChecklistWindow,
   countCcReviewTaskOutcomesFromSummary,
+  createSubprocessStreamLogger,
   DEFAULT_MAX_REVIEW_REPAIR_ROUNDS,
   DEFAULT_TASK_TIMEOUT_MS,
   discoverAgent,
@@ -117,6 +118,78 @@ describe("formatSubprocessStreamLine turns structured CLI output into readable l
 
   it("keeps ordinary prose lines unchanged", () => {
     assert.equal(formatSubprocessStreamLine("exec /bin/zsh -lc \"git status\""), 'exec /bin/zsh -lc "git status"');
+  });
+
+  it("translates Codex JSONL work items into concrete activity", () => {
+    assert.equal(
+      formatSubprocessStreamLine(JSON.stringify({
+        type: "item.started",
+        item: { type: "command_execution", command: "/bin/zsh -lc 'npm test'", status: "in_progress" },
+      })),
+      "Running command: /bin/zsh -lc 'npm test'"
+    );
+    assert.equal(
+      formatSubprocessStreamLine(JSON.stringify({
+        type: "item.completed",
+        item: { type: "file_change", changes: [{ path: "src/app.ts" }, { path: "tests/app.test.ts" }] },
+      })),
+      "Updated 2 files: src/app.ts, tests/app.test.ts"
+    );
+    assert.equal(
+      formatSubprocessStreamLine(JSON.stringify({
+        type: "item.completed",
+        item: { type: "reasoning", text: "Checking the parser and its tests" },
+      })),
+      "Thinking: Checking the parser and its tests"
+    );
+  });
+
+  it("translates Claude stream-json tool and completion events", () => {
+    assert.equal(
+      formatSubprocessStreamLine(JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "src/app.ts" } }] },
+      })),
+      "Using tool: Read — src/app.ts"
+    );
+    assert.equal(
+      formatSubprocessStreamLine(JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 1250,
+        num_turns: 2,
+        result: "done",
+      })),
+      "Claude run completed (1.3s, 2 turns)"
+    );
+  });
+
+  it("hides unknown or malformed JSON rather than exposing raw provider payloads", () => {
+    assert.equal(formatSubprocessStreamLine('{"type":"future.provider.event","opaque":true}'), null);
+    assert.equal(formatSubprocessStreamLine('{"type":"item.started","item":'), null);
+  });
+});
+
+describe("createSubprocessStreamLogger buffers provider NDJSON across data chunks", () => {
+  it("does not expose a split JSON fragment and emits one readable event after the newline", () => {
+    const entries: any[] = [];
+    const logger = createSubprocessStreamLogger((entry) => entries.push(entry), "stdout", "planner");
+    logger.write('{"type":"item.started","item":{"type":"command_execution","command":"npm');
+    assert.deepEqual(entries, []);
+    logger.write(' test","status":"in_progress"}}\n');
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].message, "Running command: npm test");
+    assert.equal(entries[0].source, "planner");
+  });
+
+  it("flushes a final plain-text line without a trailing newline", () => {
+    const entries: any[] = [];
+    const logger = createSubprocessStreamLogger((entry) => entries.push(entry), "stderr", "reviewer");
+    logger.write("review completed");
+    assert.deepEqual(entries, []);
+    logger.flush();
+    assert.equal(entries[0].message, "review completed");
   });
 });
 
@@ -915,22 +988,30 @@ describe("resolvePlannerTimeoutMs / resolveReviewerTimeoutMs (P0-4: phase timeou
 });
 
 describe("resolveMaxReviewRepairRounds (P1-1: repair loop bound)", () => {
-  it("defaults to 2", () => {
+  it("defaults to 0 so re-review is opt-in", () => {
     assert.equal(resolveMaxReviewRepairRounds({}), DEFAULT_MAX_REVIEW_REPAIR_ROUNDS);
-    assert.equal(DEFAULT_MAX_REVIEW_REPAIR_ROUNDS, 2);
+    assert.equal(DEFAULT_MAX_REVIEW_REPAIR_ROUNDS, 0);
   });
 
   it("reads CC_REVIEW_MAX_REPAIR_ROUNDS", () => {
-    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "5" }), 5);
+    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "5" } }), 5);
   });
 
   it("0 disables the repair loop (hard-fail on first block)", () => {
-    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "0" }), 0);
+    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "0" } }), 0);
   });
 
   it("invalid values fall back to default", () => {
-    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "abc" }), 2);
-    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "-1" }), 2);
+    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "abc" } }), 0);
+    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "-1" } }), 0);
+    assert.equal(resolveMaxReviewRepairRounds({ flag: 1.5 }), 0);
+  });
+
+  it("explicit parameter overrides the environment", () => {
+    assert.equal(resolveMaxReviewRepairRounds({
+      flag: 2,
+      env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "5" },
+    }), 2);
   });
 });
 
@@ -1005,6 +1086,27 @@ describe("buildRepairFeedback (P1-1: reviewer-block repair feedback)", () => {
     );
     assert.match(feedback, /Post-fix validation failed: tests failed/);
   });
+
+  it("includes orchestrator verification failures in repair feedback", () => {
+    const feedback = buildRepairFeedback(
+      { verdict: "ship", summary: "reviewer fixed the findings", findings: [] },
+      "post_review_validation_failed",
+      [],
+      {
+        error: "Verification command failed: node tests/failing.test.mjs",
+        commands: [{
+          command: "node",
+          args: ["tests/failing.test.mjs"],
+          exitCode: 1,
+          stderr: "AssertionError: expected true",
+          timedOut: false,
+        }],
+      }
+    );
+    assert.match(feedback, /Orchestrator post-review validation failed/);
+    assert.match(feedback, /node tests\/failing\.test\.mjs: exit code 1/);
+    assert.match(feedback, /AssertionError: expected true/);
+  });
 });
 
 describe("CC Review Behavioral Regression Tests", () => {
@@ -1058,6 +1160,7 @@ describe("CC Review Behavioral Regression Tests", () => {
   const originalClaudeApiUrl = process.env.CLAUDE_API_URL;
   const originalCcReviewLogLevel = process.env.CC_REVIEW_LOG_LEVEL;
   const originalCcReviewMode = process.env.CC_REVIEW_MODE;
+  const originalCcReviewMaxRepairRounds = process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
 
   beforeEach(() => {
     tempTestDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-test-workspace-"));
@@ -1077,6 +1180,7 @@ describe("CC Review Behavioral Regression Tests", () => {
     delete process.env.CLAUDE_API_URL;
     delete process.env.CC_REVIEW_LOG_LEVEL;
     delete process.env.CC_REVIEW_MODE;
+    delete process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
     process.env.CODEX_API_KEY = "test-codex-review-key";
     process.env.ANTHROPIC_API_KEY = "test-claude-review-key";
     globalThis.fetch = originalFetch;
@@ -1104,6 +1208,8 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(registeredTool.parameters.properties.reviewProvider.type, "string");
     assert.equal(registeredTool.parameters.properties.logLevel.type, "string");
     assert.equal(registeredTool.parameters.properties.reviewMode.type, "string");
+    assert.equal(registeredTool.parameters.properties.reviewRepairRounds.type, "integer");
+    assert.equal(registeredTool.parameters.properties.reviewRepairRounds.minimum, 0);
     assert.equal(registeredTool.parameters.properties.reviewProvider.enum, undefined);
     assert.equal((piMock as any).codex_workflow, undefined);
     assert.equal((piMock as any).codexWorkflow, undefined);
@@ -1189,6 +1295,11 @@ describe("CC Review Behavioral Regression Tests", () => {
       delete process.env.CC_REVIEW_MODE;
     } else {
       process.env.CC_REVIEW_MODE = originalCcReviewMode;
+    }
+    if (originalCcReviewMaxRepairRounds === undefined) {
+      delete process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
+    } else {
+      process.env.CC_REVIEW_MAX_REPAIR_ROUNDS = originalCcReviewMaxRepairRounds;
     }
     globalThis.fetch = originalFetch;
     try {
@@ -2388,6 +2499,134 @@ describe("CC Review Behavioral Regression Tests", () => {
     }
   });
 
+  it("after-all review mode asks the reviewer to repair a block and then re-reviews", async () => {
+    const mockTasks = [
+      { title: "Integrated task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+    const reviewPrompts: string[] = [];
+    const blockedReview = `Review found issues\n${JSON.stringify({
+      verdict: "block",
+      summary: "Integration bug found",
+      findings: [{
+        priority: "P1",
+        confidence: 0.98,
+        message: "repair this integration bug",
+        status: "unfixed",
+        file: "src/integration.ts",
+        line: 12,
+      }],
+    })}`;
+
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      mockProc.autoReviewStdout = false;
+      process.nextTick(() => {
+        if (args.includes("-o")) {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+        } else {
+          reviewPrompts.push(args.at(-1) || "");
+          mockProc.stdout.emit(
+            "data",
+            Buffer.from(reviewPrompts.length === 1 ? blockedReview : REVIEW_SHIP_OUTPUT)
+          );
+        }
+        mockProc.emit("close", 0, null);
+      });
+      return mockProc;
+    };
+
+    let subagentCalls = 0;
+    mockSubagentHandler = async () => {
+      subagentCalls++;
+      return {
+        content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+        details: { results: [{ exitCode: 0 }] }
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-after-all-repair",
+      {
+        goal: "Build and repair the integrated workflow",
+        reviewMode: "after-all",
+        reviewRepairRounds: 2,
+      },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.status, "completed");
+    assert.equal(subagentCalls, 1, "planned task execution should not be repeated");
+    assert.equal(reviewPrompts.length, 2, "final review should run again after the repair request");
+    assert.match(reviewPrompts[1], /repair round 1\/2/);
+    assert.match(reviewPrompts[1], /\[P1\] src\/integration\.ts:12: repair this integration bug/);
+  });
+
+  it("after-all repair reruns failed orchestrator validation after the reviewer fixes it", async () => {
+    const mockTasks = [
+      { title: "Validated task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+    fs.writeFileSync(
+      path.join(tempTestDir, ".cc-review-validation.json"),
+      JSON.stringify({
+        commands: [{
+          command: process.execPath,
+          args: ["-e", "process.exit(require('node:fs').existsSync('fixed.flag') ? 0 : 1)"],
+          timeoutMs: 10_000,
+        }],
+      }),
+      "utf8"
+    );
+
+    const reviewPrompts: string[] = [];
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      mockProc.autoReviewStdout = false;
+      process.nextTick(() => {
+        if (args.includes("-o")) {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+        } else {
+          reviewPrompts.push(args.at(-1) || "");
+          if (reviewPrompts.length === 1) {
+            fs.writeFileSync(path.join(tempTestDir, "review-change.txt"), "first review changed the workspace", "utf8");
+          } else {
+            fs.writeFileSync(path.join(tempTestDir, "fixed.flag"), "fixed", "utf8");
+          }
+          mockProc.stdout.emit("data", Buffer.from(REVIEW_SHIP_OUTPUT));
+        }
+        mockProc.emit("close", 0, null);
+      });
+      return mockProc;
+    };
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    const result = await registeredTool.execute(
+      "tool-call-after-all-validation-repair",
+      {
+        goal: "Build a workflow with post-review verification",
+        reviewMode: "after-all",
+        reviewRepairRounds: 2,
+      },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.status, "completed");
+    assert.equal(reviewPrompts.length, 2);
+    assert.match(reviewPrompts[1], /Orchestrator post-review validation failed/);
+    assert.match(reviewPrompts[1], /Verification command failed/);
+    assert.ok(fs.existsSync(path.join(tempTestDir, "fixed.flag")));
+  });
+
   it("slash command forwards --review-mode after-all", async () => {
     const mockTasks = [
       { title: "Task 1", description: "Implement A", acceptanceCriteria: "A works" },
@@ -3410,7 +3649,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-repair-loop",
-      { goal: "Repair loop goal", reviewMode: "per-task" },
+      { goal: "Repair loop goal", reviewMode: "per-task", reviewRepairRounds: 2 },
       undefined,
       undefined,
       { cwd: tempTestDir }
@@ -3461,7 +3700,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-repair-exhaust",
-      { goal: "Exhaust repair goal", reviewMode: "per-task" },
+      { goal: "Exhaust repair goal", reviewMode: "per-task", reviewRepairRounds: 2 },
       undefined,
       undefined,
       { cwd: tempTestDir }

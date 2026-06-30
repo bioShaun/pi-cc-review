@@ -204,11 +204,23 @@ export CC_REVIEW_LOG_LEVEL=warning
 pi --mode json -p "Use the cc_review tool to implement: <goal>"
 ```
 
+#### Log sources (`--log-sources` / `CC_REVIEW_LOG_SOURCES`)
+
+Optionally restrict compact widget and `onUpdate` logs to a comma-separated allow-list of `planner`, `subagent`, `reviewer`, and `cc-review`:
+
+```bash
+/cc-review --log-sources planner,subagent Implement the auth refactor
+CC_REVIEW_LOG_SOURCES=reviewer,cc-review pi --mode json -p "Use cc_review to implement: <goal>"
+```
+
+The tool parameter is `logSources`. Explicit tool/slash values take precedence over the environment. Invalid sources fall back to showing all sources and produce one warning; persisted `workflow-logs.jsonl` remains unfiltered.
+
 #### Compact widget affordances
 
 - **Severity rollup line**: directly under the phase line, the widget shows a width-bounded `Σ …` summary counting errors, warnings, info, and debug entries across the in-memory buffer (for example, `Σ 1 error · 2 warnings · 5 info`). Only non-zero counts are shown; info/debug-only buffers collapse to a neutral `Σ no issues` line.
 - **Redacted goal/title previews**: long goals and task titles are collapsed to a single line and capped (default 80 characters with an ellipsis) before terminal-width truncation. The full goal and task titles remain in the final markdown summary and persisted log.
 - **Severity-aware live log lines**: the last five filtered log lines use theme-style prefixes (`DEBUG`, `INFO`, `WARN`, `ERROR`) with timestamps and source badges.
+- **Readable provider activity**: Codex JSONL events and Claude Code `stream-json` events are buffered to complete lines and translated into actions such as `Running command`, `Using tool`, `Updated files`, `Thinking`, and `run completed`. Unknown or malformed provider JSON is omitted from the compact display instead of exposing raw payloads.
 - **Summary message renderer**: slash-command completion uses `customType: "cc-review-summary"`. When Pi exposes `registerMessageRenderer` and the TUI primitives are available, the final report renders a compact success/warning/failed/cancelled badge with a one-line headline; expand to read the full markdown body. Headless/test environments without the renderer API keep the existing markdown fallback.
 
 Structured trace output (`emitTrace` → stderr and `workflow-trace.jsonl`) is unchanged: it remains lightweight, redacted, and independent of the human-readable `workflow-logs.jsonl` file.
@@ -232,16 +244,26 @@ Planner and reviewer subprocess timeouts are separately configurable via `CC_REV
 CC_REVIEW_TASK_TIMEOUT_MS=0 pi --mode json -p "Use the cc_review tool to implement: <goal>"
 ```
 
-#### Reviewer repair loop (`CC_REVIEW_MAX_REPAIR_ROUNDS`)
+#### Reviewer repair loop (`reviewRepairRounds`)
 
-When the reviewer returns a `block` verdict on a task, CC Review re-dispatches the generator with the reviewer's findings as feedback, then re-reviews, up to a configurable number of repair rounds before hard-failing.
+By default, review runs once: the reviewer inspects the workspace, fixes findings directly, and validates those fixes in the same invocation. Automatic re-review is opt-in. When enabled, a per-task `block` re-dispatches the generator before review runs again; in `after-all` mode, CC Review re-dispatches the final reviewer with findings and failed verification diagnostics.
 
-- **Environment**: set `CC_REVIEW_MAX_REPAIR_ROUNDS=3` (default 2). Set to `0` to disable the repair loop and hard-fail on the first block (legacy behavior).
+Reviewer file changes require a repository-owned `.cc-review-validation.json`. This repository includes one that runs the static, structured, UI, and behavioral suites; failed commands are included in the next repair prompt and rerun after the fix.
+
+The default is `0`, which performs no re-review and hard-fails if the initial review remains blocked. Configure it through any interface:
 
 ```bash
-# Allow up to 3 repair rounds before giving up
+# Slash command
+/cc-review --review-repair-rounds 3 <goal>
+
+# Tool parameter
+pi --mode json -p 'Use cc_review with goal "<goal>" and reviewRepairRounds 3'
+
+# Environment fallback
 CC_REVIEW_MAX_REPAIR_ROUNDS=3 pi --mode json -p "Use the cc_review tool to implement: <goal>"
 ```
+
+An explicit `reviewRepairRounds` or `--review-repair-rounds` takes precedence over `CC_REVIEW_MAX_REPAIR_ROUNDS`.
 
 ---
 

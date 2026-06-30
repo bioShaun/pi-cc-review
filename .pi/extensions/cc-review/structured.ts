@@ -163,6 +163,7 @@ export interface CcReviewSummaryMeta {
     failed: number;
     warning: number;
     completed: number;
+    cancelled: number;
   };
   topBlockers: ReviewFinding[];
 }
@@ -790,12 +791,14 @@ export function mergeRollupFindings(taskFindings: ReviewFinding[][]): ReviewFind
 }
 
 export function buildSummaryMeta(taskResults: Array<{ status?: TaskStatus; reviewResult?: ReviewResult | null }>): CcReviewSummaryMeta {
-  const taskOutcomes = { review_blocked: 0, failed: 0, warning: 0, completed: 0 };
+  const taskOutcomes = { review_blocked: 0, failed: 0, warning: 0, completed: 0, cancelled: 0 };
   const blockers: ReviewFinding[] = [];
   for (const result of taskResults) {
     if (result.status === "review_blocked") taskOutcomes.review_blocked += 1;
-    else if (result.status === "failed" || result.status === "validation_failed" || result.status === "cancelled") {
+    else if (result.status === "failed" || result.status === "validation_failed") {
       taskOutcomes.failed += 1;
+    } else if (result.status === "cancelled") {
+      taskOutcomes.cancelled += 1;
     } else if (result.status === "completed_with_warnings" || result.status === "skipped") {
       taskOutcomes.warning += 1;
     } else if (result.status === "completed") {

@@ -174,7 +174,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; reviewMode\?: string; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?error\?: string \}/);
+  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; logSources\?: string; reviewMode\?: string; reviewRepairRounds\?: number; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?error\?: string \}/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -197,7 +197,9 @@ test("review timing supports per-task and after-all orchestration", () => {
   assert.match(source, /if \(reviewMode === "after-all"\) \{/);
   assert.match(source, /transitionToBatchReviewing\(\)/);
   assert.match(source, /const batchReviewTask: Task = \{/);
-  assert.match(source, /reviewMode === "after-all"[\s\S]*?reviewProviderConfig\.buildArgs\(\{ task: batchReviewTask \}\)/);
+  assert.match(source, /BATCH_REPAIR_LOOP: for \(let repairRound = 0; ; repairRound\+\+\)/);
+  assert.match(source, /reviewProviderConfig\.buildArgs\(\{ task: reviewTask \}\)/);
+  assert.match(source, /continue BATCH_REPAIR_LOOP/);
   assert.match(source, /Queued "\$\{task\.title\}" for the final workflow review/);
 });
 
@@ -449,7 +451,7 @@ test("display log path uses normalized log entries", () => {
   // that future severity/source toggles can be wired in without touching this
   // path; assert both that the filter feeds the slice and that liveLogs is the
   // ultimate input.
-  assert.match(source, /filterCcReviewLogEntries\(state\.liveLogs, \{ minSeverity: state\.resolvedLogLevel \}\)/);
+  assert.match(source, /filterCcReviewLogEntries\(state\.liveLogs, \{\s*\n\s*minSeverity: state\.resolvedLogLevel,\s*\n\s*sources: state\.resolvedLogSources,\s*\n\s*\}\)/);
   assert.match(source, /renderCcReviewLogEntry\(entry, \{ maxLineWidth: width - 3 \}\)/);
   // onUpdate emits a per-entry compact delta rather than re-broadcasting the full last-5 markdown block.
   assert.match(source, /const renderedDelta = renderCcReviewLogEntry\(entry, \{ maxLineWidth: 120 \}\)/);
@@ -492,14 +494,18 @@ test("severity rollup helper exists and is wired into the widget", () => {
 
 test("subprocess stream lines are formatted before logging", () => {
   assert.match(source, /export function formatSubprocessStreamLine\(/);
-  assert.match(source, /function logSubprocessStreamLines\(/);
-  assert.match(source, /logSubprocessStreamLines\(log, chunk, "stdout", "planner"\)/);
-  assert.match(source, /logSubprocessStreamLines\(log, data\.toString\(\), "stderr", "reviewer"\)/);
+  assert.match(source, /export function createSubprocessStreamLogger\(/);
+  assert.match(source, /plannerStdoutLogger\.write\(chunk\)/);
+  assert.match(source, /plannerStderrLogger\.write\(data\)/);
+  assert.match(source, /stdoutLogger\.write\(data\)/);
+  assert.match(source, /stderrLogger\.write\(data\)/);
+  assert.match(source, /plannerStdoutLogger\.flush\(\)/);
+  assert.match(source, /stdoutLogger\.flush\(\)/);
 });
 
 test("subprocess stream severity inference is exported and wired into planner/reviewer handlers", () => {
   assert.match(source, /export function inferSubprocessStreamSeverity\(/);
-  assert.match(source, /severity: inferSubprocessStreamSeverity\(trimmed, stream\)/);
+  assert.match(source, /severity: inferSubprocessStreamSeverity\(message, stream\)/);
 });
 
 test("widget full-log line is width-truncated", () => {
@@ -566,7 +572,7 @@ test("filter helper is exported and wired into the widget live-log slice", () =>
   // Helper is invoked in the widget live-log path with the resolved log level.
   assert.match(
     source,
-    /const filteredLiveLogs = filterCcReviewLogEntries\(state\.liveLogs, \{ minSeverity: state\.resolvedLogLevel \}\);/
+    /const filteredLiveLogs = filterCcReviewLogEntries\(state\.liveLogs, \{\s*\n\s*minSeverity: state\.resolvedLogLevel,\s*\n\s*sources: state\.resolvedLogSources,\s*\n\s*\}\);/
   );
   assert.match(
     source,
@@ -614,7 +620,7 @@ test("log-level resolver is exported with the documented signature and wired thr
   assert.match(source, /logLevel:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional minimum log severity/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+reviewMode\?: string;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?\}/
   );
   assert.match(
     source,
@@ -630,7 +636,7 @@ test("log-level resolver is exported with the documented signature and wired thr
   );
   assert.match(
     source,
-    /if \(passesLogLevel\) \{\s*\n\s*const renderedDelta = renderCcReviewLogEntry\(entry/
+    /if \(passesLogLevel && passesLogSources\) \{\s*\n\s*const renderedDelta = renderCcReviewLogEntry\(entry/
   );
 });
 
@@ -646,7 +652,8 @@ test("workflow steps are instrumented with lightweight structured logging and tr
 });
 
 test("trace payloads stay minimal and avoid sensitive task content", () => {
-  assert.doesNotMatch(source, /goalPreview/);
+  const traceCalls = [...source.matchAll(/emitTrace\([\s\S]*?\n\s*\}\);/g)].map((match) => match[0]).join("\n");
+  assert.doesNotMatch(traceCalls, /goalPreview/);
   assert.doesNotMatch(source, /emitTrace\([^)]*taskTitle/);
   assert.match(source, /goalLength: goal\.length/);
   assert.match(source, /taskIndex: i/);
@@ -715,7 +722,7 @@ test("workflow handles partial results and surfaces unresolved items determinist
   assert.match(source, /allUnresolved\.push\(`Task Validation Failed: "\$\{taskResult\.title\}" - Reason: \$\{taskResult\.validationError\}`\)/);
   assert.match(source, /if \(err instanceof WorkflowError\)/);
   assert.match(source, /const summary = appendPersistedLogPathToSummary\(\s*\n?\s*buildSummaryReport\(goal, taskResults, tasks\),/);
-  assert.match(source, /throw new WorkflowError\(err\.message, summary\);/);
+  assert.match(source, /throw new WorkflowError\(err\.message, summary, buildCcReviewSummaryMeta\(taskResults\)\);/);
 });
 
 test("subagent failures are retried with structured feedback instead of thrown immediately", () => {

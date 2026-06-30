@@ -1,0 +1,24 @@
+{
+  "commands": [
+    {
+      "command": "node",
+      "args": ["tests/cc-review-static.test.mjs"],
+      "timeoutMs": 120000
+    },
+    {
+      "command": "node",
+      "args": ["--experimental-strip-types", "tests/cc-review-structured.test.ts"],
+      "timeoutMs": 120000
+    },
+    {
+      "command": "node",
+      "args": ["--experimental-strip-types", "tests/cc-review-ui.test.ts"],
+      "timeoutMs": 120000
+    },
+    {
+      "command": "node",
+      "args": ["--experimental-strip-types", "tests/cc-review-behavior.test.ts"],
+      "timeoutMs": 180000
+    }
+  ]
+}

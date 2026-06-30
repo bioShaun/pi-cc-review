@@ -179,9 +179,18 @@ const CcReviewParams = {
       type: "string",
       description: "Optional minimum log severity for compact surfaces (widget + onUpdate). Supported values: debug, info, warning, error (aliases: warn, fatal). Omit to use CC_REVIEW_LOG_LEVEL or the default 'info'. Persisted workflow-logs.jsonl is never filtered.",
     },
+    logSources: {
+      type: "string",
+      description: "Optional comma-separated list of compact-surface log sources to keep (planner, subagent, reviewer, cc-review). Omit to use CC_REVIEW_LOG_SOURCES or show all.",
+    },
     reviewMode: {
       type: "string",
       description: "Optional review timing. Supported values: per-task or after-all. Omit to use CC_REVIEW_MODE or the default after-all mode.",
+    },
+    reviewRepairRounds: {
+      type: "integer",
+      minimum: 0,
+      description: "Optional number of repair/re-review rounds after an initial block. 0 disables re-review. Omit to use CC_REVIEW_MAX_REPAIR_ROUNDS or the default 0.",
     },
     taskTimeoutMs: {
       type: "number",
@@ -204,7 +213,9 @@ interface CcReviewExecuteParams {
   goal: string;
   reviewProvider?: string;
   logLevel?: string;
+  logSources?: string;
   reviewMode?: string;
+  reviewRepairRounds?: number;
   taskTimeoutMs?: number;
   widgetLogLines?: number;
   checklistWindow?: number;
@@ -346,6 +357,88 @@ function looksLikeJsonFragment(line: string): boolean {
   return false;
 }
 
+function structuredTextPreview(value: unknown, maxLength = 100): string {
+  return typeof value === "string" ? clipSubprocessLogText(value, maxLength) : "";
+}
+
+function summarizeToolInput(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const args = input as Record<string, unknown>;
+  for (const key of ["command", "path", "file_path", "pattern", "query", "url"]) {
+    const preview = structuredTextPreview(args[key], 80);
+    if (preview) return preview;
+  }
+  return "";
+}
+
+function summarizeCodexItem(eventType: string, item: Record<string, unknown>): string | null {
+  const itemType = typeof item.type === "string" ? item.type : "item";
+  const isStarted = eventType === "item.started";
+  const isCompleted = eventType === "item.completed";
+  const status = typeof item.status === "string" ? item.status : "";
+
+  if (itemType === "reasoning") {
+    const text = structuredTextPreview(item.text, 110);
+    return text ? `Thinking: ${text}` : null;
+  }
+
+  if (itemType === "agent_message") {
+    if (typeof item.text !== "string" || !item.text.trim()) return null;
+    const nestedSummary = formatSubprocessStreamLine(item.text);
+    if (nestedSummary && nestedSummary !== item.text.trim()) return nestedSummary;
+    if (nestedSummary === null && /^[\[{]/.test(item.text.trim())) return null;
+    return `Assistant: ${structuredTextPreview(item.text, 120)}`;
+  }
+
+  if (itemType === "command_execution") {
+    const command = structuredTextPreview(item.command, 90) || "command";
+    if (isStarted || status === "in_progress") return `Running command: ${command}`;
+    const exitCode = typeof item.exit_code === "number" ? item.exit_code : undefined;
+    if (exitCode !== undefined && exitCode !== 0) return `Command failed (exit ${exitCode}): ${command}`;
+    return `Command completed: ${command}`;
+  }
+
+  if (itemType === "file_change") {
+    const changes = Array.isArray(item.changes) ? item.changes : [];
+    const paths = changes
+      .map((change) =>
+        change && typeof change === "object"
+          ? structuredTextPreview((change as Record<string, unknown>).path, 50)
+          : ""
+      )
+      .filter(Boolean);
+    const preview = paths.slice(0, 3).join(", ");
+    const suffix = paths.length > 3 ? ` (+${paths.length - 3} more)` : "";
+    if (isStarted) return preview ? `Applying changes: ${preview}${suffix}` : "Applying file changes";
+    return preview ? `Updated ${paths.length} file${paths.length === 1 ? "" : "s"}: ${preview}${suffix}` : "File changes applied";
+  }
+
+  if (itemType === "mcp_tool_call") {
+    const tool =
+      structuredTextPreview(item.tool, 60) ||
+      structuredTextPreview(item.name, 60) ||
+      "tool";
+    const hint = summarizeToolInput(item.arguments ?? item.input);
+    const action = isCompleted ? "Tool completed" : "Using tool";
+    return hint ? `${action}: ${tool} — ${hint}` : `${action}: ${tool}`;
+  }
+
+  if (itemType === "web_search") {
+    const query = structuredTextPreview(item.query, 90);
+    return query ? `Searching the web: ${query}` : "Searching the web";
+  }
+
+  if (itemType === "todo_list") {
+    const items = Array.isArray(item.items) ? item.items : [];
+    const completed = items.filter(
+      (todo) => todo && typeof todo === "object" && (todo as Record<string, unknown>).completed === true
+    ).length;
+    return `Plan updated: ${completed}/${items.length} completed`;
+  }
+
+  return null;
+}
+
 function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
   if (!payload || typeof payload !== "object") return null;
   const obj = payload as Record<string, unknown>;
@@ -385,6 +478,68 @@ function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
   }
 
   if (typeof obj.type === "string") {
+    // Codex `exec --json` lifecycle. Session bookkeeping is intentionally
+    // hidden; work items are translated into concrete, scan-friendly actions.
+    if (obj.type === "thread.started" || obj.type === "turn.started") return null;
+    if (obj.type === "turn.completed") return "Codex turn completed";
+    if (obj.type === "turn.failed") {
+      const error =
+        structuredTextPreview((obj.error as Record<string, unknown> | undefined)?.message, 100) ||
+        structuredTextPreview(obj.message, 100);
+      return error ? `Codex turn failed: ${error}` : "Codex turn failed";
+    }
+    if (
+      (obj.type === "item.started" || obj.type === "item.updated" || obj.type === "item.completed") &&
+      obj.item &&
+      typeof obj.item === "object"
+    ) {
+      return summarizeCodexItem(obj.type, obj.item as Record<string, unknown>);
+    }
+
+    // Claude Code `--output-format stream-json` lifecycle.
+    if (obj.type === "system" || obj.type === "user" || obj.type === "stream_event") return null;
+    if (obj.type === "assistant") {
+      const message = obj.message && typeof obj.message === "object"
+        ? obj.message as Record<string, unknown>
+        : undefined;
+      const content = Array.isArray(message?.content) ? message.content : [];
+      const summaries: string[] = [];
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        const contentPart = part as Record<string, unknown>;
+        if (contentPart.type === "tool_use") {
+          const name = structuredTextPreview(contentPart.name, 60) || "tool";
+          const hint = summarizeToolInput(contentPart.input);
+          summaries.push(hint ? `Using tool: ${name} — ${hint}` : `Using tool: ${name}`);
+        } else if (contentPart.type === "text") {
+          if (typeof contentPart.text !== "string" || !contentPart.text.trim()) continue;
+          const nestedSummary = formatSubprocessStreamLine(contentPart.text);
+          if (nestedSummary && nestedSummary !== contentPart.text.trim()) summaries.push(nestedSummary);
+          else if (!(nestedSummary === null && /^[\[{]/.test(contentPart.text.trim()))) {
+            summaries.push(`Assistant: ${structuredTextPreview(contentPart.text, 120)}`);
+          }
+        }
+      }
+      return summaries.length > 0 ? summaries.slice(0, 2).join(" · ") : null;
+    }
+    if (obj.type === "result") {
+      const failed = obj.is_error === true || obj.subtype === "error";
+      const durationMs = typeof obj.duration_ms === "number" ? obj.duration_ms : undefined;
+      const turns = typeof obj.num_turns === "number" ? obj.num_turns : undefined;
+      const details = [
+        durationMs !== undefined ? `${Math.max(0, durationMs / 1000).toFixed(1)}s` : "",
+        turns !== undefined ? `${turns} turn${turns === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(", ");
+      const resultText = structuredTextPreview(obj.result, 100);
+      if (failed) return resultText ? `Claude failed: ${resultText}` : "Claude run failed";
+      return `Claude run completed${details ? ` (${details})` : ""}`;
+    }
+    if (obj.type === "tool_progress") {
+      const tool = structuredTextPreview(obj.tool_name ?? obj.name, 60) || "tool";
+      return `${tool} is still running`;
+    }
+    if (obj.type === "rate_limit_event") return "Rate limited; waiting to retry";
+
     if (obj.type === "tool_call" || obj.type === "tool_use" || obj.type === "tool_execution_start") {
       const name =
         typeof obj.name === "string"
@@ -405,10 +560,8 @@ function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
     return `exec ${clipSubprocessLogText(obj.command, 80)}`;
   }
 
-  const keys = Object.keys(obj);
-  if (keys.length === 0) return null;
-  const previewKeys = keys.slice(0, 4).join(", ");
-  return `{${previewKeys}${keys.length > 4 ? ", …" : ""}}`;
+  const error = structuredTextPreview(obj.error ?? obj.message, 110);
+  return error ? `Provider message: ${error}` : null;
 }
 
 export function formatSubprocessStreamLine(rawLine: string): string | null {
@@ -426,8 +579,9 @@ export function formatSubprocessStreamLine(rawLine: string): string | null {
       if (summarized !== null) return summarized;
       return null;
     } catch {
-      if (looksLikeJsonFragment(line)) return null;
-      return clipSubprocessLogText(line, 120);
+      // A provider JSON event should never leak to the human display merely
+      // because it is malformed or belongs to a newer event schema.
+      return null;
     }
   }
 
@@ -436,23 +590,49 @@ export function formatSubprocessStreamLine(rawLine: string): string | null {
   return line;
 }
 
-function logSubprocessStreamLines(
+export interface SubprocessStreamLogger {
+  write(chunk: string | Buffer): void;
+  flush(): void;
+}
+
+export function createSubprocessStreamLogger(
   logFn: (input: CcReviewLogInput) => void,
-  chunk: string,
   stream: "stdout" | "stderr",
   source: "planner" | "reviewer"
-): void {
-  for (const line of chunk.split("\n")) {
+): SubprocessStreamLogger {
+  let remainder = "";
+  const emitLine = (line: string) => {
     const trimmed = line.trim();
-    if (!trimmed) continue;
+    if (!trimmed) return;
     const message = formatSubprocessStreamLine(trimmed);
-    if (message === null) continue;
+    if (message === null) return;
     logFn({
-      severity: inferSubprocessStreamSeverity(trimmed, stream),
+      severity: inferSubprocessStreamSeverity(message, stream),
       source,
       message,
     });
-  }
+  };
+
+  return {
+    write(chunk: string | Buffer) {
+      remainder += typeof chunk === "string" ? chunk : chunk.toString();
+      let newlineIndex: number;
+      while ((newlineIndex = remainder.indexOf("\n")) !== -1) {
+        emitLine(remainder.slice(0, newlineIndex).replace(/\r$/, ""));
+        remainder = remainder.slice(newlineIndex + 1);
+      }
+    },
+    flush() {
+      if (remainder) emitLine(remainder.replace(/\r$/, ""));
+      remainder = "";
+    },
+  };
+}
+
+function extractCodexItemText(event: Record<string, unknown>): string {
+  if (event.type !== "item.completed" || !event.item || typeof event.item !== "object") return "";
+  const item = event.item as Record<string, unknown>;
+  return item.type === "agent_message" && typeof item.text === "string" ? item.text : "";
 }
 
 // Extract the final assistant text from a claude `--output-format stream-json`
@@ -496,6 +676,11 @@ export function extractAssistantTextFromStream(stdout: string): string {
     if (event?.type === "message" && typeof event?.content === "string") {
       hasStreamEvents = true;
       finalText += event.content;
+    }
+    const codexItemText = extractCodexItemText(event);
+    if (codexItemText) {
+      hasStreamEvents = true;
+      finalText += codexItemText;
     }
   }
   return hasStreamEvents && finalText ? finalText : stdout;
@@ -878,16 +1063,33 @@ function resolvePhaseTimeoutFromEnv(env: NodeJS.ProcessEnv, key: string, fallbac
 // the generator with the reviewer's findings as feedback, then re-reviews, up
 // to this many rounds before hard-failing.
 //
-// Precedence: `env.CC_REVIEW_MAX_REPAIR_ROUNDS` > default 2.
+// Precedence: explicit `flag` (tool param / slash flag
+// `--review-repair-rounds`) > `env.CC_REVIEW_MAX_REPAIR_ROUNDS` > default 0.
+// Re-review is opt-in; the reviewer still fixes findings and validates within
+// its initial review invocation.
 // ---------------------------------------------------------------------------
-export const DEFAULT_MAX_REVIEW_REPAIR_ROUNDS = 2;
+export const DEFAULT_MAX_REVIEW_REPAIR_ROUNDS = 0;
 
-export function resolveMaxReviewRepairRounds(env: NodeJS.ProcessEnv = process.env): number {
+export interface ResolveMaxReviewRepairRoundsOptions {
+  flag?: string | number;
+  env?: NodeJS.ProcessEnv;
+}
+
+export function resolveMaxReviewRepairRounds(
+  options: ResolveMaxReviewRepairRoundsOptions = {}
+): number {
+  if (options.flag !== undefined && options.flag !== null) {
+    const parsedFlag = Number(options.flag);
+    return Number.isInteger(parsedFlag) && parsedFlag >= 0
+      ? parsedFlag
+      : DEFAULT_MAX_REVIEW_REPAIR_ROUNDS;
+  }
+  const env = options.env ?? process.env;
   const raw = env.CC_REVIEW_MAX_REPAIR_ROUNDS;
   if (typeof raw !== "string" || raw.trim() === "") return DEFAULT_MAX_REVIEW_REPAIR_ROUNDS;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MAX_REVIEW_REPAIR_ROUNDS;
-  return Math.floor(parsed);
+  if (!Number.isInteger(parsed) || parsed < 0) return DEFAULT_MAX_REVIEW_REPAIR_ROUNDS;
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,6 +1169,94 @@ export function resolveCcReviewLogLevel(
   }
 
   return { level: "info", source: "default" };
+}
+
+// ---------------------------------------------------------------------------
+// resolveCcReviewLogSources: pure precedence resolver for the user-visible
+// log sources filtering.
+//
+// Precedence: explicit `flag` (slash flag / tool param `--log-sources` / `logSources`)
+//            > `env.CC_REVIEW_LOG_SOURCES`
+//            > default `all` (undefined).
+// ---------------------------------------------------------------------------
+export interface ResolveCcReviewLogSourcesOptions {
+  /** Explicit flag value from the slash command / tool param (e.g. `--log-sources planner,subagent`). */
+  flag?: string;
+  /** Environment to read `CC_REVIEW_LOG_SOURCES` from. Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ResolveCcReviewLogSourcesResult {
+  sources: string[] | undefined;
+  source: "flag" | "env" | "default";
+  invalidInput?: { source: "flag" | "env"; raw: string };
+}
+
+const SUPPORTED_LOG_SOURCES = ["planner", "subagent", "reviewer", "cc-review"];
+
+function parseLogSourcesCandidate(raw: unknown): { sources: string[]; hasInvalid: boolean } | undefined {
+  if (typeof raw !== "string") return undefined;
+  const parts = raw.split(",").map(p => p.trim());
+  const sources: string[] = [];
+  let hasInvalid = false;
+  for (const part of parts) {
+    if (part === "") continue;
+    const lower = part.toLowerCase();
+    if (SUPPORTED_LOG_SOURCES.includes(lower)) {
+      sources.push(lower);
+    } else {
+      hasInvalid = true;
+    }
+  }
+  return { sources, hasInvalid };
+}
+
+export function resolveCcReviewLogSources(
+  options: ResolveCcReviewLogSourcesOptions = {}
+): ResolveCcReviewLogSourcesResult {
+  // 1) Explicit flag wins.
+  if (options.flag !== undefined && options.flag !== null) {
+    const parsed = parseLogSourcesCandidate(options.flag);
+    if (parsed !== undefined) {
+      if (parsed.hasInvalid) {
+        return {
+          sources: undefined,
+          source: "default",
+          invalidInput: { source: "flag", raw: String(options.flag) },
+        };
+      }
+      return { sources: parsed.sources, source: "flag" };
+    }
+    return {
+      sources: undefined,
+      source: "default",
+      invalidInput: { source: "flag", raw: String(options.flag) },
+    };
+  }
+
+  // 2) Environment fallback.
+  const env = options.env ?? process.env;
+  const rawEnv = env.CC_REVIEW_LOG_SOURCES;
+  if (typeof rawEnv === "string" && rawEnv.trim() !== "") {
+    const parsed = parseLogSourcesCandidate(rawEnv);
+    if (parsed !== undefined) {
+      if (parsed.hasInvalid) {
+        return {
+          sources: undefined,
+          source: "default",
+          invalidInput: { source: "env", raw: rawEnv },
+        };
+      }
+      return { sources: parsed.sources, source: "env" };
+    }
+    return {
+      sources: undefined,
+      source: "default",
+      invalidInput: { source: "env", raw: rawEnv },
+    };
+  }
+
+  return { sources: undefined, source: "default" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1546,7 @@ export type CcReviewDisplayState =
   | "reviewing"
   | "retrying"
   | "warning"
+  | "failed"
   | "cancelled"
   | "timeout"
   | "complete";
@@ -1460,11 +1751,78 @@ export interface CcReviewWidgetState {
   lastTaskWarning?: string;
   liveLogs: readonly CcReviewLogEntry[];
   resolvedLogLevel: CcReviewLogSeverity;
+  resolvedLogSources?: string[];
   resolvedWidgetLogLines?: number;
   resolvedChecklistWindow?: number;
   persistedLogPath: string;
   findingsRollup: CcReviewFindingsRollup;
   taskStatuses?: readonly (TaskStatus | undefined)[];
+}
+
+export interface TaskVisuals {
+  marker: string;
+  markerColor: string;
+  titleColor: string;
+}
+
+export function getTaskVisuals(status: TaskStatus | "running" | "pending"): TaskVisuals {
+  switch (status) {
+    case "completed":
+      return {
+        marker: "\u2714", // ✔
+        markerColor: "success",
+        titleColor: "dim",
+      };
+    case "completed_with_warnings":
+      return {
+        marker: "\u26a0", // ⚠️
+        markerColor: "warning",
+        titleColor: "warning",
+      };
+    case "failed":
+      return {
+        marker: "\u2718", // ✘
+        markerColor: "error",
+        titleColor: "error",
+      };
+    case "validation_failed":
+      return {
+        marker: "\u2716", // ✖
+        markerColor: "error",
+        titleColor: "error",
+      };
+    case "review_blocked":
+      return {
+        marker: "\u26d4", // ⛔
+        markerColor: "error",
+        titleColor: "error",
+      };
+    case "skipped":
+      return {
+        marker: "\u21aa", // ↪
+        markerColor: "muted",
+        titleColor: "dim",
+      };
+    case "cancelled":
+      return {
+        marker: "\u2298", // ⊘
+        markerColor: "muted",
+        titleColor: "dim",
+      };
+    case "running":
+      return {
+        marker: "\u25b8", // ▸
+        markerColor: "accent",
+        titleColor: "text",
+      };
+    case "pending":
+    default:
+      return {
+        marker: "\u2610", // ☐
+        markerColor: "dim",
+        titleColor: "muted",
+      };
+  }
 }
 
 export interface BuildCcReviewWidgetLinesOptions {
@@ -1534,15 +1892,31 @@ export function buildCcReviewWidgetLines(
   const theme = options.theme ?? PLAIN_WIDGET_THEME;
   const findingsRollup = state.findingsRollup ?? emptyFindingsRollup();
   const lines: string[] = [];
+  const isCompact = width < 50;
 
-  lines.push(
-    truncateWidgetLine(
-      `${theme.fg("accent", "\ud83c\udfaf")} ${theme.fg("text", "Goal:")} ${theme.fg("muted", previewWidgetText(state.goal))}`,
-      width
-    )
-  );
-  lines.push(truncateWidgetLine(theme.fg("borderMuted", "\u2501".repeat(Math.min(50, width))), width));
+  // 1. Goal Line
+  if (isCompact) {
+    lines.push(
+      truncateWidgetLine(
+        `${theme.fg("accent", "\ud83c\udfaf")} ${theme.fg("muted", previewWidgetText(state.goal, width - 4))}`,
+        width
+      )
+    );
+  } else {
+    lines.push(
+      truncateWidgetLine(
+        `${theme.fg("accent", "\ud83c\udfaf")} ${theme.fg("text", "Goal:")} ${theme.fg("muted", previewWidgetText(state.goal))}`,
+        width
+      )
+    );
+  }
 
+  // 2. Decorative Divider
+  if (!isCompact) {
+    lines.push(truncateWidgetLine(theme.fg("borderMuted", "\u2501".repeat(Math.min(50, width))), width));
+  }
+
+  // 3. Tasks List
   if (state.tasks.length === 0) {
     const waiting =
       state.displayState === "planning"
@@ -1550,12 +1924,13 @@ export function buildCcReviewWidgetLines(
         : theme.fg("dim", "  \u23f3 Waiting for planner output\u2026");
     lines.push(truncateWidgetLine(waiting, width));
   } else {
+    const checklistWindowSize = isCompact ? 1 : (state.resolvedChecklistWindow ?? WIDGET_CHECKLIST_WINDOW);
     const window = computeChecklistWindow(
       state.tasks.length,
       state.currentTaskIndex,
-      state.resolvedChecklistWindow ?? WIDGET_CHECKLIST_WINDOW
+      checklistWindowSize
     );
-    if (window.hiddenBefore > 0) {
+    if (!isCompact && window.hiddenBefore > 0) {
       lines.push(
         truncateWidgetLine(
           theme.fg("dim", `  \u2026 ${window.hiddenBefore} earlier task${window.hiddenBefore === 1 ? "" : "s"}`),
@@ -1565,30 +1940,28 @@ export function buildCcReviewWidgetLines(
     }
     for (let i = window.startIndex; i < window.endIndex; i++) {
       const task = state.tasks[i];
-      const taskStatus = state.taskStatuses?.[i];
-      let marker: string;
-      let titleColor = "text";
-      if (taskStatus === "review_blocked") {
-        marker = theme.fg("error", "\u26d4");
-        titleColor = "error";
-      } else if (taskStatus === "failed" || taskStatus === "validation_failed") {
-        marker = theme.fg("error", "\u2718");
-        titleColor = "error";
+      let status: TaskStatus | "running" | "pending";
+      const explicitStatus = state.taskStatuses?.[i] ?? task.status;
+      if (explicitStatus) {
+        status = explicitStatus;
       } else if (i < state.currentTaskIndex) {
-        marker = theme.fg("success", "\u2714");
-        titleColor = "dim";
+        status = "completed";
       } else if (i === state.currentTaskIndex) {
-        marker = theme.fg("accent", "\u25b8");
+        status = "running";
       } else {
-        marker = theme.fg("dim", "\u2610");
-        titleColor = "muted";
+        status = "pending";
       }
+
+      const visuals = getTaskVisuals(status);
+      const marker = theme.fg(visuals.markerColor, visuals.marker);
+      const titleColor = visuals.titleColor;
+
       const title = previewWidgetText(task.title, width - 16);
       const taskLabel = theme.fg("muted", `[Task ${i + 1}/${state.tasks.length}]`);
       const styledTitle = theme.fg(titleColor, title);
       lines.push(truncateWidgetLine(`  ${marker} ${taskLabel} ${styledTitle}`, width));
     }
-    if (window.hiddenAfter > 0) {
+    if (!isCompact && window.hiddenAfter > 0) {
       lines.push(
         truncateWidgetLine(
           theme.fg("dim", `  \u2026 ${window.hiddenAfter} later task${window.hiddenAfter === 1 ? "" : "s"}`),
@@ -1598,10 +1971,20 @@ export function buildCcReviewWidgetLines(
     }
   }
 
-  lines.push(truncateWidgetLine(theme.fg("borderMuted", "\u2501".repeat(Math.min(50, width))), width));
-  lines.push(truncateWidgetLine(formatPhaseSeverityLine(state.currentPhase, state.liveLogs, { theme }), width));
-  lines.push(truncateWidgetLine(theme.fg("muted", formatFindingsRollupLine(findingsRollup)), width));
+  // 4. Decorative Divider
+  if (!isCompact) {
+    lines.push(truncateWidgetLine(theme.fg("borderMuted", "\u2501".repeat(Math.min(50, width))), width));
+  }
 
+  // 5. Phase / Severity Status (Always display)
+  lines.push(truncateWidgetLine(formatPhaseSeverityLine(state.currentPhase, state.liveLogs, { theme }), width));
+
+  // 6. Findings (Skip in compact mode)
+  if (!isCompact) {
+    lines.push(truncateWidgetLine(theme.fg("muted", formatFindingsRollupLine(findingsRollup)), width));
+  }
+
+  // 7. Exceptional/Error indicators (Prioritized, always kept)
   if (state.displayState === "warning" && state.lastTaskWarning) {
     lines.push(
       truncateWidgetLine(
@@ -1613,20 +1996,49 @@ export function buildCcReviewWidgetLines(
     lines.push(truncateWidgetLine(theme.fg("error", "\u26d4 Cancelled by user"), width));
   } else if (state.displayState === "timeout") {
     lines.push(truncateWidgetLine(theme.fg("error", "\u23f1 Timed out"), width));
+  } else if (state.displayState === "failed") {
+    lines.push(truncateWidgetLine(theme.fg("error", "\u2716 Workflow failed"), width));
   }
 
-  lines.push(truncateWidgetLine(theme.fg("text", "\ud83d\udcdd Live Logs:"), width));
+  // 8. Live Logs Section Header (Skip in compact mode)
+  if (!isCompact) {
+    if (state.resolvedLogSources !== undefined) {
+      const sourcesText = state.resolvedLogSources.length > 0 ? state.resolvedLogSources.join(", ") : "none";
+      lines.push(
+        truncateWidgetLine(
+          theme.fg("text", `\ud83d\udcdd Live Logs (sources: ${sourcesText}):`),
+          width
+        )
+      );
+    } else {
+      lines.push(truncateWidgetLine(theme.fg("text", "\ud83d\udcdd Live Logs:"), width));
+    }
+  }
+
+  // 9. Live Logs Tail
   if (state.liveLogs.length === 0) {
-    lines.push(truncateWidgetLine(theme.fg("dim", "   (No logs yet \u2014 waiting for activity)"), width));
+    if (!isCompact) {
+      lines.push(truncateWidgetLine(theme.fg("dim", "   (No logs yet \u2014 waiting for activity)"), width));
+    }
   } else {
-    const filteredLiveLogs = filterCcReviewLogEntries(state.liveLogs, { minSeverity: state.resolvedLogLevel });
+    const filteredLiveLogs = filterCcReviewLogEntries(state.liveLogs, {
+      minSeverity: state.resolvedLogLevel,
+      sources: state.resolvedLogSources,
+    });
+    const totalCount = state.liveLogs.filter(e => e).length;
+    const hiddenCount = totalCount - filteredLiveLogs.length;
+
     const collapsed = collapseConsecutiveLogEntries(filteredLiveLogs);
     filteredLiveLogs.length = 0;
     filteredLiveLogs.push(...collapsed);
-    const tailLength = state.resolvedWidgetLogLines ?? 5;
+    const defaultTailLength = isCompact ? 3 : 5;
+    const tailLength = state.resolvedWidgetLogLines ?? defaultTailLength;
     const recentLogs = tailLength > 0 ? filteredLiveLogs.slice(-tailLength) : [];
     for (const entry of recentLogs) {
-      const rendered = renderCcReviewLogEntry(entry, { maxLineWidth: width - 3 });
+      // In compact mode, we omit timestamps and source tags to conserve narrow columns
+      const rendered = isCompact
+        ? renderCcReviewLogEntry(entry, { maxLineWidth: width - 3, includeTimestamp: false, includeSource: false })
+        : renderCcReviewLogEntry(entry, { maxLineWidth: width - 3 });
       const color = severityThemeColor(entry.severity);
       for (const line of rendered) {
         // Defensively truncate the plain-text line before wrapping it in
@@ -1637,17 +2049,25 @@ export function buildCcReviewWidgetLines(
         lines.push(truncateWidgetLine(`   ${theme.fg(color, safeLine)}`, width));
       }
     }
+    if (hiddenCount > 0) {
+      const hintText = `${hiddenCount} log${hiddenCount === 1 ? "" : "s"} hidden`;
+      const lineText = `   (${hintText})`;
+      lines.push(truncateWidgetLine(theme.fg("dim", lineText), width));
+    }
   }
 
-  lines.push(
-    truncateWidgetLine(
-      `${theme.fg("muted", "\ud83d\udcc4 Full log:")} ${theme.fg(
-        "dim",
-        truncatePersistedLogPathForWidget(state.persistedLogPath, Math.max(12, width - 14))
-      )}`,
-      width
-    )
-  );
+  // 10. Persisted log path (Skip in compact mode)
+  if (!isCompact) {
+    lines.push(
+      truncateWidgetLine(
+        `${theme.fg("muted", "\ud83d\udcc4 Full log:")} ${theme.fg(
+          "dim",
+          truncatePersistedLogPathForWidget(state.persistedLogPath, Math.max(12, width - 14))
+        )}`,
+        width
+      )
+    );
+  }
   return lines;
 }
 
@@ -1657,6 +2077,27 @@ export interface CcReviewStatusState {
   displayState: CcReviewDisplayState;
   retryState?: { attempt: number; maxAttempts: number };
   currentPhase?: string;
+}
+
+export function getStatusColorForDisplayState(displayState: CcReviewDisplayState): "accent" | "success" | "warning" | "error" {
+  switch (displayState) {
+    case "initializing":
+    case "planning":
+    case "executing":
+    case "reviewing":
+      return "accent";
+    case "complete":
+      return "success";
+    case "retrying":
+    case "warning":
+      return "warning";
+    case "cancelled":
+    case "timeout":
+    case "failed":
+      return "error";
+    default:
+      return "accent";
+  }
 }
 
 export function buildCcReviewStatusText(state: CcReviewStatusState): string {
@@ -1673,8 +2114,19 @@ export function buildCcReviewStatusText(state: CcReviewStatusState): string {
     else if (state.displayState === "executing") body += " Executing";
     else if (state.displayState === "retrying") body += " Retrying";
     else if (state.displayState === "warning") body += " Warning";
+    else if (state.displayState === "failed") body += " Failed";
+    else if (state.displayState === "cancelled") body += " Cancelled";
+    else if (state.displayState === "timeout") body += " Timeout";
   } else {
-    body = state.currentPhase ?? "Running";
+    if (state.displayState === "cancelled") {
+      body = "Cancelled";
+    } else if (state.displayState === "timeout") {
+      body = "Timeout";
+    } else if (state.displayState === "failed") {
+      body = "Failed";
+    } else {
+      body = state.currentPhase ?? "Running";
+    }
   }
 
   let text = `[CC Review] ${body}`;
@@ -1975,10 +2427,12 @@ interface BatchTaskExecution {
 
 class WorkflowError extends Error {
   summary: string;
-  constructor(message: string, summary: string) {
+  meta?: CcReviewSummaryMeta;
+  constructor(message: string, summary: string, meta?: CcReviewSummaryMeta) {
     super(message);
     this.name = "WorkflowError";
     this.summary = summary;
+    this.meta = meta;
   }
 }
 
@@ -2006,7 +2460,9 @@ interface SubagentValidation {
 interface RunCcReviewWorkflowOptions {
   reviewProvider?: string;
   logLevel?: string;
+  logSources?: string;
   reviewMode?: string;
+  reviewRepairRounds?: number;
   taskTimeoutMs?: number;
   widgetLogLines?: number;
   checklistWindow?: number;
@@ -2114,14 +2570,46 @@ function registerCcReviewSummaryRenderer(pi: ExtensionAPI): void {
       const expanded = !!opts?.expanded;
       const content = typeof message?.content === "string" ? message.content : "";
       const meta = message?.details as CcReviewSummaryMeta | undefined;
-      const badge = classifyCcReviewSummary(content);
+
+      let badge: CcReviewSummaryBadge;
+      if (meta && meta.taskOutcomes) {
+        const outcomes = meta.taskOutcomes;
+        if ((outcomes.cancelled ?? 0) > 0) {
+          badge = "cancelled";
+        } else if ((outcomes.failed ?? 0) > 0 || (outcomes.review_blocked ?? 0) > 0) {
+          badge = "failed";
+        } else if ((outcomes.warning ?? 0) > 0) {
+          badge = "warning";
+        } else if ((outcomes.completed ?? 0) > 0) {
+          badge = "success";
+        } else {
+          badge = classifyCcReviewSummary(content);
+        }
+      } else {
+        badge = classifyCcReviewSummary(content);
+      }
+
       const palette = BADGE_PALETTE[badge];
       const prefix = theme.fg(palette.color, `[CC Review ${palette.label}]`);
-      let headline = extractCcReviewSummaryHeadline(content);
-      if (expanded && meta?.topBlockers?.length) {
+
+      let headline = "";
+      if (meta && meta.taskOutcomes) {
+        const completed = meta.taskOutcomes.completed ?? 0;
+        const warnings = meta.taskOutcomes.warning ?? 0;
+        const failed = (meta.taskOutcomes.failed ?? 0) + (meta.taskOutcomes.review_blocked ?? 0);
+        const total = completed + warnings + failed + (meta.taskOutcomes.cancelled ?? 0);
+        const counts = { completed, warnings, failed, total };
+        const rawHeadline = formatCcReviewSummaryHeadline(counts);
+        headline = truncateForWidget(rawHeadline, 120);
+      } else {
+        headline = extractCcReviewSummaryHeadline(content);
+      }
+
+      if (!expanded && meta?.topBlockers?.length) {
         const blocker = meta.topBlockers[0];
         headline += ` · top blocker: [${blocker.priority}] ${truncateForWidget(blocker.message, 60)}`;
       }
+
       let text = `${prefix} ${headline}`;
       if (expanded && content) {
         text += `\n\n${content}`;
@@ -2146,7 +2634,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter compact surfaces. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to opt into repair/re-review rounds (default 0; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -2168,7 +2656,9 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
         const workflowResult = await runCcReviewWorkflow(pi, goal, ctx, undefined, undefined, {
           reviewProvider: parsedArgs.reviewProvider,
           logLevel: parsedArgs.logLevel,
+          logSources: parsedArgs.logSources,
           reviewMode: parsedArgs.reviewMode,
+          reviewRepairRounds: parsedArgs.reviewRepairRounds,
           taskTimeoutMs: parsedArgs.taskTimeoutMs,
           widgetLogLines: parsedArgs.widgetLogLines,
           checklistWindow: parsedArgs.checklistWindow,
@@ -2188,6 +2678,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           await pi.sendMessage?.({
             customType: "cc-review-summary",
             content: err.summary,
+            details: err.meta,
             display: true,
           });
         }
@@ -2207,32 +2698,172 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error, or omit it to use CC_REVIEW_LOG_LEVEL / the info default. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
+    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to opt into repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 0. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
-      onUpdate?.({ content: [{ type: "text", text: "Starting CC Review..." }] });
-      
+      const renderDetails = {
+        goal: params.goal,
+        reviewProvider: (params.reviewProvider ?? process.env.CC_REVIEW_PROVIDER ?? "codex").trim().toLowerCase() || "codex",
+        reviewMode: (params.reviewMode ?? process.env.CC_REVIEW_MODE ?? "after-all").trim().toLowerCase() || "after-all",
+      };
+      const renderUpdate = onUpdate
+        ? (update: any) => onUpdate({ ...update, details: { ...renderDetails, ...update?.details } })
+        : undefined;
+      renderUpdate?.({ content: [{ type: "text", text: "Starting CC Review..." }] });
+
       try {
-        const workflowResult = await runCcReviewWorkflow(pi, params.goal, ctx, onUpdate, signal, {
+        const workflowResult = await runCcReviewWorkflow(pi, params.goal, ctx, renderUpdate, signal, {
           reviewProvider: params.reviewProvider,
           logLevel: params.logLevel,
+          logSources: params.logSources,
           reviewMode: params.reviewMode,
+          reviewRepairRounds: params.reviewRepairRounds,
           taskTimeoutMs: params.taskTimeoutMs,
           widgetLogLines: params.widgetLogLines,
           checklistWindow: params.checklistWindow,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
-          details: { goal: params.goal, status: "completed", meta: workflowResult.meta },
+          details: { ...renderDetails, status: "completed", meta: workflowResult.meta },
         };
       } catch (err: any) {
         const summary = err.summary || `Workflow failed: ${err.message}`;
         return {
           content: [{ type: "text", text: summary }],
-          details: { goal: params.goal, status: "failed", error: err.message },
+          details: { ...renderDetails, status: "failed", error: err.message, meta: err.meta },
           isError: true,
         };
       }
+    },
+    renderCall(args: any, theme: any, context: any) {
+      let piTui: any;
+      try {
+        piTui = require("@earendil-works/pi-tui");
+      } catch {
+        return undefined;
+      }
+      const Text = piTui?.Text;
+      if (!Text) return undefined;
+
+      const goal = args?.goal || "";
+      const goalPreview = previewWidgetText(goal, 40);
+      const provider = args?.reviewProvider || "codex";
+      const mode = args?.reviewMode || "after-all";
+
+      let text = theme.fg("toolTitle", theme.bold("cc_review"));
+      text += " " + theme.fg("muted", `"${goalPreview}"`);
+      text += " " + theme.fg("dim", `[provider: ${provider}, mode: ${mode}]`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result: any, options: any, theme: any) {
+      let piTui: any;
+      try {
+        piTui = require("@earendil-works/pi-tui");
+      } catch {
+        return undefined;
+      }
+      const Text = piTui?.Text;
+      if (!Text) return undefined;
+
+      const { expanded, isPartial } = options || {};
+      const details = result?.details;
+      const goal = details?.goal || "";
+      const goalPreview = previewWidgetText(goal, 40);
+      const provider = details?.reviewProvider || "codex";
+      const mode = details?.reviewMode || "after-all";
+
+      if (isPartial) {
+        let progressText = "Initializing...";
+        if (result?.content) {
+          for (let i = result.content.length - 1; i >= 0; i--) {
+            const t = result.content[i]?.text;
+            if (t && t.trim()) {
+              const lines = t.trim().split("\n");
+              const lastLine = lines[lines.length - 1].trim();
+              if (lastLine) {
+                progressText = lastLine;
+                break;
+              }
+            }
+          }
+        }
+        progressText = previewWidgetText(progressText, 60);
+
+        let text = theme.fg("warning", "⟳ Running");
+        text += " " + theme.fg("muted", ` "${goalPreview}"`);
+        text += " " + theme.fg("dim", ` [provider: ${provider}, mode: ${mode}]`);
+        text += " " + theme.fg("muted", ` | Progress: ${progressText}`);
+        return new Text(text, 0, 0);
+      }
+
+      // Finished execution
+      const isError = !!result?.isError;
+      const errorMsg = details?.error || "";
+
+      let statusText = "Success";
+      let statusColor = "success";
+      let statusIcon = "✓";
+
+      if (isError) {
+        if (/cancel|abort/i.test(errorMsg)) {
+          statusText = "Cancelled";
+          statusColor = "error";
+          statusIcon = "🛑";
+        } else {
+          statusText = "Failed";
+          statusColor = "error";
+          statusIcon = "✖";
+        }
+      } else {
+        // Check metadata for warnings/failures
+        const meta = details?.meta as CcReviewSummaryMeta | undefined;
+        if (meta && meta.taskOutcomes) {
+          const outcomes = meta.taskOutcomes;
+          if ((outcomes.cancelled ?? 0) > 0) {
+            statusText = "Cancelled";
+            statusColor = "error";
+            statusIcon = "\ud83d\uded1";
+          } else if ((outcomes.failed ?? 0) > 0 || (outcomes.review_blocked ?? 0) > 0) {
+            statusText = "Failed";
+            statusColor = "error";
+            statusIcon = "✖";
+          } else if ((outcomes.warning ?? 0) > 0) {
+            statusText = "Warning";
+            statusColor = "warning";
+            statusIcon = "⚠";
+          }
+        } else {
+          // Fallback to regex badge classification
+          const contentText = result?.content?.[0]?.text || "";
+          const badge = classifyCcReviewSummary(contentText);
+          if (badge === "failed") {
+            statusText = "Failed";
+            statusColor = "error";
+            statusIcon = "✖";
+          } else if (badge === "warning") {
+            statusText = "Warning";
+            statusColor = "warning";
+            statusIcon = "⚠";
+          } else if (badge === "cancelled") {
+            statusText = "Cancelled";
+            statusColor = "error";
+            statusIcon = "🛑";
+          }
+        }
+      }
+
+      let text = `${theme.fg(statusColor, `${statusIcon} ${statusText}`)}`;
+      text += " " + theme.fg("muted", `"${goalPreview}"`);
+      text += " " + theme.fg("dim", `[provider: ${provider}, mode: ${mode}]`);
+
+      if (expanded) {
+        const contentText = result?.content?.[0]?.text || "";
+        if (contentText) {
+          text += "\n" + contentText;
+        }
+      }
+
+      return new Text(text, 0, 0);
     },
   });
 }
@@ -2248,14 +2879,16 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; reviewMode?: string; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; error?: string } {
+export function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; logSources?: string; reviewMode?: string; reviewRepairRounds?: number; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; error?: string } {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
+  const hasLogSourcesFlag = /(?:^|\s)--log-sources(?:=|\s|$)/.test(args);
   const hasReviewModeFlag = /(?:^|\s)--review-mode(?:=|\s|$)/.test(args);
+  const hasReviewRepairRoundsFlag = /(?:^|\s)--review-repair-rounds(?:=|\s|$)/.test(args);
   const hasTaskTimeoutFlag = /(?:^|\s)--task-timeout(?:=|\s|$)/.test(args);
   const hasWidgetLogLinesFlag = /(?:^|\s)--widget-log-lines(?:=|\s|$)/.test(args);
   const hasChecklistWindowFlag = /(?:^|\s)--checklist-window(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag && !hasReviewModeFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag) {
+  if (!hasProviderFlag && !hasLogLevelFlag && !hasLogSourcesFlag && !hasReviewModeFlag && !hasReviewRepairRoundsFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag) {
     return { goal: args.trim() };
   }
 
@@ -2263,7 +2896,9 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
   const goalTokens: string[] = [];
   let reviewProvider: string | undefined;
   let logLevel: string | undefined;
+  let logSources: string | undefined;
   let reviewMode: string | undefined;
+  let reviewRepairRounds: number | undefined;
   let taskTimeoutMs: number | undefined;
   let widgetLogLines: number | undefined;
   let checklistWindow: number | undefined;
@@ -2308,6 +2943,23 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
       continue;
     }
 
+    const equalsLogSourcesMatch = token.match(/^--log-sources=(.*)$/);
+    if (equalsLogSourcesMatch) {
+      logSources = equalsLogSourcesMatch[1];
+      continue;
+    }
+
+    if (token === "--log-sources") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        logSources = "";
+      } else {
+        logSources = value;
+        i++;
+      }
+      continue;
+    }
+
     const equalsReviewModeMatch = token.match(/^--review-mode=(.*)$/);
     if (equalsReviewModeMatch) {
       reviewMode = equalsReviewModeMatch[1];
@@ -2323,6 +2975,31 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
         return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Supported review modes: per-task, after-all.` };
       }
       reviewMode = value;
+      i++;
+      continue;
+    }
+
+    const equalsReviewRepairRoundsMatch = token.match(/^--review-repair-rounds=(.*)$/);
+    if (equalsReviewRepairRoundsMatch) {
+      const raw = equalsReviewRepairRoundsMatch[1];
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isInteger(parsed) || parsed < 0) {
+        return { goal: "", error: `Invalid --review-repair-rounds value "${raw}". Expected a non-negative integer.` };
+      }
+      reviewRepairRounds = parsed;
+      continue;
+    }
+
+    if (token === "--review-repair-rounds") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a non-negative integer.` };
+      }
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return { goal: "", error: `Invalid --review-repair-rounds value "${value}". Expected a non-negative integer.` };
+      }
+      reviewRepairRounds = parsed;
       i++;
       continue;
     }
@@ -2409,7 +3086,9 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
     goal: goalTokens.join(" ").trim(),
     reviewProvider,
     logLevel,
+    logSources,
     reviewMode,
+    reviewRepairRounds,
     taskTimeoutMs,
     widgetLogLines,
     checklistWindow,
@@ -2456,7 +3135,17 @@ function summarizeParentContext(goal: string): string {
 export function buildRepairFeedback(
   reviewResult: ReviewResult | null,
   blockReason: BlockReason | undefined,
-  findings: ReviewFinding[]
+  findings: ReviewFinding[],
+  postReviewValidation?: {
+    error: string | null;
+    commands: Array<{
+      command: string;
+      args: string[];
+      exitCode: number;
+      stderr: string;
+      timedOut: boolean;
+    }>;
+  }
 ): string {
   const parts: string[] = [];
   parts.push(`Reviewer verdict: block (${blockReason ?? "explicit_block"})`);
@@ -2473,6 +3162,22 @@ export function buildRepairFeedback(
   }
   if (reviewResult?.postFixValidation?.status === "failed") {
     parts.push(`Post-fix validation failed: ${reviewResult.postFixValidation.evidence ?? "no evidence provided"}`);
+  }
+  if (postReviewValidation?.error) {
+    parts.push(`Orchestrator post-review validation failed: ${postReviewValidation.error}`);
+    for (const command of postReviewValidation.commands.filter(
+      (result) => result.timedOut || result.exitCode !== 0
+    )) {
+      const invocation = [command.command, ...command.args].join(" ");
+      const rawDiagnostic = command.stderr.trim();
+      const diagnostic = rawDiagnostic.length > 2000
+        ? `${rawDiagnostic.slice(0, 1999)}…`
+        : rawDiagnostic;
+      parts.push(
+        `- ${invocation}: ${command.timedOut ? "timed out" : `exit code ${command.exitCode}`}` +
+        (diagnostic ? `\n  ${diagnostic}` : "")
+      );
+    }
   }
   return parts.join("\n");
 }
@@ -3437,6 +4142,8 @@ async function runCcReviewWorkflow(
   const reviewMode = resolveReviewMode(options.reviewMode);
   const logLevelResolution = resolveCcReviewLogLevel({ flag: options.logLevel, env: process.env });
   const resolvedLogLevel: CcReviewLogSeverity = logLevelResolution.level;
+  const logSourcesResolution = resolveCcReviewLogSources({ flag: options.logSources, env: process.env });
+  const resolvedLogSources: string[] | undefined = logSourcesResolution.sources;
   const widgetLogLinesResolution = resolveCcReviewWidgetLogLines({ flag: options.widgetLogLines, env: process.env });
   const resolvedWidgetLogLines = widgetLogLinesResolution.lines;
   const checklistWindowResolution = resolveCcReviewChecklistWindow({ flag: options.checklistWindow, env: process.env });
@@ -3452,7 +4159,10 @@ async function runCcReviewWorkflow(
   const resolvedPlannerTimeoutMs = resolvePlannerTimeoutMs(process.env);
   const resolvedReviewerTimeoutMs = resolveReviewerTimeoutMs(process.env);
   // Resolve the reviewer-block repair round bound (P1-1).
-  const maxReviewRepairRounds = resolveMaxReviewRepairRounds(process.env);
+  const maxReviewRepairRounds = resolveMaxReviewRepairRounds({
+    flag: options.reviewRepairRounds,
+    env: process.env,
+  });
 
   // Trace workflow start
   emitTrace(ctx, "workflow_start", {
@@ -3460,6 +4170,7 @@ async function runCcReviewWorkflow(
     reviewProvider: reviewProviderConfig.provider,
     reviewMode,
     logLevel: resolvedLogLevel,
+    logSources: resolvedLogSources,
     widgetLogLines: resolvedWidgetLogLines,
     checklistWindow: resolvedChecklistWindow,
     taskTimeoutMs: resolvedTaskTimeoutMs,
@@ -3711,6 +4422,7 @@ async function runCcReviewWorkflow(
     lastTaskWarning,
     liveLogs,
     resolvedLogLevel,
+    resolvedLogSources,
     resolvedWidgetLogLines,
     resolvedChecklistWindow,
     persistedLogPath: persistedLogState.filePath,
@@ -3745,7 +4457,8 @@ async function runCcReviewWorkflow(
     });
     const uiTheme = ctx?.ui?.theme;
     if (uiTheme && typeof uiTheme.fg === "function") {
-      ctx?.ui?.setStatus?.("cc-review-status", uiTheme.fg("accent", statusText));
+      const color = getStatusColorForDisplayState(displayState);
+      ctx?.ui?.setStatus?.("cc-review-status", uiTheme.fg(color, statusText));
     } else {
       ctx?.ui?.setStatus?.("cc-review-status", statusText);
     }
@@ -3791,7 +4504,8 @@ async function runCcReviewWorkflow(
         ? (entry.severity as CcReviewLogSeverity)
         : "info";
       const passesLogLevel = LOG_SEVERITY_RANK[entrySeverityForGate] >= LOG_SEVERITY_RANK[resolvedLogLevel];
-      if (passesLogLevel) {
+      const passesLogSources = resolvedLogSources === undefined || resolvedLogSources.includes(entry.source);
+      if (passesLogLevel && passesLogSources) {
         const renderedDelta = renderCcReviewLogEntry(entry, { maxLineWidth: 120 });
         const deltaLines: string[] = [...renderedDelta];
         if (currentPhase !== lastSeenPhase) {
@@ -3829,6 +4543,18 @@ async function runCcReviewWorkflow(
       message:
         `Ignoring invalid log level ${JSON.stringify(rawDisplay)} from ${invalidSource}; ` +
         `falling back to default 'info'.`,
+    });
+  }
+
+  if (logSourcesResolution.invalidInput) {
+    const { source: invalidSource, raw } = logSourcesResolution.invalidInput;
+    const rawDisplay = typeof raw === "string" ? raw : String(raw ?? "");
+    log({
+      severity: "warning",
+      source: "cc-review",
+      message:
+        `Ignoring invalid log sources ${JSON.stringify(rawDisplay)} from ${invalidSource}; ` +
+        `falling back to default 'all'.`,
     });
   }
 
@@ -4055,18 +4781,20 @@ async function runCcReviewWorkflow(
     command: string,
     args: string[]
   ): Promise<ProcessResult> => {
-    return runProcess(
+    const stdoutLogger = createSubprocessStreamLogger(log, "stdout", "reviewer");
+    const stderrLogger = createSubprocessStreamLogger(log, "stderr", "reviewer");
+    const processPromise = runProcess(
       label,
       command,
       args,
-      (data) => {
-        logSubprocessStreamLines(log, data.toString(), "stdout", "reviewer");
-      },
-      (data) => {
-        logSubprocessStreamLines(log, data.toString(), "stderr", "reviewer");
-      },
+      (data) => stdoutLogger.write(data),
+      (data) => stderrLogger.write(data),
       resolvedReviewerTimeoutMs > 0 ? resolvedReviewerTimeoutMs : undefined
-    ).catch((err: any) => {
+    ).finally(() => {
+      stdoutLogger.flush();
+      stderrLogger.flush();
+    });
+    return processPromise.catch((err: any) => {
       const errorMessage = err?.message || String(err);
       if (/timed out/i.test(errorMessage)) {
         log({
@@ -4214,6 +4942,8 @@ async function runCcReviewWorkflow(
 
       let plannerStdoutBuffer = "";
       let planResult: ProcessResult;
+      const plannerStdoutLogger = createSubprocessStreamLogger(log, "stdout", "planner");
+      const plannerStderrLogger = createSubprocessStreamLogger(log, "stderr", "planner");
       try {
         planResult = await runProcess(
           plannerLabel,
@@ -4222,11 +4952,9 @@ async function runCcReviewWorkflow(
           (data) => {
             const chunk = data.toString();
             if (captureStdoutForPlanner) plannerStdoutBuffer += chunk;
-            logSubprocessStreamLines(log, chunk, "stdout", "planner");
+            plannerStdoutLogger.write(chunk);
           },
-          (data) => {
-            logSubprocessStreamLines(log, data.toString(), "stderr", "planner");
-          },
+          (data) => plannerStderrLogger.write(data),
           resolvedPlannerTimeoutMs > 0 ? resolvedPlannerTimeoutMs : undefined
         );
       } catch (err: any) {
@@ -4252,6 +4980,9 @@ async function runCcReviewWorkflow(
           continue;
         }
         throw err;
+      } finally {
+        plannerStdoutLogger.flush();
+        plannerStderrLogger.flush();
       }
 
       if (planResult.code !== 0) {
@@ -4362,6 +5093,7 @@ async function runCcReviewWorkflow(
       // generator attempt so the subagent can fix the reviewer's findings
       // instead of hard-failing the whole workflow (P1-1).
       let repairFeedback: string | undefined = undefined;
+      let repairRequiresPostReviewValidation = false;
       const unresolvedItemsForFailedTask: string[] = [];
 
       // Self-repair bound for per-task subagent dispatch. Default 2 retries on
@@ -4701,7 +5433,7 @@ async function runCcReviewWorkflow(
       const rerunValidation = validateSubagentOutput(cachedSubagentResult, task);
       const postReview = await runPostReviewValidation({
         reviewResult: reviewResultObject,
-        workspaceChanged,
+        workspaceChanged: workspaceChanged || repairRequiresPostReviewValidation,
         verificationPlan,
         runCommand: runVerificationCommand,
         rerunSubagentValidationPassed: rerunValidation.valid,
@@ -4832,6 +5564,7 @@ async function runCcReviewWorkflow(
         // re-review (P1-1). The generator gets the concrete findings so it can
         // fix them instead of the whole workflow aborting on the first block.
         repairFeedback = buildRepairFeedback(reviewResultObject ?? null, derived.blockReason, findings);
+        repairRequiresPostReviewValidation ||= derived.blockReason === "post_review_validation_failed";
         log({
           severity: "warning",
           source: "reviewer",
@@ -4844,14 +5577,6 @@ async function runCcReviewWorkflow(
     }
 
     if (reviewMode === "after-all") {
-      transitionToBatchReviewing();
-      emitTrace(ctx, "subagent_assignment", {
-        role: "reviewer",
-        agent: reviewProviderConfig.provider,
-        reviewMode,
-        tasksCount: tasks.length,
-      });
-
       const batchReviewTask: Task = {
         title: `Complete workflow: ${goal}`,
         description: [
@@ -4868,7 +5593,31 @@ async function runCcReviewWorkflow(
         ].join("\n\n"),
         acceptanceCriteria: "The complete workflow satisfies every planned task's acceptance criteria.",
       };
-      const reviewArgs = reviewProviderConfig.buildArgs({ task: batchReviewTask });
+      let batchRepairFeedback: string | undefined;
+      let batchRepairRequiresPostReviewValidation = false;
+
+      BATCH_REPAIR_LOOP: for (let repairRound = 0; ; repairRound++) {
+      transitionToBatchReviewing();
+      emitTrace(ctx, "subagent_assignment", {
+        role: "reviewer",
+        agent: reviewProviderConfig.provider,
+        reviewMode,
+        tasksCount: tasks.length,
+        repairRound,
+      });
+
+      const reviewTask = batchRepairFeedback
+        ? {
+            ...batchReviewTask,
+            description: [
+              batchReviewTask.description,
+              `This is repair round ${repairRound}/${maxReviewRepairRounds}.`,
+              "Fix every issue below in the workspace, rerun the relevant verification, and then review the complete workflow again:",
+              batchRepairFeedback,
+            ].join("\n\n"),
+          }
+        : batchReviewTask;
+      const reviewArgs = reviewProviderConfig.buildArgs({ task: reviewTask });
       const workspaceBeforeReview = snapshotWorkspace(workflowCwd);
       const reviewProcessResult = await runReviewerProcess(
         reviewProviderConfig.label,
@@ -4890,7 +5639,7 @@ async function runCcReviewWorkflow(
       );
       const postReview = await runPostReviewValidation({
         reviewResult: reviewResultObject,
-        workspaceChanged,
+        workspaceChanged: workspaceChanged || batchRepairRequiresPostReviewValidation,
         verificationPlan,
         runCommand: runVerificationCommand,
         rerunSubagentValidationPassed: rerunValidations.every((validation) => validation.valid),
@@ -4905,6 +5654,23 @@ async function runCcReviewWorkflow(
       });
       const effectiveVerdict = derived.effectiveVerdict;
       const batchStatus = mapEffectiveVerdictToTaskStatus(effectiveVerdict);
+
+      if (effectiveVerdict === "block" && repairRound < maxReviewRepairRounds) {
+        batchRepairFeedback = buildRepairFeedback(
+          reviewResultObject ?? null,
+          derived.blockReason,
+          findings,
+          postReview
+        );
+        batchRepairRequiresPostReviewValidation ||= derived.blockReason === "post_review_validation_failed";
+        log({
+          severity: "warning",
+          source: "reviewer",
+          message: `[Repair] Final workflow review blocked completion. Re-dispatching the reviewer to fix findings and validation failures (repair round ${repairRound + 1}/${maxReviewRepairRounds})...`,
+        });
+        continue BATCH_REPAIR_LOOP;
+      }
+
       let reviewerExitDiagnostic: string | undefined;
       if (reviewProcessResult.exitCode !== 0 && effectiveVerdict === "ship") {
         reviewerExitDiagnostic = `Reviewer exited non-zero (code ${reviewProcessResult.exitCode}) despite ship verdict`;
@@ -5004,13 +5770,18 @@ async function runCcReviewWorkflow(
       refreshWorkflowUi();
 
       if (effectiveVerdict === "block") {
-        log("[Workflow Halted] Final workflow review blocked completion.");
+        log(`[Workflow Halted] Final workflow review remained blocked after ${maxReviewRepairRounds} repair round(s).`);
         const summary = appendPersistedLogPathToSummary(
           buildSummaryReport(goal, taskResults, tasks),
           persistedLogState.filePath
         );
-        throw new WorkflowError("Blocked by final workflow review", summary);
+        throw new WorkflowError(
+          `Blocked by final workflow review (after ${maxReviewRepairRounds} repair round(s))`,
+          summary
+        );
       }
+      break BATCH_REPAIR_LOOP;
+      } // end BATCH_REPAIR_LOOP
     }
 
     if (!rollupEmitted) {
@@ -5099,12 +5870,19 @@ async function runCcReviewWorkflow(
     }
 
     if (err instanceof WorkflowError) {
+      displayState = "failed";
+      currentPhase = "Failed";
+      err.meta ??= buildCcReviewSummaryMeta(taskResults);
+      refreshWorkflowUi();
       throw err;
     }
 
     // Mark the currently executing/reviewing task as cancelled if it was interrupted
     if (isCancelled) {
       displayState = isTimeout ? "timeout" : "cancelled";
+    } else {
+      displayState = "failed";
+      currentPhase = "Failed";
     }
     if (isCancelled && currentTaskIndex >= 0 && currentTaskIndex < tasks.length) {
       if (taskResults.length === currentTaskIndex) {
@@ -5122,7 +5900,8 @@ async function runCcReviewWorkflow(
       buildSummaryReport(goal, taskResults, tasks),
       persistedLogState.filePath
     );
-    throw new WorkflowError(err.message, summary);
+    refreshWorkflowUi();
+    throw new WorkflowError(err.message, summary, buildCcReviewSummaryMeta(taskResults));
   } finally {
     // Clean up temporary files
     try {
