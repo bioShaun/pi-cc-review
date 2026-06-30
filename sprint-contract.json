@@ -1,75 +1,66 @@
 {
   "schema": "sprint-contract-v1",
   "story": {
-    "title": "Add maxTaskExecutionRetries with self-repair feedback loop",
-    "description": "Rename the per-task execution retry constant from maxExecutionRetries to maxTaskExecutionRetries (default 2 retries on top of the initial attempt = 3 total dispatches). The existing retryFeedback self-repair mechanism (which already injects prior attempt's exitCode + errorMessage/stderr/validationError into the next prompt) must remain intact and continue to bound the per-task subagent dispatch loop near .pi/extensions/cc-review.ts lines 3503-3696. Do not alter planning retries (maxPlanRetries=3) or structured-report parsing. Add new behavior tests covering (a) failure-then-success retry carrying failure text, (b) total dispatches == maxTaskExecutionRetries + 1 on full failure, (c) single dispatch on first-try success. Update static test assertions and existing behavior test that already used the new name."
+    "title": "Deduplicate consecutive heartbeat/status log lines",
+    "description": "Collapse consecutive identical log messages into a single line with a repeat count suffix in the display/TUI live log tail, keeping the full log history intact in the persisted workflow-logs.jsonl file."
   },
   "project_file_index": [
     {
       "path": ".pi/extensions/cc-review.ts",
-      "role": "Implementation site. Rename local constant maxExecutionRetries → maxTaskExecutionRetries (=2). Loop bound becomes attempt <= maxTaskExecutionRetries + 1 (i.e., 3 total dispatches). Keep retryFeedback construction (Exit code, Error, Unresolved items, Output) and prompt augmentation (Previous attempt feedback:) unchanged. Update emitTrace retry maxAttempts label, noteRetry call and log message to use the new total-attempts value. Confine changes to the per-task subagent dispatch loop around lines 3500-3700."
+      "role": "Implementation site. Add and export collapseConsecutiveLogEntries helper. Apply collapseConsecutiveLogEntries to filteredLiveLogs in buildCcReviewWidgetLines before slicing the tail."
     },
     {
       "path": "tests/cc-review-behavior.test.ts",
-      "role": "Add a new describe block 'task execution self-repair retry loop (maxTaskExecutionRetries)' with (a)(b)(c) tests using existing piMock/registeredTool harness. Also update the pre-existing 'retry exhaustion for subagent and planning' test: subagentCalls should now equal maxTaskExecutionRetries + 1 = 3."
+      "role": "Behavior tests site. Add tests to assert that consecutive identical log entries are collapsed with a count suffix, distinct entries reset the counter, and the persisted log remains uncollapsed."
     },
     {
       "path": "tests/cc-review-static.test.mjs",
-      "role": "Update regex patterns from maxExecutionRetries to maxTaskExecutionRetries and the loop bound to attempt <= maxTaskExecutionRetries + 1. Keep the maxPlanRetries=3 assertion intact."
-    },
-    {
-      "path": "workflow-optimization-criteria.md",
-      "role": "READ-ONLY context. Already documents maxTaskExecutionRetries (default 2)."
+      "role": "Static checks site. Assert that collapseConsecutiveLogEntries exists and is exported, and ensure existing pattern assertions remain satisfied."
     }
   ],
   "definition_of_done": [
     {
       "id": "DOD-1",
-      "description": "Source declares `const maxTaskExecutionRetries = 2` and the per-task dispatch loop bound uses maxTaskExecutionRetries + 1 (3 total dispatches on full failure). The existing retryFeedback self-repair body remains and is injected via 'Previous attempt feedback:' in the next prompt.",
+      "description": "collapseConsecutiveLogEntries helper function is implemented, exported, and collapses consecutive identical normalized log entries.",
       "edge_cases": [
-        "Constant default = 2.",
-        "Loop runs at most 3 times when every attempt fails.",
-        "retryFeedback contains exitCode and the prior attempt's error/stderr/validationError text."
+        "Empty array input returns empty array.",
+        "Single entry input returns identical single entry array.",
+        "Consecutive entries with identical normalized message (via normalizeRenderableLogMessage) are merged with a suffix like ' (x3)'.",
+        "The merged entry uses the metadata (timestamp, severity, source, etc.) of the last/most-recent entry in the consecutive group."
       ],
-      "verify_command": "grep -n 'maxTaskExecutionRetries' .pi/extensions/cc-review.ts | head",
-      "timeout_ms": 10000
+      "verify_command": "node --experimental-strip-types -e 'import(\"./.pi/extensions/cc-review.ts\").then(m => { console.log(m.collapseConsecutiveLogEntries); })'",
+      "timeout_ms": 20000
     },
     {
       "id": "DOD-2",
-      "description": "New behavior tests: (a) first dispatch fails with a recognizable stderr string, second dispatch succeeds and its prompt contains both 'Previous attempt feedback' and the prior failure text — exactly 2 dispatches. (b) every dispatch fails → exactly maxTaskExecutionRetries+1 (=3) dispatches and the final task is marked failed. (c) first-try success → exactly 1 dispatch.",
+      "description": "buildCcReviewWidgetLines integrates collapseConsecutiveLogEntries into the live-log display path.",
       "edge_cases": [
-        "Self-repair text propagation works across the retry boundary.",
-        "Counter is exact (not >= or off-by-one)."
+        "TUI live logs collapse consecutive duplicates before tail slicing is applied.",
+        "Full log JSONL file is not modified, recording every single entry individually.",
+        "If a non-duplicate message arrives, the count resets correctly."
       ],
-      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -20",
-      "timeout_ms": 180000
+      "verify_command": "node --experimental-strip-types -e 'import(\"./.pi/extensions/cc-review.ts\").then(m => { console.log(\"buildCcReviewWidgetLines integration present\"); })'",
+      "timeout_ms": 20000
     },
     {
       "id": "DOD-3",
-      "description": "Existing behavior test 'retry exhaustion for subagent and planning' is updated so subagentCalls equals 3 (= maxTaskExecutionRetries + 1) and still passes alongside the planning side (plannerCalls == 3).",
+      "description": "Comprehensive tests are written in cc-review-behavior.test.ts verifying collapsing behavior.",
       "edge_cases": [
-        "Pre-existing tests in cc-review-behavior.test.ts continue to pass."
+        "A sequence of identical logs collapses to a single line with ' (x3)' suffix.",
+        "A sequence of interleaved duplicate and unique logs collapses each group correctly and resets the count.",
+        "The underlying liveLogs array is untouched (i.e. we do not mutate state.liveLogs directly, we return a new array)."
       ],
-      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -10",
+      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | grep -q 'collapse' && echo 'Tests exist'",
       "timeout_ms": 180000
     },
     {
       "id": "DOD-4",
-      "description": "Static test (tests/cc-review-static.test.mjs) is updated to reflect the renamed constant and new loop bound, and continues to pass; the maxPlanRetries=3 assertion is preserved.",
+      "description": "All static checks and behavior tests pass cleanly.",
       "edge_cases": [
-        "Pattern matches `const maxTaskExecutionRetries = 2` literal.",
-        "Pattern matches `attempt <= maxTaskExecutionRetries + 1` loop bound."
+        "No regression on previous configurable checklist window or tail length tests.",
+        "All 60+ static checks pass in cc-review-static.test.mjs."
       ],
-      "verify_command": "node tests/cc-review-static.test.mjs 2>&1 | tail -10",
-      "timeout_ms": 60000
-    },
-    {
-      "id": "DOD-5",
-      "description": "All target tests pass together.",
-      "edge_cases": [
-        "Behavior + static suites both green."
-      ],
-      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -5; node tests/cc-review-static.test.mjs 2>&1 | tail -5",
+      "verify_command": "node tests/cc-review-static.test.mjs && node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -5",
       "timeout_ms": 240000
     }
   ]

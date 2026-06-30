@@ -174,7 +174,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; reviewMode\?: string; taskTimeoutMs\?: number; error\?: string \}/);
+  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; reviewMode\?: string; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?error\?: string \}/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -443,7 +443,7 @@ test("display log path uses normalized log entries", () => {
   assert.match(source, /const liveLogs: CcReviewLogEntry\[\] = \[\]/);
   assert.match(source, /let logSequence = 0/);
   assert.match(source, /const log = \(input: CcReviewLogInput\) => \{\n\s+const entry = normalizeCcReviewLogEntry\(input, \{ sequence: \+\+logSequence \}\);\n\s+if \(!entry\.message\) return;\n\s+liveLogs\.push\(entry\);/);
-  assert.match(source, /if \(liveLogs\.length > 50\) \{\n\s+liveLogs\.shift\(\);/);
+  assert.match(source, /if \(liveLogs\.length > (?:50|maxLiveLogs)\) \{\s*\n\s*liveLogs\.shift\(\);/);
   // Widget renders the bounded tail of liveLogs through the structured renderer.
   // The tail comes from the filtered (default pass-through) live-log buffer so
   // that future severity/source toggles can be wired in without touching this
@@ -467,7 +467,9 @@ test("display log path renders severity-aware normalized log entries", () => {
   assert.match(source, /function wrapLogMessage\(message: string, maxWidth: number\): string\[\]/);
   assert.match(source, /export function renderCcReviewLogEntry\(\n\s+entry: CcReviewLogEntry,/);
   assert.match(source, /const prefix = `\$\{severityMeta\.icon\} \$\{severityMeta\.label\.padEnd\(5\)\} \$\{contextParts\.join\(" "\)\}: `/);
-  assert.match(source, /const continuationPrefix = " "\.repeat\(prefix\.length\)/);
+  // continuationPrefix now uses visible column width (prefixVisibleWidth) rather
+  // than raw JS string length, so CJK/wide characters are counted correctly.
+  assert.match(source, /const continuationPrefix = " "\.repeat\(prefixVisibleWidth\)/);
   assert.match(source, /function renderCcReviewLogEntries\(entries: readonly CcReviewLogEntry\[\], options: CcReviewLogRenderOptions = \{\}\): string\[\]/);
   assert.doesNotMatch(source, /registerMessageRenderer\("cc-review-log"/);
 });
@@ -568,7 +570,7 @@ test("filter helper is exported and wired into the widget live-log slice", () =>
   );
   assert.match(
     source,
-    /const recentLogs = filteredLiveLogs\.slice\(-WIDGET_LIVE_LOG_LINES\)/
+    /const recentLogs = tailLength > 0 \? filteredLiveLogs\.slice\(-tailLength\) : \[\];/
   );
 });
 
@@ -612,7 +614,7 @@ test("log-level resolver is exported with the documented signature and wired thr
   assert.match(source, /logLevel:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional minimum log severity/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+reviewMode\?: string;\n\s+taskTimeoutMs\?: number;\n\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+reviewMode\?: string;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?\}/
   );
   assert.match(
     source,
@@ -624,7 +626,7 @@ test("log-level resolver is exported with the documented signature and wired thr
   // Persisted writes happen BEFORE the onUpdate filter gate so workflow-logs.jsonl is unfiltered.
   assert.match(
     source,
-    /persistedLogState = appendPersistedLogEntry\(persistedLogState, entry\);[\s\S]{0,1500}if \(onUpdate\) \{[\s\S]{0,600}const passesLogLevel = LOG_SEVERITY_RANK\[entrySeverityForGate\] >= LOG_SEVERITY_RANK\[resolvedLogLevel\];/
+    /persistedLogState = appendPersistedLogEntry\(persistedLogState, entry\);[\s\S]{0,1500}if \(onUpdate(?: && [^)]+)?\) \{[\s\S]{0,600}const passesLogLevel = LOG_SEVERITY_RANK\[entrySeverityForGate\] >= LOG_SEVERITY_RANK\[resolvedLogLevel\];/
   );
   assert.match(
     source,
@@ -1017,4 +1019,52 @@ test("planner reuses shared JSON extraction helper", () => {
   // uses the shared JSON extraction helper on the recovered text.
   assert.match(source, /extractAssistantTextFromStream\(plannerStdoutBuffer\)/);
   assert.match(source, /extractBalancedJsonObject\(plannerText,\s*"first"\)/);
+});
+
+test("configurable task checklist window size is exported and integrated", () => {
+  // Test resolver and options interfaces are exported with expected signatures
+  assert.match(
+    source,
+    /export interface ResolveCcReviewChecklistWindowOptions \{[\s\S]*?flag\?: any;[\s\S]*?env\?: NodeJS\.ProcessEnv;[\s\S]*?\}/
+  );
+  assert.match(
+    source,
+    /export interface ResolveCcReviewChecklistWindowResult \{[\s\S]*?window: number;[\s\S]*?source: "flag" \| "env" \| "default";[\s\S]*?invalidInput\?: \{ source: "flag" \| "env"; raw: string \};[\s\S]*?\}/
+  );
+  assert.match(
+    source,
+    /export function resolveCcReviewChecklistWindow\(/
+  );
+
+  // Workflow resolves the checklist window once at startup
+  assert.match(
+    source,
+    /const checklistWindowResolution = resolveCcReviewChecklistWindow\(\{ flag: options\.checklistWindow, env: process\.env \}\);/
+  );
+
+  // Default checklist window size is 8
+  assert.match(source, /const WIDGET_CHECKLIST_WINDOW = 8;/);
+
+  // computeChecklistWindow handles maxVisible and defaults to WIDGET_CHECKLIST_WINDOW
+  assert.match(
+    source,
+    /export function computeChecklistWindow\([\s\S]*?maxVisible: number = WIDGET_CHECKLIST_WINDOW/
+  );
+
+  // buildCcReviewWidgetLines uses the resolved checklist window size
+  assert.match(
+    source,
+    /state\.resolvedChecklistWindow \?\? WIDGET_CHECKLIST_WINDOW/
+  );
+});
+
+test("collapseConsecutiveLogEntries is exported and integrated in widget path", () => {
+  assert.match(
+    source,
+    /export function collapseConsecutiveLogEntries\(/
+  );
+  assert.match(
+    source,
+    /const collapsed = collapseConsecutiveLogEntries\(filteredLiveLogs\);/
+  );
 });

@@ -37,6 +37,10 @@ import ccReviewExtension, {
   resolveReviewMode,
   resolveReviewerTimeoutMs,
   resolveSubagentTaskTimeout,
+  resolveCcReviewWidgetLogLines,
+  resolveCcReviewChecklistWindow,
+  collapseConsecutiveLogEntries,
+  emptyFindingsRollup,
   summarizeLogSeverities,
   summarizeSubagentToolActivity,
   truncateForWidget,
@@ -2928,6 +2932,71 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.deepEqual(small, { startIndex: 0, endIndex: 5, hiddenBefore: 0, hiddenAfter: 0 });
   });
 
+  it("configurable task checklist window size", () => {
+    // 1) Test resolveCcReviewChecklistWindow with flags and env.
+    const r1 = resolveCcReviewChecklistWindow({ flag: 12 });
+    assert.equal(r1.window, 12);
+    assert.equal(r1.source, "flag");
+
+    const r2 = resolveCcReviewChecklistWindow({ env: { CC_REVIEW_CHECKLIST_WINDOW: "3" } });
+    assert.equal(r2.window, 3);
+    assert.equal(r2.source, "env");
+
+    const r3 = resolveCcReviewChecklistWindow();
+    assert.equal(r3.window, 8);
+    assert.equal(r3.source, "default");
+
+    const r4 = resolveCcReviewChecklistWindow({ flag: "invalid" });
+    assert.equal(r4.window, 8);
+    assert.equal(r4.source, "default");
+    assert.equal(r4.invalidInput?.source, "flag");
+
+    const r5 = resolveCcReviewChecklistWindow({ env: { CC_REVIEW_CHECKLIST_WINDOW: "-5" } });
+    assert.equal(r5.window, 8);
+    assert.equal(r5.source, "default");
+    assert.equal(r5.invalidInput?.source, "env");
+
+    // 2) Verify windows of 3, 8, and 20 on a task list of 10 tasks at different currentIndexes.
+    // Window of 3, centered on index 5 of a 10-task list
+    const w3 = computeChecklistWindow(10, 5, 3);
+    assert.deepEqual(w3, { startIndex: 4, endIndex: 7, hiddenBefore: 4, hiddenAfter: 3 });
+
+    // Window of 8, centered on index 5 of a 10-task list
+    const w8 = computeChecklistWindow(10, 5, 8);
+    assert.deepEqual(w8, { startIndex: 1, endIndex: 9, hiddenBefore: 1, hiddenAfter: 1 });
+
+    // Window of 20, centered on index 5 of a 10-task list
+    const w20 = computeChecklistWindow(10, 5, 20);
+    assert.deepEqual(w20, { startIndex: 0, endIndex: 10, hiddenBefore: 0, hiddenAfter: 0 });
+
+    // Coercion test: window of 0 or negative
+    const wZero = computeChecklistWindow(10, 5, 0);
+    assert.equal(wZero.endIndex - wZero.startIndex, 1, "0 window should coerce to at least 1");
+
+    // 3) Verify buildCcReviewWidgetLines uses the resolvedChecklistWindow
+    const dummyState = {
+      goal: "Test goal",
+      tasks: Array.from({ length: 10 }, (_, i) => ({ title: `Task ${i + 1}`, status: "completed" })),
+      currentTaskIndex: 5,
+      displayState: "executing",
+      currentPhase: "Executing",
+      liveLogs: [],
+      resolvedLogLevel: "info",
+      resolvedChecklistWindow: 3,
+      persistedLogPath: "dummy.jsonl",
+      findingsRollup: emptyFindingsRollup(),
+    };
+
+    const renderedLines = buildCcReviewWidgetLines(dummyState as any);
+    // Rendered lines should contain earlier/later ellipses:
+    const earlierLines = renderedLines.filter(line => line.includes("earlier task"));
+    const laterLines = renderedLines.filter(line => line.includes("later task"));
+    assert.equal(earlierLines.length, 1, "Should have 1 earlier tasks line");
+    assert.equal(laterLines.length, 1, "Should have 1 later tasks line");
+    assert.ok(earlierLines[0].includes("4 earlier tasks"), "Should show exactly 4 earlier tasks");
+    assert.ok(laterLines[0].includes("3 later tasks"), "Should show exactly 3 later tasks");
+  });
+
   it("truncates verbose widget lines with a single-char ellipsis", () => {
     const longGoal = "a".repeat(200);
     const truncated = truncateForWidget(`Goal: ${longGoal}`, 32);
@@ -3749,5 +3818,246 @@ describe("buildSubagentTaskPrompt injects the prior task handoff into Task N≥2
     assert.match(handoff, /… \(truncated\)/);
     // The overall prompt stays comfortably bounded (handoff cap + small body).
     assert.ok(prompt.length < 8 * 1024, `prompt unexpectedly large: ${prompt.length}`);
+  });
+});
+
+describe("configurable live-log tail length", () => {
+  const baseState = {
+    goal: "Test Goal",
+    tasks: [],
+    currentTaskIndex: -1,
+    displayState: "initializing" as const,
+    currentPhase: "Initializing",
+    liveLogs: Array.from({ length: 15 }, (_, i) => ({
+      id: `id-${i}`,
+      timestamp: "2026-06-30T15:00:00.000Z",
+      severity: "info" as const,
+      source: "cc-review",
+      pluginId: "cc-review",
+      message: `Log line ${i + 1}`,
+      sequence: i + 1,
+    })),
+    resolvedLogLevel: "info" as const,
+    persistedLogPath: "workflow-logs.jsonl",
+    findingsRollup: { shipCount: 0, warningCount: 0, blockCount: 0, openFindingsCount: 0 },
+  };
+
+  it("produces 0 log lines when tail length is resolved to 0", () => {
+    const state = {
+      ...baseState,
+      resolvedWidgetLogLines: 0,
+    };
+    const lines = buildCcReviewWidgetLines(state);
+    // Find how many rendered logs are there. In the widget, each live log starts with "   " or contains colored log entry line.
+    // Our state has 15 logs, but resolved tail length is 0.
+    // So there should be no log entries listed.
+    const logLines = lines.filter(line => line.includes("Log line"));
+    assert.equal(logLines.length, 0);
+  });
+
+  it("produces at most 5 log lines when tail length is resolved to 5 (default)", () => {
+    const state = {
+      ...baseState,
+      resolvedWidgetLogLines: 5,
+    };
+    const lines = buildCcReviewWidgetLines(state);
+    const logLines = lines.filter(line => line.includes("Log line"));
+    assert.equal(logLines.length, 5);
+    // Check they are the last 5 logs (Log line 11 to 15)
+    assert.ok(logLines[0].includes("Log line 11"));
+    assert.ok(logLines[4].includes("Log line 15"));
+  });
+
+  it("produces at most 10 log lines when tail length is resolved to 10", () => {
+    const state = {
+      ...baseState,
+      resolvedWidgetLogLines: 10,
+    };
+    const lines = buildCcReviewWidgetLines(state);
+    const logLines = lines.filter(line => line.includes("Log line"));
+    assert.equal(logLines.length, 10);
+    // Check they are the last 10 logs (Log line 6 to 15)
+    assert.ok(logLines[0].includes("Log line 6"));
+    assert.ok(logLines[9].includes("Log line 15"));
+  });
+
+  it("resolves the configurable tail length correctly based on environment and flags", () => {
+    // 1) default
+    const res1 = resolveCcReviewWidgetLogLines();
+    assert.equal(res1.lines, 5);
+    assert.equal(res1.source, "default");
+
+    // 2) flag
+    const res2 = resolveCcReviewWidgetLogLines({ flag: 10 });
+    assert.equal(res2.lines, 10);
+    assert.equal(res2.source, "flag");
+
+    // 3) env
+    const res3 = resolveCcReviewWidgetLogLines({ env: { CC_REVIEW_WIDGET_LOG_LINES: "8" } });
+    assert.equal(res3.lines, 8);
+    assert.equal(res3.source, "env");
+
+    // 4) flag overrides env
+    const res4 = resolveCcReviewWidgetLogLines({ flag: 3, env: { CC_REVIEW_WIDGET_LOG_LINES: "8" } });
+    assert.equal(res4.lines, 3);
+    assert.equal(res4.source, "flag");
+
+    // 5) invalid env falls back to 5
+    const res5 = resolveCcReviewWidgetLogLines({ env: { CC_REVIEW_WIDGET_LOG_LINES: "invalid" } });
+    assert.equal(res5.lines, 5);
+    assert.equal(res5.source, "default");
+    assert.ok(res5.invalidInput);
+    assert.equal(res5.invalidInput.source, "env");
+    assert.equal(res5.invalidInput.raw, "invalid");
+  });
+});
+
+describe("collapse consecutive identical log messages", () => {
+  it("returns empty array for empty input", () => {
+    const result = collapseConsecutiveLogEntries([]);
+    assert.deepEqual(result, []);
+  });
+
+  it("returns same single element array", () => {
+    const logs = [
+      {
+        id: "id-1",
+        timestamp: "2026-06-30T15:00:00.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Unique msg",
+        sequence: 1,
+      },
+    ];
+    const result = collapseConsecutiveLogEntries(logs);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].message, "Unique msg");
+  });
+
+  it("collapses consecutive duplicate logs and preserves meta of the last entry", () => {
+    const logs = [
+      {
+        id: "id-1",
+        timestamp: "2026-06-30T15:00:01.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Codex planner still running (30s)...",
+        sequence: 1,
+      },
+      {
+        id: "id-2",
+        timestamp: "2026-06-30T15:00:02.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Codex planner still running (30s)...",
+        sequence: 2,
+      },
+      {
+        id: "id-3",
+        timestamp: "2026-06-30T15:00:03.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "  Codex planner still running (30s)... \n",
+        sequence: 3,
+      },
+    ];
+
+    const result = collapseConsecutiveLogEntries(logs);
+    assert.equal(result.length, 1);
+    assert.ok(result[0].message.includes("(x3)"));
+    assert.equal(result[0].sequence, 3);
+    assert.equal(result[0].timestamp, "2026-06-30T15:00:03.000Z");
+  });
+
+  it("resets counter when non-duplicate logs are in between", () => {
+    const logs = [
+      {
+        id: "id-1",
+        timestamp: "2026-06-30T15:00:01.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Heartbeat",
+        sequence: 1,
+      },
+      {
+        id: "id-2",
+        timestamp: "2026-06-30T15:00:02.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Heartbeat",
+        sequence: 2,
+      },
+      {
+        id: "id-3",
+        timestamp: "2026-06-30T15:00:03.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Different msg",
+        sequence: 3,
+      },
+      {
+        id: "id-4",
+        timestamp: "2026-06-30T15:00:04.000Z",
+        severity: "info" as const,
+        source: "cc-review",
+        pluginId: "cc-review",
+        message: "Heartbeat",
+        sequence: 4,
+      },
+    ];
+
+    const result = collapseConsecutiveLogEntries(logs);
+    assert.equal(result.length, 3);
+    assert.ok(result[0].message.includes("Heartbeat"));
+    assert.ok(result[0].message.includes("(x2)"));
+    assert.equal(result[1].message, "Different msg");
+    assert.equal(result[2].message, "Heartbeat");
+    assert.ok(!result[2].message.includes("(x"));
+  });
+
+  it("integrates seamlessly inside buildCcReviewWidgetLines rendering", () => {
+    const state = {
+      goal: "Test Goal",
+      tasks: [],
+      currentTaskIndex: -1,
+      displayState: "initializing" as const,
+      currentPhase: "Initializing",
+      liveLogs: [
+        {
+          id: "id-1",
+          timestamp: "2026-06-30T15:00:01.000Z",
+          severity: "info" as const,
+          source: "cc-review",
+          pluginId: "cc-review",
+          message: "Codex planner still running (30s)...",
+          sequence: 1,
+        },
+        {
+          id: "id-2",
+          timestamp: "2026-06-30T15:00:02.000Z",
+          severity: "info" as const,
+          source: "cc-review",
+          pluginId: "cc-review",
+          message: "Codex planner still running (30s)...",
+          sequence: 2,
+        },
+      ],
+      resolvedLogLevel: "info" as const,
+      resolvedWidgetLogLines: 5,
+      persistedLogPath: "workflow-logs.jsonl",
+      findingsRollup: { shipCount: 0, warningCount: 0, blockCount: 0, openFindingsCount: 0 },
+    };
+
+    const lines = buildCcReviewWidgetLines(state);
+    const logLines = lines.filter(line => line.includes("Codex planner still running"));
+    assert.equal(logLines.length, 1);
+    assert.ok(logLines[0].includes("(x2)"));
   });
 });

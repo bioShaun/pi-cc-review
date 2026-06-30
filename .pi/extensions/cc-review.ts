@@ -45,6 +45,7 @@ import {
 export {
   buildFindingsPayload,
   deriveEffectiveVerdict,
+  emptyFindingsRollup,
   extractBalancedJsonObject,
   formatTaskArtifactFileName,
   generateWorkflowRunId,
@@ -186,6 +187,14 @@ const CcReviewParams = {
       type: "number",
       description: "Optional per-attempt subagent execution timeout in milliseconds. 0 disables the timeout. Omit to use CC_REVIEW_TASK_TIMEOUT_MS or the default 1800000 (30 min).",
     },
+    widgetLogLines: {
+      type: "number",
+      description: "Optional log tail length for compact widget and onUpdate delta stream. Omit to use CC_REVIEW_WIDGET_LOG_LINES or the default 5.",
+    },
+    checklistWindow: {
+      type: "number",
+      description: "Optional task checklist window size for the compact widget. Omit to use CC_REVIEW_CHECKLIST_WINDOW or the default 8.",
+    },
   },
   required: ["goal"],
   additionalProperties: false,
@@ -197,6 +206,8 @@ interface CcReviewExecuteParams {
   logLevel?: string;
   reviewMode?: string;
   taskTimeoutMs?: number;
+  widgetLogLines?: number;
+  checklistWindow?: number;
 }
 
 interface Task {
@@ -596,6 +607,43 @@ function normalizeRenderableLogMessage(message: string): string {
   return cleaned || "(empty message)";
 }
 
+export function collapseConsecutiveLogEntries(
+  entries: readonly CcReviewLogEntry[]
+): CcReviewLogEntry[] {
+  if (entries.length === 0) return [];
+  const collapsed: CcReviewLogEntry[] = [];
+  let currentGroup: CcReviewLogEntry[] = [entries[0]];
+
+  for (let i = 1; i < entries.length; i++) {
+    const entry = entries[i];
+    const prev = currentGroup[currentGroup.length - 1];
+    const normPrev = normalizeRenderableLogMessage(prev.message);
+    const normCurr = normalizeRenderableLogMessage(entry.message);
+
+    if (normPrev === normCurr) {
+      currentGroup.push(entry);
+    } else {
+      collapsed.push(mergeLogGroup(currentGroup));
+      currentGroup = [entry];
+    }
+  }
+
+  if (currentGroup.length > 0) {
+    collapsed.push(mergeLogGroup(currentGroup));
+  }
+
+  return collapsed;
+}
+
+function mergeLogGroup(group: CcReviewLogEntry[]): CcReviewLogEntry {
+  if (group.length === 1) return group[0];
+  const lastEntry = group[group.length - 1];
+  return {
+    ...lastEntry,
+    message: `${lastEntry.message} (x${group.length})`,
+  };
+}
+
 function wrapLogMessage(message: string, maxWidth: number): string[] {
   const width = Math.max(16, Math.floor(maxWidth));
   const words = message.split(/\s+/).filter(Boolean);
@@ -646,12 +694,16 @@ export function renderCcReviewLogEntry(
     options.includeSource === false ? "" : `[${source}]`,
   ].filter(Boolean);
   const prefix = `${severityMeta.icon} ${severityMeta.label.padEnd(5)} ${contextParts.join(" ")}: `;
+  // Use visible column width (ANSI-aware, CJK-aware) rather than JS string
+  // length so that wide characters in the icon or source label are counted
+  // correctly.  This prevents the message portion from overflowing the terminal.
+  const prefixVisibleWidth = measureVisibleWidth(prefix);
   const messageWrapWidth =
     options.maxLineWidth !== undefined
-      ? Math.max(8, options.maxLineWidth - prefix.length)
+      ? Math.max(8, options.maxLineWidth - prefixVisibleWidth)
       : (options.maxMessageWidth ?? DEFAULT_LOG_MESSAGE_WRAP_WIDTH);
   const messageLines = wrapLogMessage(normalizeRenderableLogMessage(entry.message), messageWrapWidth);
-  const continuationPrefix = " ".repeat(prefix.length);
+  const continuationPrefix = " ".repeat(prefixVisibleWidth);
 
   return messageLines.map((line, index) => (index === 0 ? `${prefix}${line}` : `${continuationPrefix}${line}`));
 }
@@ -917,6 +969,116 @@ export function resolveCcReviewLogLevel(
   return { level: "info", source: "default" };
 }
 
+// ---------------------------------------------------------------------------
+// resolveCcReviewWidgetLogLines: pure precedence resolver for the user-visible
+// live-log tail length.
+//
+// Precedence: explicit `flag` (slash flag / tool param `widgetLogLines`)
+//            > `env.CC_REVIEW_WIDGET_LOG_LINES`
+//            > default `5`.
+// ---------------------------------------------------------------------------
+export interface ResolveCcReviewWidgetLogLinesOptions {
+  /** Explicit flag value from the slash command / tool param (e.g. `--widget-log-lines 10`). */
+  flag?: any;
+  /** Environment to read `CC_REVIEW_WIDGET_LOG_LINES` from. Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ResolveCcReviewWidgetLogLinesResult {
+  lines: number;
+  source: "flag" | "env" | "default";
+  invalidInput?: { source: "flag" | "env"; raw: string };
+}
+
+export function resolveCcReviewWidgetLogLines(
+  options: ResolveCcReviewWidgetLogLinesOptions = {}
+): ResolveCcReviewWidgetLogLinesResult {
+  // 1) Explicit flag wins.
+  if (options.flag !== undefined && options.flag !== null) {
+    const parsed = Number(options.flag);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      return { lines: parsed, source: "flag" };
+    }
+    return {
+      lines: 5,
+      source: "default",
+      invalidInput: { source: "flag", raw: String(options.flag) },
+    };
+  }
+
+  // 2) Environment fallback.
+  const env = options.env ?? process.env;
+  const rawEnv = env.CC_REVIEW_WIDGET_LOG_LINES;
+  if (typeof rawEnv === "string" && rawEnv.trim() !== "") {
+    const parsed = Number(rawEnv);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      return { lines: parsed, source: "env" };
+    }
+    return {
+      lines: 5,
+      source: "default",
+      invalidInput: { source: "env", raw: rawEnv },
+    };
+  }
+
+  return { lines: 5, source: "default" };
+}
+
+// ---------------------------------------------------------------------------
+// resolveCcReviewChecklistWindow: pure precedence resolver for the user-visible
+// task checklist window size.
+//
+// Precedence: explicit `flag` (slash flag / tool param `checklistWindow`)
+//            > `env.CC_REVIEW_CHECKLIST_WINDOW`
+//            > default `8`.
+// ---------------------------------------------------------------------------
+export interface ResolveCcReviewChecklistWindowOptions {
+  /** Explicit flag value from the slash command / tool param (e.g. `--checklist-window 10`). */
+  flag?: any;
+  /** Environment to read `CC_REVIEW_CHECKLIST_WINDOW` from. Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ResolveCcReviewChecklistWindowResult {
+  window: number;
+  source: "flag" | "env" | "default";
+  invalidInput?: { source: "flag" | "env"; raw: string };
+}
+
+export function resolveCcReviewChecklistWindow(
+  options: ResolveCcReviewChecklistWindowOptions = {}
+): ResolveCcReviewChecklistWindowResult {
+  // 1) Explicit flag wins.
+  if (options.flag !== undefined && options.flag !== null) {
+    const parsed = Number(options.flag);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      return { window: parsed, source: "flag" };
+    }
+    return {
+      window: 8,
+      source: "default",
+      invalidInput: { source: "flag", raw: String(options.flag) },
+    };
+  }
+
+  // 2) Environment fallback.
+  const env = options.env ?? process.env;
+  const rawEnv = env.CC_REVIEW_CHECKLIST_WINDOW;
+  if (typeof rawEnv === "string" && rawEnv.trim() !== "") {
+    const parsed = Number(rawEnv);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      return { window: parsed, source: "env" };
+    }
+    return {
+      window: 8,
+      source: "default",
+      invalidInput: { source: "env", raw: rawEnv },
+    };
+  }
+
+  return { window: 8, source: "default" };
+}
+
 // Display order for the severity rollup line: error first (most actionable),
 // then warning, then info/debug. Mirrors the visual priority of
 // LOG_SEVERITY_RENDER_META without re-encoding icons.
@@ -1109,12 +1271,166 @@ const PLAIN_WIDGET_THEME: CcReviewWidgetTheme = {
 };
 
 let truncateToWidthFn: ((text: string, width: number) => string) | null | undefined;
+let visibleWidthFn: ((text: string) => number) | null | undefined;
+
+function getVisibleWidth(): ((text: string) => number) | undefined {
+  if (visibleWidthFn === undefined) {
+    try {
+      const piTui = require("@earendil-works/pi-tui");
+      visibleWidthFn = typeof piTui?.visibleWidth === "function" ? piTui.visibleWidth : null;
+    } catch {
+      visibleWidthFn = null;
+    }
+  }
+  return visibleWidthFn ?? undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Column-width primitives
+// ---------------------------------------------------------------------------
+// Terminal cells occupied by Unicode East-Asian Wide / Fullwidth characters.
+// Sourced from Unicode EAW = W (Wide) or F (Fullwidth) classifications,
+// with conservative ranges that cover CJK ideographs, Hangul, fullwidth ASCII,
+// and common ideographic symbols.  This is the single source of truth used by
+// all width-measuring and truncation functions below.
+
+function charWidth(code: number): 1 | 2 {
+  // Supplementary-plane characters (>U+FFFF, i.e. codepoints encoded as
+  // surrogate pairs in UTF-16) are rendered 2 columns wide by virtually
+  // every modern terminal.  This covers emoji, CJK Extension B–G, historic
+  // scripts, and other wide symbols without needing an exhaustive range
+  // table that would inevitably miss new Unicode additions.
+  if (code > 0xFFFF) return 2;
+  // BMP East-Asian Wide / Fullwidth ranges.
+  // Hangul Jamo
+  if (code >= 0x1100 && code <= 0x115F) return 2;
+  if (code === 0x2329 || code === 0x232A) return 2;
+  // CJK Radicals, Kangxi, Ideographic Desc, CJK Symbols…
+  if (code >= 0x2E80 && code <= 0x3247 && code !== 0x303F) return 2;
+  // Enclosed CJK, CJK Compat Forms, CJK Ext A
+  if (code >= 0x3250 && code <= 0x4DBF) return 2;
+  // CJK Unified Ideographs, Yi
+  if (code >= 0x4E00 && code <= 0xA4C6) return 2;
+  // Hangul Jamo Extended-A
+  if (code >= 0xA960 && code <= 0xA97C) return 2;
+  // Hangul Syllables
+  if (code >= 0xAC00 && code <= 0xD7A3) return 2;
+  // CJK Compatibility Ideographs
+  if (code >= 0xF900 && code <= 0xFAFF) return 2;
+  // Vertical forms
+  if (code >= 0xFE10 && code <= 0xFE19) return 2;
+  // CJK Compatibility Forms
+  if (code >= 0xFE30 && code <= 0xFE6B) return 2;
+  // Fullwidth ASCII, Halfwidth Katakana range
+  if (code >= 0xFF01 && code <= 0xFF60) return 2;
+  // Fullwidth signs
+  if (code >= 0xFFE0 && code <= 0xFFE6) return 2;
+  return 1;
+}
+
+/** Count visible columns in a plain (ANSI-free) or ANSI-containing string. */
+function countColumns(plain: string): number {
+  let cols = 0;
+  for (const cp of plain) {
+    cols += charWidth(cp.codePointAt(0) ?? 0);
+  }
+  return cols;
+}
+
+/**
+ * Truncate a *plain* (ANSI-free) string to at most `maxCols` visible columns,
+ * appending an ellipsis when truncation occurs.  Returns the original if it
+ * already fits.
+ */
+function truncatePlainByColumn(plain: string, maxCols: number): string {
+  if (countColumns(plain) <= maxCols) return plain;
+  const budget = Math.max(0, maxCols - 1); // −1 for ellipsis
+  let cols = 0;
+  let cut = 0;
+  for (const cp of plain) {
+    const w = charWidth(cp.codePointAt(0) ?? 0);
+    if (cols + w > budget) break;
+    cols += w;
+    cut += cp.length; // handles surrogate pairs correctly
+  }
+  return plain.slice(0, cut) + "\u2026";
+}
+
+/**
+ * Truncate a string that may contain ANSI escape codes while preserving them.
+ * Uses `measureVisibleWidth` for the width check (ANSI-aware when pi-tui is
+ * available) and walks the raw string code-point by code-point, accumulating
+ * visible column cost only for the printable portion, so ANSI sequences are
+ * carried through transparently.
+ */
+function truncateAnsiByColumn(text: string, maxCols: number): string {
+  if (measureVisibleWidth(text) <= maxCols) return text;
+  const budget = Math.max(0, maxCols - 1);
+  let cols = 0;
+  let cut = 0;
+  let inEscape = false;
+  // Walk the string as an array of code-point strings so `.length` is
+  // always 1 or 2 (surrogate pair), never slicing mid-codepoint.
+  const chars = Array.from(text);
+  for (const ch of chars) {
+    if (inEscape) {
+      cut += ch.length;
+      if (ch === "m") inEscape = false;
+      continue;
+    }
+    if (ch === "\x1b") {
+      inEscape = true;
+      cut += ch.length;
+      continue;
+    }
+    const w = charWidth(ch.codePointAt(0) ?? 0);
+    if (cols + w > budget) break;
+    cols += w;
+    cut += ch.length;
+  }
+  return text.slice(0, cut) + "\u2026";
+}
+
+// ---------------------------------------------------------------------------
+// pi-tui integration
+// ---------------------------------------------------------------------------
+
+// Measure visible (column) width of a string, ANSI-aware when pi-tui is available.
+// Falls back to our CJK-aware column counter in headless / test environments.
+export function measureVisibleWidth(text: string): number {
+  const vw = getVisibleWidth();
+  if (vw) return vw(text);
+  return countColumns(stripAnsi(text));
+}
+
+// Build a visibleWidth-aware truncation function when pi-tui is available but
+// does not export truncateToWidth.  The returned function is ANSI-preserving.
+function buildVisibleWidthTruncate(
+  vw: (text: string) => number
+): (text: string, maxWidth: number) => string {
+  return (text: string, maxWidth: number): string => {
+    if (vw(text) <= maxWidth) return text;
+    // When pi-tui's visibleWidth signals overflow but pi-tui has no native
+    // truncator, fall back to our ANSI-safe column truncation using the same
+    // CJK-width table as `countColumns`.  The fallback cannot guarantee
+    // absolute consistency with pi-tui's width model for exotic emoji /
+    // grapheme clusters, but it handles the dominant crash case (CJK-heavy
+    // log lines) safely and preserves ANSI colour codes.
+    return truncateAnsiByColumn(text, maxWidth);
+  };
+}
 
 function getTruncateToWidth(): ((text: string, width: number) => string) | undefined {
   if (truncateToWidthFn === undefined) {
     try {
       const piTui = require("@earendil-works/pi-tui");
-      truncateToWidthFn = typeof piTui?.truncateToWidth === "function" ? piTui.truncateToWidth : null;
+      if (typeof piTui?.truncateToWidth === "function") {
+        truncateToWidthFn = piTui.truncateToWidth;
+      } else if (typeof piTui?.visibleWidth === "function") {
+        truncateToWidthFn = buildVisibleWidthTruncate(piTui.visibleWidth);
+      } else {
+        truncateToWidthFn = null;
+      }
     } catch {
       truncateToWidthFn = null;
     }
@@ -1122,13 +1438,16 @@ function getTruncateToWidth(): ((text: string, width: number) => string) | undef
   return truncateToWidthFn ?? undefined;
 }
 
-// Width-safe truncation for widget lines. Uses pi-tui's truncateToWidth when
-// available (ANSI-aware); falls back to the plain-text helper for tests/headless.
+// Width-safe truncation for widget lines.  Uses pi-tui's truncateToWidth when
+// available (ANSI-aware); falls back to a CJK-aware column truncation for
+// headless / test environments.  The fallback operates on ANSI-stripped text
+// because headless renderers do not emit colour codes.
 export function truncateWidgetLine(text: string, maxWidth: number = WIDGET_MAX_WIDTH_DEFAULT): string {
   const width = Math.max(8, Math.floor(maxWidth));
   const trunc = getTruncateToWidth();
   if (trunc) return trunc(text, width);
-  return truncateForWidget(text, width);
+  // Headless / test fallback: strip ANSI and truncate by columns.
+  return truncatePlainByColumn(stripAnsi(text), width);
 }
 
 export interface CcReviewWidgetState {
@@ -1141,6 +1460,8 @@ export interface CcReviewWidgetState {
   lastTaskWarning?: string;
   liveLogs: readonly CcReviewLogEntry[];
   resolvedLogLevel: CcReviewLogSeverity;
+  resolvedWidgetLogLines?: number;
+  resolvedChecklistWindow?: number;
   persistedLogPath: string;
   findingsRollup: CcReviewFindingsRollup;
   taskStatuses?: readonly (TaskStatus | undefined)[];
@@ -1229,7 +1550,11 @@ export function buildCcReviewWidgetLines(
         : theme.fg("dim", "  \u23f3 Waiting for planner output\u2026");
     lines.push(truncateWidgetLine(waiting, width));
   } else {
-    const window = computeChecklistWindow(state.tasks.length, state.currentTaskIndex, WIDGET_CHECKLIST_WINDOW);
+    const window = computeChecklistWindow(
+      state.tasks.length,
+      state.currentTaskIndex,
+      state.resolvedChecklistWindow ?? WIDGET_CHECKLIST_WINDOW
+    );
     if (window.hiddenBefore > 0) {
       lines.push(
         truncateWidgetLine(
@@ -1295,12 +1620,21 @@ export function buildCcReviewWidgetLines(
     lines.push(truncateWidgetLine(theme.fg("dim", "   (No logs yet \u2014 waiting for activity)"), width));
   } else {
     const filteredLiveLogs = filterCcReviewLogEntries(state.liveLogs, { minSeverity: state.resolvedLogLevel });
-    const recentLogs = filteredLiveLogs.slice(-WIDGET_LIVE_LOG_LINES);
+    const collapsed = collapseConsecutiveLogEntries(filteredLiveLogs);
+    filteredLiveLogs.length = 0;
+    filteredLiveLogs.push(...collapsed);
+    const tailLength = state.resolvedWidgetLogLines ?? 5;
+    const recentLogs = tailLength > 0 ? filteredLiveLogs.slice(-tailLength) : [];
     for (const entry of recentLogs) {
       const rendered = renderCcReviewLogEntry(entry, { maxLineWidth: width - 3 });
       const color = severityThemeColor(entry.severity);
       for (const line of rendered) {
-        lines.push(truncateWidgetLine(`   ${theme.fg(color, line)}`, width));
+        // Defensively truncate the plain-text line before wrapping it in
+        // ANSI codes and the 3-space indent.  renderCcReviewLogEntry uses
+        // measureVisibleWidth for its wrap budget, but we guard here too in
+        // case a single token (e.g. a URL or JSON blob) exceeds the budget.
+        const safeLine = truncateWidgetLine(line, width - 3);
+        lines.push(truncateWidgetLine(`   ${theme.fg(color, safeLine)}`, width));
       }
     }
   }
@@ -1674,6 +2008,8 @@ interface RunCcReviewWorkflowOptions {
   logLevel?: string;
   reviewMode?: string;
   taskTimeoutMs?: number;
+  widgetLogLines?: number;
+  checklistWindow?: number;
   validationCommands?: VerificationCommand[];
 }
 
@@ -1834,6 +2170,8 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           logLevel: parsedArgs.logLevel,
           reviewMode: parsedArgs.reviewMode,
           taskTimeoutMs: parsedArgs.taskTimeoutMs,
+          widgetLogLines: parsedArgs.widgetLogLines,
+          checklistWindow: parsedArgs.checklistWindow,
         });
         ctx?.ui?.notify?.("CC Review completed.", "info");
         
@@ -1880,6 +2218,8 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           logLevel: params.logLevel,
           reviewMode: params.reviewMode,
           taskTimeoutMs: params.taskTimeoutMs,
+          widgetLogLines: params.widgetLogLines,
+          checklistWindow: params.checklistWindow,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
@@ -1908,12 +2248,14 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; reviewMode?: string; taskTimeoutMs?: number; error?: string } {
+function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; reviewMode?: string; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; error?: string } {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
   const hasReviewModeFlag = /(?:^|\s)--review-mode(?:=|\s|$)/.test(args);
   const hasTaskTimeoutFlag = /(?:^|\s)--task-timeout(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag && !hasReviewModeFlag && !hasTaskTimeoutFlag) {
+  const hasWidgetLogLinesFlag = /(?:^|\s)--widget-log-lines(?:=|\s|$)/.test(args);
+  const hasChecklistWindowFlag = /(?:^|\s)--checklist-window(?:=|\s|$)/.test(args);
+  if (!hasProviderFlag && !hasLogLevelFlag && !hasReviewModeFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag) {
     return { goal: args.trim() };
   }
 
@@ -1923,6 +2265,8 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
   let logLevel: string | undefined;
   let reviewMode: string | undefined;
   let taskTimeoutMs: number | undefined;
+  let widgetLogLines: number | undefined;
+  let checklistWindow: number | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -2008,6 +2352,56 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
       continue;
     }
 
+    const equalsWidgetLogLinesMatch = token.match(/^--widget-log-lines=(.*)$/);
+    if (equalsWidgetLogLinesMatch) {
+      const raw = equalsWidgetLogLinesMatch[1];
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        return { goal: "", error: `Invalid --widget-log-lines value "${raw}". Expected a non-negative integer.` };
+      }
+      widgetLogLines = parsed;
+      continue;
+    }
+
+    if (token === "--widget-log-lines") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a non-negative integer.` };
+      }
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        return { goal: "", error: `Invalid --widget-log-lines value "${value}". Expected a non-negative integer.` };
+      }
+      widgetLogLines = parsed;
+      i++;
+      continue;
+    }
+
+    const equalsChecklistWindowMatch = token.match(/^--checklist-window=(.*)$/);
+    if (equalsChecklistWindowMatch) {
+      const raw = equalsChecklistWindowMatch[1];
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        return { goal: "", error: `Invalid --checklist-window value "${raw}". Expected a non-negative integer.` };
+      }
+      checklistWindow = parsed;
+      continue;
+    }
+
+    if (token === "--checklist-window") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a non-negative integer.` };
+      }
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        return { goal: "", error: `Invalid --checklist-window value "${value}". Expected a non-negative integer.` };
+      }
+      checklistWindow = parsed;
+      i++;
+      continue;
+    }
+
     goalTokens.push(token);
   }
 
@@ -2017,6 +2411,8 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
     logLevel,
     reviewMode,
     taskTimeoutMs,
+    widgetLogLines,
+    checklistWindow,
   };
 }
 
@@ -3041,6 +3437,10 @@ async function runCcReviewWorkflow(
   const reviewMode = resolveReviewMode(options.reviewMode);
   const logLevelResolution = resolveCcReviewLogLevel({ flag: options.logLevel, env: process.env });
   const resolvedLogLevel: CcReviewLogSeverity = logLevelResolution.level;
+  const widgetLogLinesResolution = resolveCcReviewWidgetLogLines({ flag: options.widgetLogLines, env: process.env });
+  const resolvedWidgetLogLines = widgetLogLinesResolution.lines;
+  const checklistWindowResolution = resolveCcReviewChecklistWindow({ flag: options.checklistWindow, env: process.env });
+  const resolvedChecklistWindow = checklistWindowResolution.window;
   // Resolve the per-attempt subagent execution timeout (P0-1). Previously this
   // was hardcoded to 300000ms (5 min); real coding subagent runs routinely
   // exceed that and were killed mid-flight. The default is now 30 min and is
@@ -3060,6 +3460,8 @@ async function runCcReviewWorkflow(
     reviewProvider: reviewProviderConfig.provider,
     reviewMode,
     logLevel: resolvedLogLevel,
+    widgetLogLines: resolvedWidgetLogLines,
+    checklistWindow: resolvedChecklistWindow,
     taskTimeoutMs: resolvedTaskTimeoutMs,
     plannerTimeoutMs: resolvedPlannerTimeoutMs,
     reviewerTimeoutMs: resolvedReviewerTimeoutMs,
@@ -3309,6 +3711,8 @@ async function runCcReviewWorkflow(
     lastTaskWarning,
     liveLogs,
     resolvedLogLevel,
+    resolvedWidgetLogLines,
+    resolvedChecklistWindow,
     persistedLogPath: persistedLogState.filePath,
     findingsRollup,
     taskStatuses,
@@ -3364,7 +3768,8 @@ async function runCcReviewWorkflow(
     const entry = normalizeCcReviewLogEntry(input, { sequence: ++logSequence });
     if (!entry.message) return;
     liveLogs.push(entry);
-    if (liveLogs.length > 50) {
+    const maxLiveLogs = Math.max(50, resolvedWidgetLogLines);
+    if (liveLogs.length > maxLiveLogs) {
       liveLogs.shift();
     }
 
@@ -3379,7 +3784,7 @@ async function runCcReviewWorkflow(
     // The resolved log level gates this compact surface: entries below the
     // threshold are skipped here but they were ALREADY persisted to the JSONL
     // log a few lines above, so the on-disk record remains complete.
-    if (onUpdate) {
+    if (onUpdate && resolvedWidgetLogLines > 0) {
       const entrySeverityForGate: CcReviewLogSeverity = SUPPORTED_LOG_SEVERITIES.includes(
         entry.severity as CcReviewLogSeverity
       )
