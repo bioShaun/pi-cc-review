@@ -181,7 +181,7 @@ const CcReviewParams = {
     },
     reviewMode: {
       type: "string",
-      description: "Optional review timing. Supported values: per-task or after-all. Omit to use CC_REVIEW_MODE or the default per-task mode.",
+      description: "Optional review timing. Supported values: per-task or after-all. Omit to use CC_REVIEW_MODE or the default after-all mode.",
     },
     taskTimeoutMs: {
       type: "number",
@@ -1932,7 +1932,7 @@ export function resolveReviewMode(
 ): ReviewMode {
   const source: ReviewModeSource = explicitMode !== undefined ? "reviewMode" : "CC_REVIEW_MODE";
   const rawMode = explicitMode !== undefined ? explicitMode : env.CC_REVIEW_MODE;
-  return rawMode === undefined ? "per-task" : normalizeReviewMode(rawMode, source);
+  return rawMode === undefined ? "after-all" : normalizeReviewMode(rawMode, source);
 }
 
 interface SubagentResult {
@@ -2146,7 +2146,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter compact surfaces. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter compact surfaces. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -2207,7 +2207,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the per-task default. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error, or omit it to use CC_REVIEW_LOG_LEVEL / the info default. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
+    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error, or omit it to use CC_REVIEW_LOG_LEVEL / the info default. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
       onUpdate?.({ content: [{ type: "text", text: "Starting CC Review..." }] });

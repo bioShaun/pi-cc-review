@@ -647,13 +647,13 @@ describe("resolveCcReviewLogLevel derives the compact-surface minimum severity",
 });
 
 describe("resolveReviewMode selects review timing", () => {
-  it("uses explicit value, environment fallback, and the per-task default", () => {
-    assert.equal(resolveReviewMode(" after-all "), "after-all");
+  it("uses explicit value, environment fallback, and the after-all default", () => {
+    assert.equal(resolveReviewMode(" per-task "), "per-task");
     assert.equal(
       resolveReviewMode(undefined, { CC_REVIEW_MODE: "per-task" } as NodeJS.ProcessEnv),
       "per-task"
     );
-    assert.equal(resolveReviewMode(undefined, {} as NodeJS.ProcessEnv), "per-task");
+    assert.equal(resolveReviewMode(undefined, {} as NodeJS.ProcessEnv), "after-all");
   });
 
   it("rejects unsupported explicit and environment values", () => {
@@ -1309,7 +1309,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-provider-claude",
-      { goal: "Build with Claude reviewer" },
+      { goal: "Build with Claude reviewer", reviewMode: "per-task" },
       undefined,
       undefined,
       { cwd: tempTestDir }
@@ -2111,7 +2111,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-claude-request",
-      { goal: "Build with Claude request" },
+      { goal: "Build with Claude request", reviewMode: "per-task" },
       undefined,
       undefined,
       { cwd: tempTestDir }
@@ -2289,7 +2289,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-1",
-      { goal: "Build a perfect calculator app" },
+      { goal: "Build a perfect calculator app", reviewMode: "per-task" },
       undefined,
       undefined,
       { cwd: tempTestDir }
@@ -2524,7 +2524,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-3",
-      { goal: "Multi-step app build" },
+      { goal: "Multi-step app build", reviewMode: "per-task" },
       undefined,
       undefined,
       { cwd: tempTestDir }
@@ -3410,7 +3410,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-repair-loop",
-      { goal: "Repair loop goal" },
+      { goal: "Repair loop goal", reviewMode: "per-task" },
       undefined,
       undefined,
       { cwd: tempTestDir }
@@ -3461,7 +3461,7 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     const result = await registeredTool.execute(
       "tool-call-repair-exhaust",
-      { goal: "Exhaust repair goal" },
+      { goal: "Exhaust repair goal", reviewMode: "per-task" },
       undefined,
       undefined,
       { cwd: tempTestDir }

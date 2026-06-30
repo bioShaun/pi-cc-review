@@ -191,7 +191,7 @@ test("review timing supports per-task and after-all orchestration", () => {
   assert.match(source, /type ReviewMode = "per-task" \| "after-all"/);
   assert.match(source, /type ReviewModeSource = "reviewMode" \| "CC_REVIEW_MODE"/);
   assert.match(source, /export function resolveReviewMode\(/);
-  assert.match(source, /return rawMode === undefined \? "per-task" : normalizeReviewMode\(rawMode, source\)/);
+  assert.match(source, /return rawMode === undefined \? "after-all" : normalizeReviewMode\(rawMode, source\)/);
   assert.match(source, /reviewMode: params\.reviewMode/);
   assert.match(source, /reviewMode: parsedArgs\.reviewMode/);
   assert.match(source, /if \(reviewMode === "after-all"\) \{/);

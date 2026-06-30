@@ -113,8 +113,8 @@ pi --mode json -p "Use the cc_review tool to implement: <goal>"
 
 CC Review supports two execution modes:
 
-- `per-task` (default): execute, validate, and review each task before starting the next task.
-- `after-all`: execute and validate every task first, then invoke the reviewer once for the complete workflow. The final reviewer can fix cross-task integration issues, runs the configured post-review verification once, and writes the shared verdict into every task artifact.
+- `per-task`: execute, validate, and review each task before starting the next task.
+- `after-all` (default): execute and validate every task first, then invoke the reviewer once for the complete workflow. The final reviewer can fix cross-task integration issues, runs the configured post-review verification once, and writes the shared verdict into every task artifact.
 
 Select the mode through one of these interfaces:
 
@@ -129,7 +129,7 @@ pi --mode json -p 'Use cc_review with goal "<goal>" and reviewMode "after-all"'
 CC_REVIEW_MODE=after-all pi --mode json -p "Use cc_review to implement: <goal>"
 ```
 
-An explicit `reviewMode` or `--review-mode` takes precedence over `CC_REVIEW_MODE`. Supported values are exactly `per-task` and `after-all`; omitted configuration defaults to `per-task`.
+An explicit `reviewMode` or `--review-mode` takes precedence over `CC_REVIEW_MODE`. Supported values are exactly `per-task` and `after-all`; omitted configuration defaults to `after-all`.
 
 In `after-all` mode, an unrecoverable task execution or output-validation failure still halts immediately because there is no complete workflow to review.
 
