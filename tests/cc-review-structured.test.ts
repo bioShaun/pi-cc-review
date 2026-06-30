@@ -6,6 +6,7 @@ import path from "node:path";
 
 import {
   deriveEffectiveVerdict,
+  extractBalancedJsonObject,
   generateWorkflowRunId,
   parseReviewResult,
   parseSubagentStructuredReport,
@@ -13,7 +14,7 @@ import {
   validateStructuredSubagentReport,
   writeTaskArtifact,
   WORKFLOW_ARTIFACT_DIR,
-} from "../.pi/extensions/cc-review-structured.ts";
+} from "../.pi/extensions/cc-review/structured.ts";
 
 test("parseSubagentStructuredReport accepts completed JSON at end of text", () => {
   const text = `Done.\n${JSON.stringify({
@@ -131,4 +132,48 @@ test("parseReviewResult normalizes ambiguous P0 status to unfixed and invalid_sc
   assert.equal(parsed.status, "invalid_schema");
   assert.equal(parsed.result?.findings[0]?.status, "unfixed");
   assert.equal(parsed.ambiguousHighSeverity, true);
+});
+
+test("extractBalancedJsonObject returns first object with leading prose (first mode)", () => {
+  const raw = `Planner notes:\nHere is the plan that follows\n{"tasks":[{"title":"A"}]}\nTrailing chatter {"ignored":true}`;
+  const extracted = extractBalancedJsonObject(raw, "first");
+  assert.equal(extracted, '{"tasks":[{"title":"A"}]}');
+});
+
+test("extractBalancedJsonObject returns final object with trailing prose (last mode)", () => {
+  const raw = `Preamble {"early":1}\nMore text\n{"final":{"nested":true}}\nDone.`;
+  const extracted = extractBalancedJsonObject(raw, "last");
+  assert.equal(extracted, '{"final":{"nested":true}}');
+});
+
+test("extractBalancedJsonObject prefers fenced JSON blocks and respects position", () => {
+  const raw = [
+    "intro {\"loose\":0}",
+    "```json",
+    '{"fenced":"one"}',
+    "```",
+    "middle prose",
+    "```json",
+    '{"fenced":"two"}',
+    "```",
+    "tail {\"trailing\":9}",
+  ].join("\n");
+  assert.equal(extractBalancedJsonObject(raw, "first"), '{"fenced":"one"}');
+  assert.equal(extractBalancedJsonObject(raw, "last"), '{"trailing":9}');
+});
+
+test("extractBalancedJsonObject ignores braces inside strings and escapes", () => {
+  const raw = 'noise {"text":"a } b { c","value":{"k":1}} after';
+  assert.equal(
+    extractBalancedJsonObject(raw, "first"),
+    '{"text":"a } b { c","value":{"k":1}}'
+  );
+});
+
+test("extractBalancedJsonObject returns undefined for unbalanced or empty input", () => {
+  assert.equal(extractBalancedJsonObject("", "first"), undefined);
+  assert.equal(extractBalancedJsonObject("", "last"), undefined);
+  assert.equal(extractBalancedJsonObject("no braces here", "first"), undefined);
+  // Opening brace with no matching close should not produce a candidate.
+  assert.equal(extractBalancedJsonObject('prefix {"unterminated":[1, 2', "first"), undefined);
 });

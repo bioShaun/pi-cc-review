@@ -20,6 +20,7 @@ import {
   buildSummaryMeta,
   deriveEffectiveVerdict,
   emptyFindingsRollup,
+  extractBalancedJsonObject,
   formatFindingsRollupLine,
   formatTaskArtifactFileName,
   generateWorkflowRunId,
@@ -39,7 +40,7 @@ import {
   writeTaskArtifact,
   type RunVerificationCommand,
   WORKFLOW_ARTIFACT_DIR,
-} from "./cc-review-structured.ts";
+} from "./cc-review/structured.ts";
 
 export {
   buildFindingsPayload,
@@ -58,7 +59,7 @@ export {
   workspaceSnapshotChanged,
   writeTaskArtifact,
   WORKFLOW_ARTIFACT_DIR,
-} from "./cc-review-structured.ts";
+} from "./cc-review/structured.ts";
 
 const require = createRequire(import.meta.url);
 const childProcess = require("node:child_process") as typeof import("node:child_process");
@@ -136,37 +137,6 @@ function emitTrace(ctx: any, event: string, payload: Record<string, any> = {}) {
   }
 }
 
-// Extract the first balanced JSON object from a noisy stdout buffer. Used for
-// planner backends (e.g. claude) that cannot guarantee JSON-only stdout. The
-// codex planner uses --output-schema and writes to a file, so it doesn't need this.
-// Returns undefined if no balanced JSON object is found.
-function extractJsonObject(raw: string): string | undefined {
-  if (!raw) return undefined;
-  // Prefer ```json ... ``` blocks if present, then fall back to scanning the raw buffer.
-  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates = fenceMatch ? [fenceMatch[1], raw] : [raw];
-  for (const candidate of candidates) {
-    const start = candidate.indexOf("{");
-    if (start === -1) continue;
-    let depth = 0;
-    let inString = false;
-    let escape = false;
-    for (let i = start; i < candidate.length; i++) {
-      const ch = candidate[i];
-      if (escape) { escape = false; continue; }
-      if (inString && ch === "\\") { escape = true; continue; }
-      if (ch === '"') { inString = !inString; continue; }
-      if (inString) continue;
-      if (ch === "{") depth++;
-      else if (ch === "}") {
-        depth--;
-        if (depth === 0) return candidate.substring(start, i + 1);
-      }
-    }
-  }
-  return undefined;
-}
-
 // Check if an error message indicates a transient failure
 function isTransientError(error: any): boolean {
   if (!error) return false;
@@ -208,6 +178,10 @@ const CcReviewParams = {
       type: "string",
       description: "Optional minimum log severity for compact surfaces (widget + onUpdate). Supported values: debug, info, warning, error (aliases: warn, fatal). Omit to use CC_REVIEW_LOG_LEVEL or the default 'info'. Persisted workflow-logs.jsonl is never filtered.",
     },
+    reviewMode: {
+      type: "string",
+      description: "Optional review timing. Supported values: per-task or after-all. Omit to use CC_REVIEW_MODE or the default per-task mode.",
+    },
   },
   required: ["goal"],
   additionalProperties: false,
@@ -217,6 +191,7 @@ interface CcReviewExecuteParams {
   goal: string;
   reviewProvider?: string;
   logLevel?: string;
+  reviewMode?: string;
 }
 
 interface Task {
@@ -280,6 +255,8 @@ const LOG_SEVERITY_RENDER_META: Record<CcReviewLogSeverity, { icon: string; labe
 
 interface CcReviewLogRenderOptions {
   maxMessageWidth?: number;
+  /** When set, caps each rendered line (prefix + message) to this visible budget. */
+  maxLineWidth?: number;
   includeTimestamp?: boolean;
   includeSource?: boolean;
 }
@@ -310,15 +287,177 @@ function normalizeOptionalText(value: unknown, fallback: string): string {
   return trimmed || fallback;
 }
 
-function inferLegacyLogSeverity(label: string): CcReviewLogSeverity {
+export function inferSubprocessStreamSeverity(
+  line: string,
+  stream: "stdout" | "stderr" = "stderr"
+): CcReviewLogSeverity {
+  const normalized = stripAnsi(line).trim().toLowerCase();
+  if (!normalized) return "info";
+
+  if (
+    /\b(fatal|panic|segfault|uncaught exception)\b/.test(normalized) ||
+    /\berror:\s/.test(normalized) ||
+    /^error\b/.test(normalized) ||
+    /\b(exit(?:ed)? with code|exit code) [1-9]\d*/.test(normalized)
+  ) {
+    return "error";
+  }
+
+  if (/\bfailed\b/.test(normalized) && !/\bsucceeded\b/.test(normalized)) {
+    return "error";
+  }
+
+  if (/\b(warn(?:ing)?|retrying|timed?\s*out|transient|rate[-\s]+limit(?:ed)?)\b/.test(normalized)) {
+    return "warning";
+  }
+
+  return "info";
+}
+
+function clipSubprocessLogText(text: string, maxLength = 120): string {
+  const cleaned = stripAnsi(text).replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) return cleaned;
+  if (maxLength <= 1) return cleaned.slice(0, maxLength);
+  return `${cleaned.slice(0, maxLength - 1)}…`;
+}
+
+function looksLikeJsonFragment(line: string): boolean {
+  if (/^[\{\}\[\]],?\s*$/.test(line)) return true;
+  if (/^"[^"]+"\s*:/.test(line)) return true;
+  if (/^"(tasks|title|description|verdict|findings|summary|acceptanceCriteria|postFixValidation)"/.test(line)) {
+    return true;
+  }
+  return false;
+}
+
+function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const obj = payload as Record<string, unknown>;
+
+  if (obj.type === "workflow_trace" || obj.type === "cc_review_log_rotation") {
+    return null;
+  }
+
+  if (Array.isArray(obj.tasks)) {
+    const titles = obj.tasks
+      .map((task) =>
+        task && typeof task === "object" && typeof (task as { title?: unknown }).title === "string"
+          ? (task as { title: string }).title
+          : ""
+      )
+      .filter(Boolean);
+    const preview = titles.slice(0, 3).join("; ");
+    const suffix = titles.length > 3 ? ` (+${titles.length - 3} more)` : "";
+    return `Planned ${titles.length} task${titles.length === 1 ? "" : "s"}: ${preview}${suffix}`;
+  }
+
+  if (typeof obj.verdict === "string") {
+    const summary = typeof obj.summary === "string" ? clipSubprocessLogText(obj.summary, 80) : "";
+    const findings = Array.isArray(obj.findings) ? obj.findings : [];
+    const unfixed = findings.filter(
+      (finding) =>
+        finding &&
+        typeof finding === "object" &&
+        (finding as { status?: unknown }).status === "unfixed"
+    ).length;
+    const parts = [`Review: ${obj.verdict}`];
+    if (summary) parts.push(summary);
+    if (findings.length > 0) {
+      parts.push(`${findings.length} finding${findings.length === 1 ? "" : "s"} (${unfixed} unfixed)`);
+    }
+    return parts.join(" — ");
+  }
+
+  if (typeof obj.type === "string") {
+    if (obj.type === "tool_call" || obj.type === "tool_use" || obj.type === "tool_execution_start") {
+      const name =
+        typeof obj.name === "string"
+          ? obj.name
+          : typeof obj.tool === "string"
+            ? obj.tool
+            : typeof obj.toolName === "string"
+              ? obj.toolName
+              : "tool";
+      return `⚙ ${name}`;
+    }
+    if (obj.type === "message" || obj.type === "assistant" || obj.type === "stream_event" || obj.type === "message_end") {
+      return null;
+    }
+  }
+
+  if (typeof obj.command === "string") {
+    return `exec ${clipSubprocessLogText(obj.command, 80)}`;
+  }
+
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return null;
+  const previewKeys = keys.slice(0, 4).join(", ");
+  return `{${previewKeys}${keys.length > 4 ? ", …" : ""}}`;
+}
+
+export function formatSubprocessStreamLine(rawLine: string): string | null {
+  const line = stripAnsi(rawLine).trim();
+  if (!line) return null;
+
+  if (line.includes('"type":"workflow_trace"') || line.includes('"type": "workflow_trace"')) {
+    return null;
+  }
+
+  if (line.startsWith("{") || line.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(line);
+      const summarized = summarizeStructuredSubprocessPayload(parsed);
+      if (summarized !== null) return summarized;
+      return null;
+    } catch {
+      if (looksLikeJsonFragment(line)) return null;
+      return clipSubprocessLogText(line, 120);
+    }
+  }
+
+  if (looksLikeJsonFragment(line)) return null;
+
+  return line;
+}
+
+function logSubprocessStreamLines(
+  logFn: (input: CcReviewLogInput) => void,
+  chunk: string,
+  stream: "stdout" | "stderr",
+  source: "planner" | "reviewer"
+): void {
+  for (const line of chunk.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const message = formatSubprocessStreamLine(trimmed);
+    if (message === null) continue;
+    logFn({
+      severity: inferSubprocessStreamSeverity(trimmed, stream),
+      source,
+      message,
+    });
+  }
+}
+
+function isStderrChannelLabel(label: string): boolean {
+  const normalizedLabel = label.trim().toLowerCase();
+  return normalizedLabel.endsWith(" error") || normalizedLabel.endsWith(" failure");
+}
+
+function inferLegacyLogSeverity(label: string, message = ""): CcReviewLogSeverity {
   const normalizedLabel = label.trim().toLowerCase();
   if (normalizedLabel.includes("debug")) return "debug";
+  if (isStderrChannelLabel(label)) {
+    return inferSubprocessStreamSeverity(message, "stderr");
+  }
   if (
-    normalizedLabel.includes("error") ||
     normalizedLabel.includes("failure") ||
     normalizedLabel.includes("failed") ||
     normalizedLabel.includes("halted")
   ) {
+    return "error";
+  }
+  if (normalizedLabel.includes("error")) {
     return "error";
   }
   if (
@@ -350,7 +489,7 @@ function parseLegacyLogInput(input: string): CcReviewStructuredLogInput {
   const label = prefixedLogMatch[1].trim();
   const message = prefixedLogMatch[2].trim();
   return {
-    severity: inferLegacyLogSeverity(label),
+    severity: inferLegacyLogSeverity(label, message),
     source: inferLegacyLogSource(label),
     message: message || cleaned,
   };
@@ -456,10 +595,11 @@ export function renderCcReviewLogEntry(
     options.includeSource === false ? "" : `[${source}]`,
   ].filter(Boolean);
   const prefix = `${severityMeta.icon} ${severityMeta.label.padEnd(5)} ${contextParts.join(" ")}: `;
-  const messageLines = wrapLogMessage(
-    normalizeRenderableLogMessage(entry.message),
-    options.maxMessageWidth ?? DEFAULT_LOG_MESSAGE_WRAP_WIDTH
-  );
+  const messageWrapWidth =
+    options.maxLineWidth !== undefined
+      ? Math.max(8, options.maxLineWidth - prefix.length)
+      : (options.maxMessageWidth ?? DEFAULT_LOG_MESSAGE_WRAP_WIDTH);
+  const messageLines = wrapLogMessage(normalizeRenderableLogMessage(entry.message), messageWrapWidth);
   const continuationPrefix = " ".repeat(prefix.length);
 
   return messageLines.map((line, index) => (index === 0 ? `${prefix}${line}` : `${continuationPrefix}${line}`));
@@ -683,6 +823,22 @@ const WORKFLOW_LOG_TRUNCATE_KEEP = 1500;
 
 // ANSI-naive width truncation with ellipsis. Sufficient because cc-review widget
 // lines are plain text (we strip ANSI when normalizing log messages).
+export function truncatePersistedLogPathForWidget(
+  filePath: string,
+  maxWidth: number = WIDGET_MAX_WIDTH_DEFAULT
+): string {
+  const width = Math.max(12, Math.floor(maxWidth));
+  if (filePath.length <= width) return filePath;
+  const base = path.basename(filePath);
+  const ellipsis = "\u2026";
+  const tailBudget = base.length + ellipsis.length;
+  if (tailBudget >= width) {
+    return truncateForWidget(base, width);
+  }
+  const headChars = width - tailBudget;
+  return `${filePath.slice(0, headChars)}${ellipsis}${base}`;
+}
+
 export function truncateForWidget(value: string, maxWidth: number = WIDGET_MAX_WIDTH_DEFAULT): string {
   const width = Math.max(8, Math.floor(maxWidth));
   if (value.length <= width) return value;
@@ -966,7 +1122,7 @@ export function buildCcReviewWidgetLines(
     const filteredLiveLogs = filterCcReviewLogEntries(state.liveLogs, { minSeverity: state.resolvedLogLevel });
     const recentLogs = filteredLiveLogs.slice(-WIDGET_LIVE_LOG_LINES);
     for (const entry of recentLogs) {
-      const rendered = renderCcReviewLogEntry(entry, { maxMessageWidth: width - 4 });
+      const rendered = renderCcReviewLogEntry(entry, { maxLineWidth: width - 3 });
       const color = severityThemeColor(entry.severity);
       for (const line of rendered) {
         lines.push(truncateWidgetLine(`   ${theme.fg(color, line)}`, width));
@@ -975,7 +1131,13 @@ export function buildCcReviewWidgetLines(
   }
 
   lines.push(
-    `${theme.fg("muted", "\ud83d\udcc4 Full log:")} ${theme.fg("dim", state.persistedLogPath)}`
+    truncateWidgetLine(
+      `${theme.fg("muted", "\ud83d\udcc4 Full log:")} ${theme.fg(
+        "dim",
+        truncatePersistedLogPathForWidget(state.persistedLogPath, Math.max(12, width - 14))
+      )}`,
+      width
+    )
   );
   return lines;
 }
@@ -1096,6 +1258,8 @@ export function appendPersistedLogEntry(
 
 type ReviewProvider = "codex" | "claude";
 type ReviewProviderSource = "reviewProvider" | "CC_REVIEW_PROVIDER";
+type ReviewMode = "per-task" | "after-all";
+type ReviewModeSource = "reviewMode" | "CC_REVIEW_MODE";
 
 interface ReviewPromptContext {
   task: Task;
@@ -1232,6 +1396,25 @@ function resolveReviewProviderConfig(explicitProvider?: string, env: NodeJS.Proc
   return initializeSelectedReviewBackend(normalizedProvider, env);
 }
 
+function normalizeReviewMode(rawMode: string, source: ReviewModeSource): ReviewMode {
+  const normalized = rawMode.trim().toLowerCase();
+  if (normalized === "per-task" || normalized === "after-all") {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid ${source} value "${rawMode}". Supported review modes: per-task, after-all.`
+  );
+}
+
+export function resolveReviewMode(
+  explicitMode?: string,
+  env: NodeJS.ProcessEnv = process.env
+): ReviewMode {
+  const source: ReviewModeSource = explicitMode !== undefined ? "reviewMode" : "CC_REVIEW_MODE";
+  const rawMode = explicitMode !== undefined ? explicitMode : env.CC_REVIEW_MODE;
+  return rawMode === undefined ? "per-task" : normalizeReviewMode(rawMode, source);
+}
+
 interface SubagentResult {
   code: number;
 }
@@ -1254,6 +1437,20 @@ interface TaskResult {
   blockReason?: BlockReason;
   reviewerExitDiagnostic?: string;
   status?: TaskStatus;
+}
+
+interface BatchTaskExecution {
+  taskIndex: number;
+  task: Task;
+  startedAt: string;
+  subagentResult: SubagentResult;
+  subagentOutputText: string;
+  cachedSubagentResult: SubagentToolResult;
+  validationError?: string;
+  unresolvedItems?: string[];
+  structuredReport: SubagentStructuredReport | null;
+  schemaParseStatus: SchemaParseStatus;
+  result: TaskResult;
 }
 
 class WorkflowError extends Error {
@@ -1289,6 +1486,7 @@ interface SubagentValidation {
 interface RunCcReviewWorkflowOptions {
   reviewProvider?: string;
   logLevel?: string;
+  reviewMode?: string;
   validationCommands?: VerificationCommand[];
 }
 
@@ -1328,7 +1526,7 @@ function registerCcReviewFindingsRenderer(pi: ExtensionAPI): void {
   try {
     pi.registerMessageRenderer("cc-review-findings", (message: any, opts: any, theme: any) => {
       const expanded = !!opts?.expanded;
-      const content = (message?.content ?? {}) as CcReviewFindingsPayload;
+      const content = (message?.details ?? {}) as CcReviewFindingsPayload;
       const kindLabel = content.kind === "rollup" ? "Rollup" : `Task ${(content.taskIndex ?? 0) + 1}`;
       const partial = content.partial ? " (partial run)" : "";
       const verdictColor =
@@ -1392,7 +1590,7 @@ function registerCcReviewSummaryRenderer(pi: ExtensionAPI): void {
     pi.registerMessageRenderer("cc-review-summary", (message: any, opts: any, theme: any) => {
       const expanded = !!opts?.expanded;
       const content = typeof message?.content === "string" ? message.content : "";
-      const meta = message?.meta as CcReviewSummaryMeta | undefined;
+      const meta = message?.details as CcReviewSummaryMeta | undefined;
       const badge = classifyCcReviewSummary(content);
       const palette = BADGE_PALETTE[badge];
       const prefix = theme.fg(palette.color, `[CC Review ${palette.label}]`);
@@ -1425,7 +1623,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review tasks step-by-step. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter the compact widget + onUpdate surfaces; the persisted workflow-logs.jsonl is never filtered.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter compact surfaces.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -1447,6 +1645,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
         const workflowResult = await runCcReviewWorkflow(pi, goal, ctx, undefined, undefined, {
           reviewProvider: parsedArgs.reviewProvider,
           logLevel: parsedArgs.logLevel,
+          reviewMode: parsedArgs.reviewMode,
         });
         ctx?.ui?.notify?.("CC Review completed.", "info");
         
@@ -1454,7 +1653,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
         await pi.sendMessage?.({
           customType: "cc-review-summary",
           content: workflowResult.summary,
-          meta: workflowResult.meta,
+          details: workflowResult.meta,
           display: true,
         });
       } catch (err: any) {
@@ -1482,7 +1681,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: break down a goal, execute through subagents, review/fix with the configured provider, and progress sequentially. Pass reviewProvider as codex or claude (controls both planner and reviewer), or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel (debug|info|warning|error) to filter compact widget + onUpdate surfaces, or omit it to use CC_REVIEW_LOG_LEVEL / the info default. The persisted workflow-logs.jsonl is never filtered.",
+    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the per-task default. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error, or omit it to use CC_REVIEW_LOG_LEVEL / the info default.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
       onUpdate?.({ content: [{ type: "text", text: "Starting CC Review..." }] });
@@ -1491,6 +1690,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
         const workflowResult = await runCcReviewWorkflow(pi, params.goal, ctx, onUpdate, signal, {
           reviewProvider: params.reviewProvider,
           logLevel: params.logLevel,
+          reviewMode: params.reviewMode,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
@@ -1519,10 +1719,11 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; error?: string } {
+function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; reviewMode?: string; error?: string } {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag) {
+  const hasReviewModeFlag = /(?:^|\s)--review-mode(?:=|\s|$)/.test(args);
+  if (!hasProviderFlag && !hasLogLevelFlag && !hasReviewModeFlag) {
     return { goal: args.trim() };
   }
 
@@ -1530,6 +1731,7 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
   const goalTokens: string[] = [];
   let reviewProvider: string | undefined;
   let logLevel: string | undefined;
+  let reviewMode: string | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -1571,6 +1773,25 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
       continue;
     }
 
+    const equalsReviewModeMatch = token.match(/^--review-mode=(.*)$/);
+    if (equalsReviewModeMatch) {
+      reviewMode = equalsReviewModeMatch[1];
+      if (!reviewMode) {
+        return { goal: "", error: "Invalid --review-mode value \"\". Supported review modes: per-task, after-all." };
+      }
+      continue;
+    }
+
+    if (token === "--review-mode") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Supported review modes: per-task, after-all.` };
+      }
+      reviewMode = value;
+      i++;
+      continue;
+    }
+
     goalTokens.push(token);
   }
 
@@ -1578,6 +1799,7 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
     goal: goalTokens.join(" ").trim(),
     reviewProvider,
     logLevel,
+    reviewMode,
   };
 }
 
@@ -1610,18 +1832,199 @@ function summarizeParentContext(goal: string): string {
   return summary.trim();
 }
 
-function buildSubagentTaskPrompt(task: Task, parentContextSummary: string): string {
-  return [
+// ---------------------------------------------------------------------------
+// Cross-task handoff
+//
+// `buildPriorTaskHandoff` produces a compact, bounded "Prior Tasks (Handoff)"
+// block that is injected into each subsequent task's subagent prompt so
+// downstream generator runs can build on what earlier tasks delivered.
+//
+// Design constraints (per sprint contract):
+//   * Includes ONLY structured fields: title, verdict (effectiveVerdict ?? status),
+//     structuredReport.summary, filesChanged, unresolvedItems.
+//   * NEVER includes raw model output (TaskResult.output), reviewer stdout/stderr,
+//     log fragments, or `reviewResult.findings[*].message` (reviewer prose).
+//   * Total length is hard-capped (default 4096 chars). When the natural
+//     rendering exceeds the cap, the string is truncated and a stable marker
+//     `… (truncated)` is appended so the generator knows context was elided.
+//   * Per-task fields are also individually clipped (summary ≤ 400 chars,
+//     filesChanged ≤ 12 items, unresolvedItems ≤ 8 items) to keep one large
+//     task from starving later ones.
+// ---------------------------------------------------------------------------
+
+export interface PriorTaskHandoffOptions {
+  /** Total handoff size cap. Defaults to 4096 chars. */
+  maxSize?: number;
+  /** Maximum number of prior tasks to include (most recent kept). Defaults to 6. */
+  maxTasks?: number;
+  /** Per-task summary character cap. Defaults to 400. */
+  perTaskSummaryChars?: number;
+  /** Per-task filesChanged cap. Defaults to 12. */
+  perTaskMaxFiles?: number;
+  /** Per-task unresolvedItems cap. Defaults to 8. */
+  perTaskMaxUnresolved?: number;
+}
+
+export interface PriorTaskHandoffInput {
+  title: string;
+  status?: TaskStatus;
+  effectiveVerdict?: ReviewVerdict;
+  structuredReport?: SubagentStructuredReport;
+  // NOTE: deliberately NOT typed to receive raw `output`, reviewer stdout/stderr,
+  // or `reviewResult.findings`. Callers should pass only structured fields.
+}
+
+const PRIOR_HANDOFF_TRUNCATION_MARKER = "… (truncated)";
+const PRIOR_HANDOFF_HEADER = "Prior Tasks (Handoff):";
+
+function clipString(value: string, max: number): string {
+  if (value.length <= max) return value;
+  if (max <= 1) return value.slice(0, max);
+  return value.slice(0, Math.max(0, max - 1)).trimEnd() + "…";
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+export function buildPriorTaskHandoff(
+  priorTasks: readonly PriorTaskHandoffInput[],
+  options: PriorTaskHandoffOptions = {}
+): string {
+  if (!Array.isArray(priorTasks) || priorTasks.length === 0) return "";
+  const maxSize = Math.max(64, options.maxSize ?? 4096);
+  const maxTasks = Math.max(1, options.maxTasks ?? 6);
+  const perTaskSummaryChars = Math.max(40, options.perTaskSummaryChars ?? 400);
+  const perTaskMaxFiles = Math.max(1, options.perTaskMaxFiles ?? 12);
+  const perTaskMaxUnresolved = Math.max(1, options.perTaskMaxUnresolved ?? 8);
+
+  // Keep the most recent N tasks if the caller passed too many — recent context
+  // is more relevant for the next task. The original ordering of the kept slice
+  // is preserved so Task indices read in chronological order.
+  const tooMany = priorTasks.length > maxTasks;
+  const visible = tooMany ? priorTasks.slice(priorTasks.length - maxTasks) : priorTasks.slice();
+  const droppedCount = priorTasks.length - visible.length;
+
+  const blocks: string[] = [];
+  for (let i = 0; i < visible.length; i++) {
+    const t = visible[i];
+    if (!t || typeof t !== "object") continue;
+    const title = clipString(collapseWhitespace(String(t.title ?? "(untitled task)")), 120);
+    const verdict = t.effectiveVerdict ?? t.status ?? "unknown";
+    const report = t.structuredReport;
+    const reportStatus = report?.status ?? "unknown";
+    const summarySource = report?.summary ? collapseWhitespace(report.summary) : "(no structured summary)";
+    const summary = clipString(summarySource, perTaskSummaryChars);
+    const files = (report?.filesChanged ?? []).filter(
+      (f: string) => typeof f === "string" && f.length > 0
+    );
+    const filesShown = files.slice(0, perTaskMaxFiles).map((f: string) => clipString(f, 120));
+    const filesOmitted = Math.max(0, files.length - filesShown.length);
+    const unresolved = (report?.unresolvedItems ?? []).filter(
+      (u: string) => typeof u === "string" && u.length > 0
+    );
+    const unresolvedShown = unresolved
+      .slice(0, perTaskMaxUnresolved)
+      .map((u: string) => clipString(collapseWhitespace(u), 200));
+    const unresolvedOmitted = Math.max(0, unresolved.length - unresolvedShown.length);
+    // Index reflects position within the visible window (which may have been
+    // shifted forward when older tasks were dropped); using a 1-based local
+    // index keeps the rendering deterministic for tests.
+    const localIndex = droppedCount + i + 1;
+    const lines = [
+      `- Task ${localIndex}: ${title}`,
+      `  Status: ${reportStatus} · Verdict: ${verdict}`,
+      `  Summary: ${summary}`,
+    ];
+    if (filesShown.length > 0) {
+      const suffix = filesOmitted > 0 ? ` (+${filesOmitted} more)` : "";
+      lines.push(`  Files: ${filesShown.join(", ")}${suffix}`);
+    }
+    if (unresolvedShown.length > 0) {
+      const suffix = unresolvedOmitted > 0 ? ` (+${unresolvedOmitted} more)` : "";
+      lines.push(`  Unresolved: ${unresolvedShown.join("; ")}${suffix}`);
+    }
+    blocks.push(lines.join("\n"));
+  }
+
+  if (blocks.length === 0) return "";
+
+  const droppedNote = droppedCount > 0
+    ? `(${droppedCount} earlier task${droppedCount === 1 ? "" : "s"} omitted)\n`
+    : "";
+  let rendered = `${PRIOR_HANDOFF_HEADER}\n${droppedNote}${blocks.join("\n")}`;
+
+  if (rendered.length > maxSize) {
+    // Drop the oldest blocks from the visible window until we fit.
+    // Always keep at least the most recent block so Task N+1 still has some
+    // signal about Task N.
+    const remaining = blocks.slice();
+    while (remaining.length > 1) {
+      remaining.shift();
+      const omittedFromFront = visible.length - remaining.length + droppedCount;
+      const noteLine = omittedFromFront > 0
+        ? `(${omittedFromFront} earlier task${omittedFromFront === 1 ? "" : "s"} omitted)\n`
+        : "";
+      const candidate = `${PRIOR_HANDOFF_HEADER}\n${noteLine}${remaining.join("\n")}`;
+      if (candidate.length <= maxSize - PRIOR_HANDOFF_TRUNCATION_MARKER.length - 1) {
+        rendered = `${candidate}\n${PRIOR_HANDOFF_TRUNCATION_MARKER}`;
+        return rendered;
+      }
+    }
+    // Last resort: hard-clip only the most recent block. Clipping the original
+    // rendering here would preserve the oldest visible task and could omit the
+    // latest task entirely when no complete block fits.
+    const omittedFromFront = priorTasks.length - 1;
+    const noteLine = omittedFromFront > 0
+      ? `(${omittedFromFront} earlier task${omittedFromFront === 1 ? "" : "s"} omitted)\n`
+      : "";
+    rendered = `${PRIOR_HANDOFF_HEADER}\n${noteLine}${remaining[remaining.length - 1]}`;
+    const room = Math.max(0, maxSize - PRIOR_HANDOFF_TRUNCATION_MARKER.length - 1);
+    rendered = `${rendered.slice(0, room).trimEnd()}\n${PRIOR_HANDOFF_TRUNCATION_MARKER}`;
+  }
+  return rendered;
+}
+
+export function priorTaskHandoffFromResults(
+  priorTaskResults: readonly TaskResult[],
+  options?: PriorTaskHandoffOptions
+): string {
+  // Map TaskResult → PriorTaskHandoffInput, deliberately dropping raw output,
+  // reviewer process output, and other non-structured fields. This is the only
+  // call path the runtime uses to feed handoff data into the prompt builder.
+  const inputs: PriorTaskHandoffInput[] = priorTaskResults.map((r) => ({
+    title: r.title,
+    status: r.status,
+    effectiveVerdict: r.effectiveVerdict,
+    structuredReport: r.structuredReport,
+  }));
+  return buildPriorTaskHandoff(inputs, options);
+}
+
+function buildSubagentTaskPrompt(
+  task: Task,
+  parentContextSummary: string,
+  priorTaskHandoff: string = ""
+): string {
+  const sections = [
     `Parent Workflow Context (Summary): ${parentContextSummary}`,
+  ];
+  if (priorTaskHandoff && priorTaskHandoff.trim().length > 0) {
+    sections.push(priorTaskHandoff);
+  }
+  sections.push(
     `Task: ${task.title}`,
     `Description:\n${task.description}`,
     `Acceptance Criteria:\n${task.acceptanceCriteria}`,
     "Work only on this task's stated scope in the current workspace directory.",
     "Verify the acceptance criteria before reporting completion.",
     "End your final response with one JSON object (prose allowed above it) using this shape:",
-    '{"status":"completed|partial|blocked","summary":"...","filesChanged":["path"],"unresolvedItems":[],"acceptanceCriteria":[{"criterion":"...","status":"met|not_met|unknown","evidence":"..."}]}',
-  ].join("\n\n");
+    '{"status":"completed|partial|blocked","summary":"...","filesChanged":["path"],"unresolvedItems":[],"acceptanceCriteria":[{"criterion":"...","status":"met|not_met|unknown","evidence":"..."}]}'
+  );
+  return sections.join("\n\n");
 }
+
+export { buildSubagentTaskPrompt };
 
 // ---------------------------------------------------------------------------
 // Subagent executor
@@ -2331,6 +2734,7 @@ async function runCcReviewWorkflow(
   options: RunCcReviewWorkflowOptions = {}
 ): Promise<CcReviewWorkflowResult> {
   const reviewProviderConfig = resolveReviewProviderConfig(options.reviewProvider);
+  const reviewMode = resolveReviewMode(options.reviewMode);
   const logLevelResolution = resolveCcReviewLogLevel({ flag: options.logLevel, env: process.env });
   const resolvedLogLevel: CcReviewLogSeverity = logLevelResolution.level;
 
@@ -2338,6 +2742,7 @@ async function runCcReviewWorkflow(
   emitTrace(ctx, "workflow_start", {
     goalLength: goal.length,
     reviewProvider: reviewProviderConfig.provider,
+    reviewMode,
     logLevel: resolvedLogLevel,
   });
 
@@ -2351,6 +2756,7 @@ async function runCcReviewWorkflow(
   let currentTaskIndex = -1;
   let tasks: Task[] = [];
   const taskResults: TaskResult[] = [];
+  const batchTaskExecutions: BatchTaskExecution[] = [];
   let currentPhase = "Initializing";
   let displayState: CcReviewDisplayState = "initializing";
   let retryState: { attempt: number; maxAttempts: number } | undefined;
@@ -2380,7 +2786,13 @@ async function runCcReviewWorkflow(
 
   const emitFindingsMessage = async (payload: CcReviewFindingsPayload) => {
     if (typeof pi.sendMessage === "function") {
-      await pi.sendMessage({ customType: "cc-review-findings", display: true, content: payload });
+      const kindLabel = payload.kind === "rollup" ? "Rollup" : `Task ${(payload.taskIndex ?? 0) + 1}`;
+      await pi.sendMessage({
+        customType: "cc-review-findings",
+        display: true,
+        content: `[CC Review Findings ${kindLabel}] ${payload.effectiveVerdict}: ${payload.summary}`,
+        details: payload,
+      });
     }
   };
 
@@ -2489,7 +2901,18 @@ async function runCcReviewWorkflow(
     tasks = plannedTasks;
     currentTaskIndex = -1;
     retryState = undefined;
-    log(`Workflow planned: ${tasks.length} tasks generated.`);
+    log({
+      severity: "info",
+      source: "planner",
+      message: (() => {
+        const preview = plannedTasks
+          .slice(0, 3)
+          .map((task) => task.title)
+          .join("; ");
+        const suffix = plannedTasks.length > 3 ? ` (+${plannedTasks.length - 3} more)` : "";
+        return `Workflow planned: ${plannedTasks.length} tasks — ${preview}${suffix}`;
+      })(),
+    });
   };
 
   const transitionToExecuting = (index: number) => {
@@ -2509,6 +2932,14 @@ async function runCcReviewWorkflow(
     retryState = undefined;
     currentPhase = `Reviewing Task ${index + 1}/${tasks.length}: ${task.title}`;
     log(`Invoking ${reviewProviderConfig.label} to review and fix any issues for: "${task.title}"`);
+  };
+
+  const transitionToBatchReviewing = () => {
+    currentTaskIndex = tasks.length > 0 ? tasks.length - 1 : -1;
+    displayState = "reviewing";
+    retryState = undefined;
+    currentPhase = `Reviewing All ${tasks.length} Tasks`;
+    log(`Invoking ${reviewProviderConfig.label} once to review and fix the complete workflow.`);
   };
 
   const noteRetry = (attempt: number, maxAttempts: number) => {
@@ -2633,7 +3064,7 @@ async function runCcReviewWorkflow(
         : "info";
       const passesLogLevel = LOG_SEVERITY_RANK[entrySeverityForGate] >= LOG_SEVERITY_RANK[resolvedLogLevel];
       if (passesLogLevel) {
-        const renderedDelta = renderCcReviewLogEntry(entry, { maxMessageWidth: 120 });
+        const renderedDelta = renderCcReviewLogEntry(entry, { maxLineWidth: 120 });
         const deltaLines: string[] = [...renderedDelta];
         if (currentPhase !== lastSeenPhase) {
           deltaLines.unshift(`▸ Phase: ${currentPhase}`);
@@ -2962,26 +3393,10 @@ async function runCcReviewWorkflow(
         (data) => {
           const chunk = data.toString();
           if (captureStdoutForPlanner) plannerStdoutBuffer += chunk;
-          for (const line of chunk.split("\n")) {
-            if (line.trim()) {
-              log({
-                severity: "info",
-                source: "planner",
-                message: line.trim(),
-              });
-            }
-          }
+          logSubprocessStreamLines(log, chunk, "stdout", "planner");
         },
         (data) => {
-          for (const line of data.toString().split("\n")) {
-            if (line.trim()) {
-              log({
-                severity: "error",
-                source: "planner",
-                message: line.trim(),
-              });
-            }
-          }
+          logSubprocessStreamLines(log, data.toString(), "stderr", "planner");
         }
       );
 
@@ -3008,7 +3423,7 @@ async function runCcReviewWorkflow(
 
       let rawPlanJson: string | undefined;
       if (captureStdoutForPlanner) {
-        rawPlanJson = extractJsonObject(plannerStdoutBuffer);
+        rawPlanJson = extractBalancedJsonObject(plannerStdoutBuffer, "first");
       } else if (fs.existsSync(outputPath)) {
         rawPlanJson = fs.readFileSync(outputPath, "utf8");
       }
@@ -3075,7 +3490,11 @@ async function runCcReviewWorkflow(
       let schemaParseStatus: SchemaParseStatus = "absent";
 
       const summarizedParentContext = summarizeParentContext(goal);
-      const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext);
+      // Build a bounded, structured handoff from prior task results. Raw
+      // subagent output and reviewer process output are intentionally excluded
+      // (see priorTaskHandoffFromResults).
+      const priorHandoff = priorTaskHandoffFromResults(taskResults);
+      const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff);
       let subagentResult: SubagentResult = { code: 0 };
       let subagentOutputText = "";
       let validationError: string | undefined = undefined;
@@ -3084,12 +3503,19 @@ async function runCcReviewWorkflow(
       let retryFeedback: string | undefined = undefined;
       const unresolvedItemsForFailedTask: string[] = [];
 
-      const maxExecutionRetries = 2;
-      for (let attempt = 1; attempt <= maxExecutionRetries; attempt++) {
+      // Self-repair bound for per-task subagent dispatch. Default 2 retries on
+      // top of the initial attempt → maxTaskExecutionRetries + 1 total
+      // dispatches. On each non-zero / validation-failed attempt, the prior
+      // attempt's exit code and error/stderr/validationError text is appended
+      // to the next prompt via `retryFeedback` so the subagent can repair
+      // itself (see assignment below).
+      const maxTaskExecutionRetries = 2;
+      const maxTaskExecutionAttempts = maxTaskExecutionRetries + 1;
+      for (let attempt = 1; attempt <= maxTaskExecutionAttempts; attempt++) {
         throwIfAborted();
         if (attempt > 1) {
-          noteRetry(attempt, maxExecutionRetries);
-          log(`Retrying task execution in subagent (attempt ${attempt}/${maxExecutionRetries})...`);
+          noteRetry(attempt, maxTaskExecutionAttempts);
+          log(`Retrying task execution in subagent (attempt ${attempt}/${maxTaskExecutionAttempts})...`);
         } else {
           clearRetry();
         }
@@ -3155,7 +3581,10 @@ async function runCcReviewWorkflow(
                   (item: any) => item?.type === "text" && item.text
                 )?.text;
                 if (subagentText) {
-                  log(`[Subagent] ${subagentText}`);
+                  const formatted = formatSubprocessStreamLine(subagentText);
+                  if (formatted !== null) {
+                    log(`[Subagent] ${formatted}`);
+                  }
                 }
                 onUpdate?.(partial);
               },
@@ -3245,7 +3674,7 @@ async function runCcReviewWorkflow(
             subagentFailure?.errorMessage ||
             subagentFailure?.stderr ||
             `Subagent process exited with code ${resultCode}`;
-          if (attempt < maxExecutionRetries) {
+          if (attempt < maxTaskExecutionAttempts) {
             retryFeedback = [
               `Exit code: ${resultCode}`,
               `Error: ${errorMsg}`,
@@ -3256,7 +3685,7 @@ async function runCcReviewWorkflow(
               phase: "execution",
               taskIndex: i,
               attempt,
-              maxAttempts: maxExecutionRetries,
+              maxAttempts: maxTaskExecutionAttempts,
               error: errorMsg,
             });
           } else {
@@ -3326,6 +3755,38 @@ async function runCcReviewWorkflow(
         throw new Error(`Task execution failed unrecoverably on: "${task.title}" (${validationError || "exit code " + subagentResult.code})`);
       }
 
+      if (reviewMode === "after-all") {
+        const result: TaskResult = {
+          title: task.title,
+          description: task.description,
+          executionCode: subagentResult.code,
+          reviewCode: -1,
+          output: subagentOutputText,
+          validationError,
+          unresolvedItems,
+          status: "completed",
+          structuredReport: structuredReport ?? undefined,
+          schemaParseStatus,
+        };
+        taskStatuses[i] = "completed";
+        recordTaskResult(result);
+        batchTaskExecutions.push({
+          taskIndex: i,
+          task,
+          startedAt: taskStartedAt,
+          subagentResult,
+          subagentOutputText,
+          cachedSubagentResult,
+          validationError,
+          unresolvedItems,
+          structuredReport,
+          schemaParseStatus,
+          result,
+        });
+        log(`[Task Execution Done] Queued "${task.title}" for the final workflow review.`);
+        continue;
+      }
+
       // Part B: Review and Fix with the configured review provider
       transitionToReviewing(i);
 
@@ -3343,16 +3804,10 @@ async function runCcReviewWorkflow(
         reviewProviderConfig.command,
         reviewArgs,
         (data) => {
-          const lines = data.toString().split("\n");
-          for (const line of lines) {
-            if (line.trim()) log(`[${reviewProviderConfig.label}] ${line}`);
-          }
+          logSubprocessStreamLines(log, data.toString(), "stdout", "reviewer");
         },
         (data) => {
-          const lines = data.toString().split("\n");
-          for (const line of lines) {
-            if (line.trim()) log(`[${reviewProviderConfig.label} Error] ${line}`);
-          }
+          logSubprocessStreamLines(log, data.toString(), "stderr", "reviewer");
         }
       );
 
@@ -3489,6 +3944,179 @@ async function runCcReviewWorkflow(
           persistedLogState.filePath
         );
         throw new WorkflowError(`Blocked by reviewer on: "${task.title}"`, summary);
+      }
+    }
+
+    if (reviewMode === "after-all") {
+      transitionToBatchReviewing();
+      emitTrace(ctx, "subagent_assignment", {
+        role: "reviewer",
+        agent: reviewProviderConfig.provider,
+        reviewMode,
+        tasksCount: tasks.length,
+      });
+
+      const batchReviewTask: Task = {
+        title: `Complete workflow: ${goal}`,
+        description: [
+          `Review the complete workspace after all ${tasks.length} planned tasks have executed.`,
+          `Overall goal: ${goal}`,
+          "Planned tasks and acceptance criteria:",
+          ...tasks.map(
+            (plannedTask, index) =>
+              `${index + 1}. ${plannedTask.title}\n` +
+              `Description: ${plannedTask.description}\n` +
+              `Acceptance criteria: ${plannedTask.acceptanceCriteria}`
+          ),
+          "Review integration issues across task boundaries, fix problems directly, and verify the workflow as a whole.",
+        ].join("\n\n"),
+        acceptanceCriteria: "The complete workflow satisfies every planned task's acceptance criteria.",
+      };
+      const reviewArgs = reviewProviderConfig.buildArgs({ task: batchReviewTask });
+      const workspaceBeforeReview = snapshotWorkspace(workflowCwd);
+      const reviewProcessResult = await runProcess(
+        reviewProviderConfig.label,
+        reviewProviderConfig.command,
+        reviewArgs,
+        (data) => {
+          logSubprocessStreamLines(log, data.toString(), "stdout", "reviewer");
+        },
+        (data) => {
+          logSubprocessStreamLines(log, data.toString(), "stderr", "reviewer");
+        }
+      );
+
+      const workspaceAfterReview = snapshotWorkspace(workflowCwd);
+      const workspaceChanged = workspaceSnapshotChanged(workspaceBeforeReview, workspaceAfterReview);
+      const parsedReview = parseReviewResult(reviewProcessResult.combinedOutput);
+      const reviewResultObject = parsedReview.result;
+      const findings = reviewResultObject?.findings ?? [];
+      const reportedVerdict = reviewResultObject?.verdict ?? null;
+      const rerunValidations = batchTaskExecutions.map((execution) =>
+        validateSubagentOutput(execution.cachedSubagentResult, execution.task)
+      );
+      const postReview = await runPostReviewValidation({
+        reviewResult: reviewResultObject,
+        workspaceChanged,
+        verificationPlan,
+        runCommand: runVerificationCommand,
+        rerunSubagentValidationPassed: rerunValidations.every((validation) => validation.valid),
+      });
+      const derived = deriveEffectiveVerdict({
+        reportedVerdict,
+        findings,
+        reviewerExitCode: reviewProcessResult.exitCode,
+        reviewParseStatus: parsedReview.status,
+        ambiguousHighSeverity: parsedReview.ambiguousHighSeverity,
+        postReviewValidationFailed: !postReview.passed,
+      });
+      const effectiveVerdict = derived.effectiveVerdict;
+      const batchStatus = mapEffectiveVerdictToTaskStatus(effectiveVerdict);
+      let reviewerExitDiagnostic: string | undefined;
+      if (reviewProcessResult.exitCode !== 0 && effectiveVerdict === "ship") {
+        reviewerExitDiagnostic = `Reviewer exited non-zero (code ${reviewProcessResult.exitCode}) despite ship verdict`;
+      }
+
+      if (reviewProcessResult.exitCode !== 0 && effectiveVerdict === "ship_with_warnings") {
+        const warningMessage = `${reviewProviderConfig.label} exited with code ${reviewProcessResult.exitCode}`;
+        noteReviewWarning(warningMessage);
+        log({ severity: "warning", source: "reviewer", message: `[Review Warning] ${warningMessage}` });
+      } else if (effectiveVerdict === "ship") {
+        log(`[Review Done] ${reviewProviderConfig.label} completed the final workflow review.`);
+      } else if (effectiveVerdict === "ship_with_warnings") {
+        log({
+          severity: "warning",
+          source: "reviewer",
+          message: `[Review Warning] ${reviewProviderConfig.label} reported workflow-level warnings.`,
+        });
+      }
+
+      let lastArtifactPath = path.join(workflowCwd, WORKFLOW_ARTIFACT_DIR, workflowRunId);
+      for (let index = 0; index < batchTaskExecutions.length; index++) {
+        const execution = batchTaskExecutions[index];
+        const rerunValidation = rerunValidations[index];
+        const completedAt = new Date().toISOString();
+        const artifactPath = writeTaskArtifactForIndex({
+          taskIndex: execution.taskIndex,
+          task: execution.task,
+          startedAt: execution.startedAt,
+          completedAt,
+          execution: {
+            exitCode: execution.subagentResult.code,
+            status: batchStatus,
+            rawOutput: execution.subagentOutputText,
+            structuredReport: execution.structuredReport,
+            schemaParseStatus: execution.schemaParseStatus,
+          },
+          review: {
+            provider: reviewProviderConfig.provider,
+            reviewerExitCode: reviewProcessResult.exitCode,
+            stdout: reviewProcessResult.stdout,
+            stderr: reviewProcessResult.stderr,
+            combinedOutput: reviewProcessResult.combinedOutput,
+            reviewParseStatus: parsedReview.status,
+            reportedVerdict,
+            effectiveVerdict,
+            blockReason: derived.blockReason ?? null,
+            fallbackApplied: derived.fallbackApplied,
+            result: reviewResultObject,
+          },
+          validation: {
+            valid: rerunValidation.valid,
+            error: rerunValidation.error ?? null,
+            unresolvedItems: rerunValidation.unresolvedItems ?? [],
+          },
+          postReviewValidation: {
+            required: postReview.required,
+            workspaceChanged: postReview.workspaceChanged,
+            passed: postReview.passed,
+            error: postReview.error,
+            commands: postReview.commands,
+          },
+          workflow: {
+            haltedOnReview: effectiveVerdict === "block",
+            haltedOnExecution: false,
+          },
+        });
+        lastArtifactPath = artifactPath;
+        taskStatuses[execution.taskIndex] = batchStatus;
+        Object.assign(execution.result, {
+          reviewCode: reviewProcessResult.exitCode,
+          reviewWarningName: reviewProviderConfig.warningName,
+          status: batchStatus,
+          artifactPath,
+          reviewResult: index === 0 ? reviewResultObject ?? undefined : undefined,
+          reportedVerdict,
+          effectiveVerdict,
+          blockReason: derived.blockReason,
+          reviewerExitDiagnostic,
+        });
+      }
+
+      await emitFindingsMessage(
+        buildFindingsPayload({
+          kind: "task",
+          taskTitle: "Complete workflow review",
+          reportedVerdict,
+          effectiveVerdict,
+          blockReason: derived.blockReason,
+          summary: reviewResultObject?.summary ?? `Workflow review completed with ${effectiveVerdict}`,
+          findings,
+          artifactPath: lastArtifactPath,
+        })
+      );
+      collectedTaskFindings.push(findings);
+      findingsRollup = updateFindingsRollup(findingsRollup, effectiveVerdict, findings);
+      reviewedTaskCount = 1;
+      refreshWorkflowUi();
+
+      if (effectiveVerdict === "block") {
+        log("[Workflow Halted] Final workflow review blocked completion.");
+        const summary = appendPersistedLogPathToSummary(
+          buildSummaryReport(goal, taskResults, tasks),
+          persistedLogState.filePath
+        );
+        throw new WorkflowError("Blocked by final workflow review", summary);
       }
     }
 

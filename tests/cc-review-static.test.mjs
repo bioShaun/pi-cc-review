@@ -117,10 +117,10 @@ test("README type-check guidance uses compiler diagnostics terminology", () => {
 
 test("rename happy path: active extension metadata and docs use CC Review identity", () => {
   assert.match(source, /registerCommand\("cc-review"/);
-  assert.match(source, /description: "Run CC Review to plan, execute via Pi subagents, and review tasks step-by-step\. Use --provider claude or --provider codex to select the planner\+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex\. Use --log-level <debug\|info\|warning\|error> \(or the CC_REVIEW_LOG_LEVEL env fallback\) to filter the compact widget \+ onUpdate surfaces; the persisted workflow-logs\.jsonl is never filtered\."/);
+  assert.match(source, /description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks\./);
   assert.match(source, /name: "cc_review"/);
   assert.match(source, /label: "CC Review"/);
-  assert.match(source, /description: "Run CC Review: break down a goal, execute through subagents, review\/fix with the configured provider, and progress sequentially\. Pass reviewProvider as codex or claude \(controls both planner and reviewer\), or omit it to use CC_REVIEW_PROVIDER \/ the codex default\. Pass logLevel \(debug\|info\|warning\|error\) to filter compact widget \+ onUpdate surfaces, or omit it to use CC_REVIEW_LOG_LEVEL \/ the info default\. The persisted workflow-logs\.jsonl is never filtered\."/);
+  assert.match(source, /description: "Run CC Review: plan a goal, execute tasks sequentially, then review\/fix either per task or once after all tasks\./);
   assert.match(source, /description: "The overarching goal for CC Review to accomplish using Codex planning and Pi subagents"/);
   assert.match(source, /customType: "cc-review-summary"/);
   assert.match(source, /"cc-review-widget"/);
@@ -174,7 +174,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; error\?: string \}/);
+  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; reviewMode\?: string; error\?: string \}/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -185,6 +185,20 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /reviewProviderConfig\.command/);
   assert.match(source, /reviewProviderConfig\.label/);
   assert.doesNotMatch(source, /reviewProviderConfig\.command,\n\s+codexReviewArgs/);
+});
+
+test("review timing supports per-task and after-all orchestration", () => {
+  assert.match(source, /type ReviewMode = "per-task" \| "after-all"/);
+  assert.match(source, /type ReviewModeSource = "reviewMode" \| "CC_REVIEW_MODE"/);
+  assert.match(source, /export function resolveReviewMode\(/);
+  assert.match(source, /return rawMode === undefined \? "per-task" : normalizeReviewMode\(rawMode, source\)/);
+  assert.match(source, /reviewMode: params\.reviewMode/);
+  assert.match(source, /reviewMode: parsedArgs\.reviewMode/);
+  assert.match(source, /if \(reviewMode === "after-all"\) \{/);
+  assert.match(source, /transitionToBatchReviewing\(\)/);
+  assert.match(source, /const batchReviewTask: Task = \{/);
+  assert.match(source, /reviewMode === "after-all"[\s\S]*?reviewProviderConfig\.buildArgs\(\{ task: batchReviewTask \}\)/);
+  assert.match(source, /Queued "\$\{task\.title\}" for the final workflow review/);
 });
 
 test("command help and docs show explicit and environment Claude provider selection", () => {
@@ -212,8 +226,8 @@ test("README documents CC Review installation and active plugin identity", () =>
 
 test("README documents selected review setup, provider examples, and credentials", () => {
   const readme = fs.readFileSync("README.md", "utf8");
-  assert.match(readme, /Planning always uses Codex/);
-  assert.match(readme, /changes only the per-task review\/fix phase/);
+  assert.match(readme, /selects both the planner and reviewer backend/);
+  assert.match(readme, /Review Timing/);
   assert.match(readme, /CC_REVIEW_PROVIDER=claude pi --mode json -p/);
   assert.match(readme, /claude -p/);
   assert.match(readme, /ensure `claude` is on `PATH`/);
@@ -236,13 +250,13 @@ test("README documents provider defaults and troubleshooting", () => {
   assert.match(readme, /CC Review does not preflight credentials/);
   assert.match(readme, /empty, whitespace-only, and unsupported names fail with an invalid provider error such as `Invalid reviewProvider` or `Invalid CC_REVIEW_PROVIDER`/);
   assert.match(readme, /explicit `reviewProvider` or `--provider` values take precedence over `CC_REVIEW_PROVIDER`/);
-  assert.match(readme, /Claude provider selection does not replace Codex planning/);
+  assert.match(readme, /provider selection applies to both planning and review/);
   assert.doesNotMatch(readme, /Unset or empty: defaults/);
 });
 
 test("README manual verification checklist covers install, default, Claude, marketplace, old-name search, and standard commands", () => {
   const readme = fs.readFileSync("README.md", "utf8");
-  assert.match(readme, /### 2\.5\. Manual Verification Checklist/);
+  assert.match(readme, /### 2\.6\. Manual Verification Checklist/);
   for (const requiredTerm of [
     "Install/load smoke test",
     "copy `.pi/extensions/cc-review.ts` into a clean Pi workspace",
@@ -341,18 +355,18 @@ test("provider selection flow implementation note documents current control path
     "these affect task execution subagents, not planner/reviewer provider selection",
     "`runCcReviewWorkflow(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start",
     "invalid explicit/environment provider values fail before planner or reviewer subprocesses are spawned",
-    "Planning remains hardcoded",
-    "`codexPlanArgs` plus `runProcess(\"Codex planner\", \"codex\", codexPlanArgs, ...)`",
-    "`reviewProvider: \"claude\"`, `--provider claude`, or `CC_REVIEW_PROVIDER=claude` does not change planning",
+    "Planning uses the normalized provider",
+    "Codex writes schema-constrained output",
+    "Claude returns JSON on stdout",
     "`REVIEW_BACKEND_FACTORIES` and `reviewProviderConfig.buildArgs({ task })`",
-    "Codex review spawns `codex exec",
-    "Claude review spawns `claude -p",
+    "Review uses `.pi/extensions/cc-review.ts` `REVIEW_BACKEND_FACTORIES`",
+    "in `after-all` mode it runs once",
     "`runProcess(reviewProviderConfig.label, reviewProviderConfig.command, reviewArgs, ...)`",
-    "optional `reviewProvider` was added to `CcReviewParams`",
-    "optional slash-command provider flags are parsed before goal handling",
-    "a small options object is threaded into `runCcReviewWorkflow(...)`",
-    "`resolveReviewProviderConfig(...)` accepts that explicit value ahead of `process.env.CC_REVIEW_PROVIDER`",
-    "single validation/defaulting function",
+    "provider and review-timing insertion points are implemented",
+    "handler parses provider, log-level, and `--review-mode` flags",
+    "forwards `reviewProvider`, `logLevel`, and `reviewMode`",
+    "accepts an explicit provider value before falling back to `CC_REVIEW_PROVIDER`",
+    "sole review-provider defaulting and validation point",
   ]) {
     assert.match(note, new RegExp(requiredTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -431,9 +445,9 @@ test("display log path uses normalized log entries", () => {
   // path; assert both that the filter feeds the slice and that liveLogs is the
   // ultimate input.
   assert.match(source, /filterCcReviewLogEntries\(state\.liveLogs, \{ minSeverity: state\.resolvedLogLevel \}\)/);
-  assert.match(source, /renderCcReviewLogEntry\(entry, \{ maxMessageWidth: width - 4 \}\)/);
+  assert.match(source, /renderCcReviewLogEntry\(entry, \{ maxLineWidth: width - 3 \}\)/);
   // onUpdate emits a per-entry compact delta rather than re-broadcasting the full last-5 markdown block.
-  assert.match(source, /const renderedDelta = renderCcReviewLogEntry\(entry, \{ maxMessageWidth: 120 \}\)/);
+  assert.match(source, /const renderedDelta = renderCcReviewLogEntry\(entry, \{ maxLineWidth: 120 \}\)/);
   assert.doesNotMatch(source, /const liveLogs: string\[\] = \[\]/);
   assert.doesNotMatch(source, /liveLogs\.push\(cleaned\)/);
 });
@@ -466,6 +480,27 @@ test("severity rollup helper exists and is wired into the widget", () => {
   assert.match(
     source,
     /lines\.push\(truncateWidgetLine\(formatPhaseSeverityLine\(state\.currentPhase, state\.liveLogs, \{ theme \}\), width\)\);/
+  );
+});
+
+test("subprocess stream lines are formatted before logging", () => {
+  assert.match(source, /export function formatSubprocessStreamLine\(/);
+  assert.match(source, /function logSubprocessStreamLines\(/);
+  assert.match(source, /logSubprocessStreamLines\(log, chunk, "stdout", "planner"\)/);
+  assert.match(source, /logSubprocessStreamLines\(log, data\.toString\(\), "stderr", "reviewer"\)/);
+});
+
+test("subprocess stream severity inference is exported and wired into planner/reviewer handlers", () => {
+  assert.match(source, /export function inferSubprocessStreamSeverity\(/);
+  assert.match(source, /severity: inferSubprocessStreamSeverity\(trimmed, stream\)/);
+});
+
+test("widget full-log line is width-truncated", () => {
+  assert.match(source, /export function truncatePersistedLogPathForWidget\(/);
+  assert.match(source, /truncatePersistedLogPathForWidget\(state\.persistedLogPath/);
+  assert.match(
+    source,
+    /truncateWidgetLine\(\s*\n?\s*`\$\{theme\.fg\("muted", "\\ud83d\\udcc4 Full log:"\)\} \$\{theme\.fg\(\s*\n?\s*"dim",\s*\n?\s*truncatePersistedLogPathForWidget\(state\.persistedLogPath/
   );
 });
 
@@ -572,11 +607,11 @@ test("log-level resolver is exported with the documented signature and wired thr
   assert.match(source, /logLevel:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional minimum log severity/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+reviewMode\?: string;\n\}/
   );
   assert.match(
     source,
-    /interface RunCcReviewWorkflowOptions \{[\s\S]*?reviewProvider\?: string;[\s\S]*?logLevel\?: string;[\s\S]*?validationCommands\?:/
+    /interface RunCcReviewWorkflowOptions \{[\s\S]*?reviewProvider\?: string;[\s\S]*?logLevel\?: string;[\s\S]*?reviewMode\?: string;[\s\S]*?validationCommands\?:/
   );
   assert.match(source, /logLevel: params\.logLevel/);
   assert.match(source, /logLevel: parsedArgs\.logLevel/);
@@ -637,9 +672,20 @@ test("subagent task definition and schema incorporate acceptance criteria", () =
 
 test("parent workflow context is summarized and formatted in subagent prompt", () => {
   assert.match(source, /function summarizeParentContext\(goal: string\): string/);
-  assert.match(source, /function buildSubagentTaskPrompt\(task: Task, parentContextSummary: string\): string/);
+  // buildSubagentTaskPrompt now accepts an optional priorTaskHandoff arg so
+  // generators on Task N>=2 receive a bounded handoff from earlier tasks.
+  assert.match(
+    source,
+    /function buildSubagentTaskPrompt\(\s*task: Task,\s*parentContextSummary: string,\s*priorTaskHandoff[^)]*\): string/
+  );
   assert.match(source, /const summarizedParentContext = summarizeParentContext\(goal\);/);
-  assert.match(source, /const subagentPrompt = buildSubagentTaskPrompt\(task, summarizedParentContext\);/);
+  // The runtime now derives a structured handoff from accumulated taskResults
+  // and forwards it as the third argument when building the per-task prompt.
+  assert.match(source, /priorTaskHandoffFromResults\(taskResults\)/);
+  assert.match(
+    source,
+    /const subagentPrompt = buildSubagentTaskPrompt\(task, summarizedParentContext, priorHandoff\);/
+  );
   assert.match(source, /Parent Workflow Context \(Summary\): \$\{parentContextSummary\}/);
   assert.match(source, /Acceptance Criteria:\\n\$\{task\.acceptanceCriteria\}/);
   assert.match(source, /Verify the acceptance criteria before reporting completion/);
@@ -742,8 +788,8 @@ test("regression test for successful multi-step execution", () => {
 
 test("regression test for subagent failure", () => {
   // Verifies that execution failures are detected and retries are scheduled
-  assert.match(source, /const\s+maxExecutionRetries\s*=\s*2/);
-  assert.match(source, /for\s*\(let\s+attempt\s*=\s*1;\s*attempt\s*<=\s*maxExecutionRetries;\s*attempt\+\+\)/);
+  assert.match(source, /const\s+maxTaskExecutionRetries\s*=\s*2/);
+  assert.match(source, /for\s*\(let\s+attempt\s*=\s*1;\s*attempt\s*<=\s*maxTaskExecutionAttempts;\s*attempt\+\+\)/);
   assert.match(source, /retryFeedback\s*=/);
   assert.match(source, /resultCode\s*===\s*0/);
 });
@@ -758,7 +804,8 @@ test("regression test for partial result aggregation", () => {
 
 test("regression test for retry exhaustion", () => {
   // Verifies that limits are imposed on retries before propagating failures
-  assert.match(source, /const\s+maxExecutionRetries\s*=\s*2/);
+  assert.match(source, /const\s+maxTaskExecutionRetries\s*=\s*2/);
+  assert.match(source, /const\s+maxTaskExecutionAttempts\s*=\s*maxTaskExecutionRetries\s*\+\s*1/);
   assert.match(source, /const\s+maxPlanRetries\s*=\s*3/);
   assert.match(source, /throw\s+new\s+Error\(errorMsg\)/);
   assert.match(source, /Task execution failed unrecoverably/);
@@ -849,7 +896,7 @@ test("log surface audit documents addressed log-display gaps", () => {
 test("README documents log display controls and compact widget affordances", () => {
   const readme = fs.readFileSync("README.md", "utf8");
   for (const requiredTerm of [
-    "### 2.6. Log Display and Observability",
+    "### 2.7. Log Display and Observability",
     "CC_REVIEW_LOG_LEVEL",
     "--log-level",
     "Severity rollup line",
@@ -959,3 +1006,7 @@ test("reference summary records intentionally deferred patterns and scope guard"
   assert.doesNotMatch(source, /registerMessageRenderer\("cc-review-log"/);
 });
 
+test("planner reuses shared JSON extraction helper", () => {
+  assert.doesNotMatch(source, /function extractJsonObject\(/);
+  assert.match(source, /extractBalancedJsonObject\(plannerStdoutBuffer,\s*"first"\)/);
+});

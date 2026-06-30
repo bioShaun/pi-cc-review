@@ -12,17 +12,23 @@ import ccReviewExtension, {
   buildBuiltinGeneratorAgent,
   buildCcReviewStatusText,
   buildCcReviewWidgetLines,
+  buildPriorTaskHandoff,
+  buildSubagentTaskPrompt,
+  priorTaskHandoffFromResults,
   classifyCcReviewSummary,
   computeChecklistWindow,
   countCcReviewTaskOutcomesFromSummary,
   discoverAgent,
   filterCcReviewLogEntries,
+  formatSubprocessStreamLine,
+  inferSubprocessStreamSeverity,
   formatCcReviewSummaryHeadline,
   formatPhaseSeverityLine,
   normalizeCcReviewLogEntry,
   previewWidgetText,
   renderCcReviewLogEntry,
   resolveCcReviewLogLevel,
+  resolveReviewMode,
   summarizeLogSeverities,
   summarizeSubagentToolActivity,
   truncateForWidget,
@@ -65,6 +71,59 @@ describe("summarizes subagent tool activity for live progress", () => {
   it("falls back to the tool name when no useful arg is present", () => {
     assert.equal(summarizeSubagentToolActivity({ type: "tool_execution_start", toolName: "think", args: {} }), "⚙ think");
     assert.equal(summarizeSubagentToolActivity({ type: "tool_execution_start" }), "⚙ tool");
+  });
+});
+
+describe("formatSubprocessStreamLine turns structured CLI output into readable log lines", () => {
+  it("summarizes planner task JSON instead of dumping raw payloads", () => {
+    const formatted = formatSubprocessStreamLine(
+      JSON.stringify({
+        tasks: [
+          { title: "Task A", description: "d", acceptanceCriteria: "a" },
+          { title: "Task B", description: "d", acceptanceCriteria: "a" },
+        ],
+      })
+    );
+    assert.equal(formatted, "Planned 2 tasks: Task A; Task B");
+  });
+
+  it("summarizes reviewer verdict JSON instead of dumping raw payloads", () => {
+    const formatted = formatSubprocessStreamLine(
+      JSON.stringify({
+        verdict: "ship",
+        summary: "All checks passed",
+        findings: [{ priority: "P2", confidence: 1, message: "nit", status: "fixed" }],
+      })
+    );
+    assert.match(formatted ?? "", /^Review: ship — All checks passed — 1 finding/);
+  });
+
+  it("skips JSON fragments and workflow trace noise", () => {
+    assert.equal(formatSubprocessStreamLine('  "tasks": ['), null);
+    assert.equal(formatSubprocessStreamLine('{"type":"workflow_trace","event":"workflow_start"}'), null);
+  });
+
+  it("keeps ordinary prose lines unchanged", () => {
+    assert.equal(formatSubprocessStreamLine("exec /bin/zsh -lc \"git status\""), 'exec /bin/zsh -lc "git status"');
+  });
+});
+
+describe("inferSubprocessStreamSeverity classifies CLI stream lines by content", () => {
+  it("treats routine stderr diagnostics as info", () => {
+    assert.equal(
+      inferSubprocessStreamSeverity("docs/plugin-log-surface-audit.md:70: retry field docs", "stderr"),
+      "info"
+    );
+    assert.equal(
+      inferSubprocessStreamSeverity("exec /bin/zsh -lc \"git status\" succeeded in 0ms", "stderr"),
+      "info"
+    );
+  });
+
+  it("elevates stderr lines with explicit failure signals", () => {
+    assert.equal(inferSubprocessStreamSeverity("schema validation failed", "stderr"), "error");
+    assert.equal(inferSubprocessStreamSeverity("Claude review failed", "stderr"), "error");
+    assert.equal(inferSubprocessStreamSeverity("rate limited", "stderr"), "warning");
   });
 });
 
@@ -119,6 +178,22 @@ describe("renders severity-aware log entries for the CC Review display", () => {
     assert.equal(rendered[4], `${" ".repeat(prefix.length)}log widget boundary`);
     for (const continuation of rendered.slice(1)) {
       assert.ok(continuation.startsWith(" ".repeat(prefix.length)), "continuation line should align under message body");
+    }
+  });
+
+  it("respects maxLineWidth so prefix plus first message line fits the widget budget", () => {
+    const entry = normalizeCcReviewLogEntry({
+      timestamp: "2026-06-26T03:04:05.678Z",
+      severity: "info",
+      source: "subagent",
+      message: "bash: cd /workspace && grep -R observability docs tests README workflow-baseline.md",
+    }, { sequence: 4 });
+
+    const maxLineWidth = 80;
+    const rendered = renderCcReviewLogEntry(entry, { maxLineWidth });
+    assert.ok(rendered.length > 0);
+    for (const line of rendered) {
+      assert.ok(line.length <= maxLineWidth, `line too long (${line.length}): ${line}`);
     }
   });
 });
@@ -276,6 +351,30 @@ describe("buildCcReviewWidgetLines colors and merges phase with severity rollup"
     assert.ok(lines.some((line) => line.includes("<accent>") && line.includes("\u25b8")));
     assert.ok(lines.some((line) => line.includes("Executing Task 1/2")));
     assert.ok(lines.some((line) => line.includes("/tmp/workflow-logs.jsonl")));
+    for (const line of lines) {
+      assert.ok(line.length <= 80, `widget line exceeds width 80 (${line.length}): ${line}`);
+    }
+  });
+
+  it("truncates an overlong Full log path line", () => {
+    const longPath = `/tmp/${"very-long-segment/".repeat(20)}workflow-logs.jsonl`;
+    const lines = buildCcReviewWidgetLines(
+      {
+        goal: "Ship widget polish",
+        tasks: [{ title: "Color the widget" }],
+        currentTaskIndex: 0,
+        displayState: "executing",
+        currentPhase: "Executing Task 1/1",
+        liveLogs: [],
+        resolvedLogLevel: "info",
+        persistedLogPath: longPath,
+        findingsRollup: { tasksReviewed: 0, ship: 0, shipWithWarnings: 0, blocked: 0, unfixedP0: 0, unfixedP1: 0, unfixedP2P3: 0 },
+      },
+      { width: 60, theme: mockTheme }
+    );
+    const fullLogLine = lines[lines.length - 1];
+    assert.ok(fullLogLine.length <= 60, `expected truncated Full log line, got length ${fullLogLine.length}`);
+    assert.ok(fullLogLine.includes("\u2026") || fullLogLine.length < longPath.length);
   });
 });
 
@@ -535,6 +634,25 @@ describe("resolveCcReviewLogLevel derives the compact-surface minimum severity",
   });
 });
 
+describe("resolveReviewMode selects review timing", () => {
+  it("uses explicit value, environment fallback, and the per-task default", () => {
+    assert.equal(resolveReviewMode(" after-all "), "after-all");
+    assert.equal(
+      resolveReviewMode(undefined, { CC_REVIEW_MODE: "per-task" } as NodeJS.ProcessEnv),
+      "per-task"
+    );
+    assert.equal(resolveReviewMode(undefined, {} as NodeJS.ProcessEnv), "per-task");
+  });
+
+  it("rejects unsupported explicit and environment values", () => {
+    assert.throws(() => resolveReviewMode("batch"), /Invalid reviewMode value "batch"/);
+    assert.throws(
+      () => resolveReviewMode(undefined, { CC_REVIEW_MODE: "later" } as NodeJS.ProcessEnv),
+      /Invalid CC_REVIEW_MODE value "later"/
+    );
+  });
+});
+
 describe("normalizes log entries into the CC Review display contract", () => {  it("normalizes log entries from a legacy string with default display fields", () => {
     const entry = normalizeCcReviewLogEntry("\u001b[31mPlanner ready\u001b[0m", {
       sequence: 7,
@@ -574,6 +692,13 @@ describe("normalizes log entries into the CC Review display contract", () => {  
     assert.equal(timeoutWarning.severity, "warning");
     assert.equal(timeoutWarning.source, "cc-review");
     assert.equal(timeoutWarning.message, "subagent exceeded timeout");
+
+    const plannerDiagnostic = normalizeCcReviewLogEntry(
+      "[Codex Planner Error] docs/plugin-log-surface-audit.md:70: retry field",
+      { sequence: 11, now: () => new Date("2026-06-26T00:00:00.000Z") }
+    );
+    assert.equal(plannerDiagnostic.severity, "info");
+    assert.equal(plannerDiagnostic.source, "planner");
   });
 
   it("normalizes log entries from a complete structured input without dropping fields", () => {
@@ -744,6 +869,7 @@ describe("CC Review Behavioral Regression Tests", () => {
   const originalClaudeMaxTokens = process.env.CLAUDE_MAX_TOKENS;
   const originalClaudeApiUrl = process.env.CLAUDE_API_URL;
   const originalCcReviewLogLevel = process.env.CC_REVIEW_LOG_LEVEL;
+  const originalCcReviewMode = process.env.CC_REVIEW_MODE;
 
   beforeEach(() => {
     tempTestDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-test-workspace-"));
@@ -762,6 +888,7 @@ describe("CC Review Behavioral Regression Tests", () => {
     delete process.env.CLAUDE_MAX_TOKENS;
     delete process.env.CLAUDE_API_URL;
     delete process.env.CC_REVIEW_LOG_LEVEL;
+    delete process.env.CC_REVIEW_MODE;
     process.env.CODEX_API_KEY = "test-codex-review-key";
     process.env.ANTHROPIC_API_KEY = "test-claude-review-key";
     globalThis.fetch = originalFetch;
@@ -785,8 +912,10 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.match(registeredTool.description, /CC_REVIEW_PROVIDER/);
     assert.match(registeredTool.description, /logLevel/);
     assert.match(registeredTool.description, /CC_REVIEW_LOG_LEVEL/);
+    assert.match(registeredTool.description, /CC_REVIEW_MODE/);
     assert.equal(registeredTool.parameters.properties.reviewProvider.type, "string");
     assert.equal(registeredTool.parameters.properties.logLevel.type, "string");
+    assert.equal(registeredTool.parameters.properties.reviewMode.type, "string");
     assert.equal(registeredTool.parameters.properties.reviewProvider.enum, undefined);
     assert.equal((piMock as any).codex_workflow, undefined);
     assert.equal((piMock as any).codexWorkflow, undefined);
@@ -867,6 +996,11 @@ describe("CC Review Behavioral Regression Tests", () => {
       delete process.env.CC_REVIEW_LOG_LEVEL;
     } else {
       process.env.CC_REVIEW_LOG_LEVEL = originalCcReviewLogLevel;
+    }
+    if (originalCcReviewMode === undefined) {
+      delete process.env.CC_REVIEW_MODE;
+    } else {
+      process.env.CC_REVIEW_MODE = originalCcReviewMode;
     }
     globalThis.fetch = originalFetch;
     try {
@@ -1267,8 +1401,21 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(reviewArgsList[0][0], "exec");
     assert.ok(reviewArgsList[0].includes("--skip-git-repo-check"));
     assert.ok(reviewArgsList[0].includes("--dangerously-bypass-approvals-and-sandbox"));
-    assert.equal(sentMessages.filter((message) => message.customType === "cc-review-findings").length, 2);
+    const findingsMessages = sentMessages.filter((message) => message.customType === "cc-review-findings");
+    assert.equal(findingsMessages.length, 2);
+    for (const message of findingsMessages) {
+      assert.equal(
+        typeof message.content,
+        "string",
+        "custom message content must satisfy Pi's string-or-content-block-array contract"
+      );
+      assert.ok(
+        message.details?.kind === "task" || message.details?.kind === "rollup",
+        "structured findings payload must be carried in custom message details"
+      );
+    }
     assert.match(getSummaryText(sentMessages), /Completed and reviewed/);
+    assert.ok(getSummaryMessage(sentMessages)?.details, "summary renderer metadata must use Pi's details field");
   });
 
   it("slash command with --provider claude reaches Claude subprocess path", async () => {
@@ -1983,6 +2130,110 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(firstTrace.event, "workflow_start");
   });
 
+  it("after-all review mode executes every task before invoking one workflow review", async () => {
+    const mockTasks = [
+      { title: "Foundation", description: "Implement foundation", acceptanceCriteria: "Foundation works" },
+      { title: "Integration", description: "Integrate feature", acceptanceCriteria: "Integration works" }
+    ];
+    let subagentCalls = 0;
+    let reviewerCalls = 0;
+    let subagentCallsWhenReviewStarted = -1;
+    let reviewPrompt = "";
+
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      if (args.includes("-o")) {
+        process.nextTick(() => {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+          mockProc.emit("close", 0, null);
+        });
+      } else {
+        reviewerCalls++;
+        subagentCallsWhenReviewStarted = subagentCalls;
+        reviewPrompt = args.at(-1) || "";
+        process.nextTick(() => mockProc.emit("close", 0, null));
+      }
+      return mockProc;
+    };
+
+    mockSubagentHandler = async () => {
+      subagentCalls++;
+      return {
+        content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+        details: { results: [{ exitCode: 0 }] }
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-after-all",
+      { goal: "Build the integrated workflow", reviewMode: "after-all" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.equal(subagentCalls, 2);
+    assert.equal(reviewerCalls, 1);
+    assert.equal(subagentCallsWhenReviewStarted, 2);
+    assert.match(reviewPrompt, /Complete workflow: Build the integrated workflow/);
+    assert.match(reviewPrompt, /Foundation/);
+    assert.match(reviewPrompt, /Integration/);
+    assert.equal(
+      sentMessages.filter((message) => message.customType === "cc-review-findings").length,
+      2,
+      "after-all emits one workflow finding plus one rollup"
+    );
+
+    const artifactRoot = path.join(tempTestDir, "cc-review-artifacts");
+    const runDirs = fs.readdirSync(artifactRoot);
+    assert.equal(runDirs.length, 1);
+    const artifactFiles = fs.readdirSync(path.join(artifactRoot, runDirs[0])).sort();
+    assert.deepEqual(artifactFiles, ["task-001.json", "task-002.json"]);
+    for (const artifactFile of artifactFiles) {
+      const artifact = JSON.parse(
+        fs.readFileSync(path.join(artifactRoot, runDirs[0], artifactFile), "utf8")
+      );
+      assert.equal(artifact.review.effectiveVerdict, "ship");
+      assert.equal(artifact.workflow.haltedOnReview, false);
+    }
+  });
+
+  it("slash command forwards --review-mode after-all", async () => {
+    const mockTasks = [
+      { title: "Task 1", description: "Implement A", acceptanceCriteria: "A works" },
+      { title: "Task 2", description: "Implement B", acceptanceCriteria: "B works" }
+    ];
+    let reviewerCalls = 0;
+
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      process.nextTick(() => {
+        if (args.includes("-o")) {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+        } else {
+          reviewerCalls++;
+        }
+        mockProc.emit("close", 0, null);
+      });
+      return mockProc;
+    };
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    await registeredCommand.handler(
+      "--review-mode after-all Build through slash command",
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(reviewerCalls, 1);
+    assert.match(getSummaryText(sentMessages), /Completed and reviewed/);
+  });
+
   it("subagent failure with retry and recovery", async () => {
     const mockTasks = [
       { title: "Task 1", description: "Implement feature A", acceptanceCriteria: "A is verified" }
@@ -2153,7 +2404,7 @@ describe("CC Review Behavioral Regression Tests", () => {
     );
 
     assert.equal(resultSubagentExhaustion.isError, true);
-    assert.equal(subagentCalls, 2); // maxTaskExecutionRetries is 2
+    assert.equal(subagentCalls, 3); // maxTaskExecutionRetries=2 → 3 total dispatches
 
     // B. Planning retry exhaustion
     let plannerCalls = 0;
@@ -2428,8 +2679,18 @@ describe("CC Review Behavioral Regression Tests", () => {
             fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
             mockProc.emit("close", 0, null);
           } else {
-            // Reviewer fails with non-zero exit to trigger warning state in widget
+            // Reviewer exits non-zero with warnings so the widget surfaces an explicit warning state.
             mockProc.autoReviewStdout = false;
+            mockProc.stdout.emit(
+              "data",
+              Buffer.from(
+                `${JSON.stringify({
+                  verdict: "ship_with_warnings",
+                  summary: "Minor review issues",
+                  findings: [],
+                })}\n`
+              )
+            );
             mockProc.stderr.emit("data", Buffer.from("review hiccup\n"));
             mockProc.emit("close", 1, null);
           }
@@ -2459,10 +2720,9 @@ describe("CC Review Behavioral Regression Tests", () => {
       /No logs yet|Planning tasks|Waiting for planner/.test(earliestSnapshot),
       `earliest widget snapshot should show an explicit empty/planning state, got:\n${earliestSnapshot}`
     );
-    // Every snapshot should advertise the persisted log path.
-    const fullLogPath = path.join(tempTestDir, "workflow-logs.jsonl");
-    assert.ok(widgetSnapshots.every((snap) => snap.some((line) => line.includes(fullLogPath))),
-      "every widget snapshot should reference the persisted log path");
+    // Every snapshot should advertise the persisted log file.
+    assert.ok(widgetSnapshots.every((snap) => snap.some((line) => line.includes("workflow-logs.jsonl"))),
+      "every widget snapshot should reference the persisted log file name");
     // After the reviewer warning we should see the warning marker somewhere in the trail.
     const warningSeen = widgetSnapshots.some((snap) => snap.some((line) => /Warning:/i.test(line)));
     assert.ok(warningSeen, "reviewer warning should surface in the widget");
@@ -2657,7 +2917,17 @@ describe("CC Review Behavioral Regression Tests", () => {
           if (args.includes("-o")) {
             fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
           } else {
-            mockProc.stderr.emit("data", Buffer.from("review hiccup\n"));
+            mockProc.stdout.emit(
+              "data",
+              Buffer.from(
+                `${JSON.stringify({
+                  verdict: "ship",
+                  summary: "Looks good",
+                  findings: [],
+                })}\n`
+              )
+            );
+            mockProc.stderr.emit("data", Buffer.from("fatal: review subprocess error\n"));
           }
           mockProc.emit("close", args.includes("-o") ? 0 : 1, null);
         });
@@ -2683,13 +2953,450 @@ describe("CC Review Behavioral Regression Tests", () => {
       .map((u) => u?.content?.[0]?.text ?? "")
       .filter((t) => typeof t === "string" && t.length > 0);
     assert.ok(
-      updateTexts.some((text) => /⚠ WARN|✖ ERROR/.test(text)),
-      "warning/error deltas should still appear when CC_REVIEW_LOG_LEVEL=error"
+      updateTexts.some((text) => /✖ ERROR/.test(text)),
+      "error deltas should still appear when CC_REVIEW_LOG_LEVEL=error"
     );
     assert.equal(
-      updateTexts.filter((text) => /ℹ INFO/.test(text)).length,
+      updateTexts.filter((text) => /ℹ INFO|⚠ WARN/.test(text)).length,
       0,
-      "info deltas should be filtered when CC_REVIEW_LOG_LEVEL=error"
+      "info/warning deltas should be filtered when CC_REVIEW_LOG_LEVEL=error"
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // Self-repair task-execution retry loop (maxTaskExecutionRetries)
+  //
+  // These tests bound the per-task subagent dispatch loop and verify that
+  // a failing dispatch's stderr/error text is fed back into the next
+  // attempt's prompt for self-repair.
+  // -------------------------------------------------------------------------
+  describe("task execution self-repair retry loop (maxTaskExecutionRetries)", () => {
+    const SINGLE_TASK_PLAN = [
+      { title: "Self-repair task", description: "Build feature X", acceptanceCriteria: "X passes" },
+    ];
+
+    function installCodexPlannerAndReviewerHandler() {
+      mockSpawnHandler = (command, args) => {
+        if (command !== "codex") return null;
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (isCodexPlannerArgs(args)) {
+            const oIndex = args.indexOf("-o");
+            const outputPath = args[oIndex + 1];
+            fs.writeFileSync(outputPath, JSON.stringify({ tasks: SINGLE_TASK_PLAN }), "utf8");
+            mockProc.emit("close", 0, null);
+          } else {
+            // Reviewer: emit a ship verdict so a successful subagent path
+            // results in a completed task. (Failed subagent tasks halt the
+            // workflow before reviewer is invoked.)
+            emitMockReviewStdout(mockProc);
+            mockProc.emit("close", 0, null);
+          }
+        });
+        return mockProc;
+      };
+    }
+
+    it("(c) dispatches exactly once when the first attempt succeeds", async () => {
+      installCodexPlannerAndReviewerHandler();
+      const dispatchedPrompts: string[] = [];
+      mockSubagentHandler = async (_toolName, params) => {
+        dispatchedPrompts.push(String(params.task));
+        return {
+          content: [{ type: "text", text: "All acceptance criteria verified on first try." }],
+          details: { results: [{ exitCode: 0 }] },
+        };
+      };
+
+      const result = await registeredTool.execute(
+        "tool-call-self-repair-first-try",
+        { goal: "Self-repair happy path" },
+        undefined,
+        undefined,
+        { cwd: tempTestDir }
+      );
+
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.status, "completed");
+      assert.equal(dispatchedPrompts.length, 1, "first-try success must not retry");
+      // The single dispatch must NOT contain self-repair feedback markers.
+      assert.equal(
+        /Previous attempt feedback/i.test(dispatchedPrompts[0]),
+        false,
+        "no failure-feedback should appear on the first dispatch"
+      );
+    });
+
+    it("(a) re-dispatches once with the prior attempt's failure text on a single recoverable failure", async () => {
+      installCodexPlannerAndReviewerHandler();
+      const FAIL_STDERR =
+        "E_TYPECHECK: TS2304 Cannot find name 'frobnicate' at src/foo.ts:42";
+      const dispatchedPrompts: string[] = [];
+      mockSubagentHandler = async (_toolName, params) => {
+        dispatchedPrompts.push(String(params.task));
+        if (dispatchedPrompts.length === 1) {
+          return {
+            content: [{ type: "text", text: FAIL_STDERR }],
+            details: { results: [{ exitCode: 1, errorMessage: FAIL_STDERR, stderr: FAIL_STDERR }] },
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text", text: "Fixed the typecheck and verified." }],
+          details: { results: [{ exitCode: 0 }] },
+        };
+      };
+
+      const result = await registeredTool.execute(
+        "tool-call-self-repair-recover",
+        { goal: "Fail once then recover" },
+        undefined,
+        undefined,
+        { cwd: tempTestDir }
+      );
+
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.status, "completed");
+      assert.equal(
+        dispatchedPrompts.length,
+        2,
+        "second attempt should succeed; loop must not dispatch a third time"
+      );
+      // Self-repair: the second prompt must contain feedback marker AND the
+      // first attempt's failure text so the subagent can repair itself.
+      assert.match(dispatchedPrompts[1], /Previous attempt feedback/);
+      assert.ok(
+        dispatchedPrompts[1].includes(FAIL_STDERR),
+        `second dispatch must carry the prior failure text; got: ${dispatchedPrompts[1].slice(0, 400)}`
+      );
+      // The first dispatch must be free of self-repair feedback.
+      assert.equal(/Previous attempt feedback/.test(dispatchedPrompts[0]), false);
+      assert.equal(dispatchedPrompts[0].includes(FAIL_STDERR), false);
+    });
+
+    it("(b) stops after exactly maxTaskExecutionRetries+1 dispatches when every attempt fails", async () => {
+      installCodexPlannerAndReviewerHandler();
+      const dispatchedPrompts: string[] = [];
+      mockSubagentHandler = async (_toolName, params) => {
+        dispatchedPrompts.push(String(params.task));
+        return {
+          content: [{ type: "text", text: "Persistent failure" }],
+          details: { results: [{ exitCode: 1, errorMessage: "Persistent failure" }] },
+          isError: true,
+        };
+      };
+
+      const result = await registeredTool.execute(
+        "tool-call-self-repair-exhaust",
+        { goal: "Always fails" },
+        undefined,
+        undefined,
+        { cwd: tempTestDir }
+      );
+
+      assert.equal(result.isError, true);
+      // Per spec: total dispatches == maxTaskExecutionRetries + 1.
+      // With the default maxTaskExecutionRetries=2 → 3 dispatches.
+      assert.equal(
+        dispatchedPrompts.length,
+        3,
+        `expected exactly maxTaskExecutionRetries+1 (=3) dispatches, got ${dispatchedPrompts.length}`
+      );
+      // Each retry beyond the first must carry self-repair feedback from
+      // the prior attempt.
+      assert.equal(/Previous attempt feedback/.test(dispatchedPrompts[0]), false);
+      assert.match(dispatchedPrompts[1], /Previous attempt feedback/);
+      assert.match(dispatchedPrompts[2], /Previous attempt feedback/);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-task handoff (DOD-1..DOD-4): bounded prior task handoff
+// ---------------------------------------------------------------------------
+
+describe("buildPriorTaskHandoff produces a bounded, structured prior task handoff", () => {
+  it("returns an empty string when there are no prior tasks (Task 1 case)", () => {
+    assert.equal(buildPriorTaskHandoff([]), "");
+    assert.equal(buildPriorTaskHandoff([] as any, { maxSize: 4096 }), "");
+  });
+
+  it("includes title, verdict, structured summary, filesChanged, and unresolvedItems", () => {
+    const handoff = buildPriorTaskHandoff([
+      {
+        title: "Set up logging surface",
+        status: "completed",
+        effectiveVerdict: "ship",
+        structuredReport: {
+          status: "completed",
+          summary: "Added structured log entries and severity rollup.",
+          filesChanged: ["src/log.ts", "tests/log.test.ts"],
+          unresolvedItems: ["Wire severity to widget"],
+        },
+      },
+    ]);
+    assert.match(handoff, /^Prior Tasks \(Handoff\):/);
+    assert.match(handoff, /Task 1: Set up logging surface/);
+    assert.match(handoff, /Status: completed/);
+    assert.match(handoff, /Verdict: ship\b/);
+    assert.match(handoff, /Summary: Added structured log entries/);
+    assert.match(handoff, /Files: src\/log\.ts, tests\/log\.test\.ts/);
+    assert.match(handoff, /Unresolved: Wire severity to widget/);
+  });
+
+  it("renders a verdict even when effectiveVerdict is absent (falls back to status)", () => {
+    const handoff = buildPriorTaskHandoff([
+      {
+        title: "Partial task",
+        status: "completed_with_warnings",
+        structuredReport: { status: "partial", summary: "Did most of it." },
+      },
+    ]);
+    assert.match(handoff, /Verdict: completed_with_warnings/);
+    assert.match(handoff, /Status: partial/);
+  });
+
+  it("caps total size at the configured maxSize and appends a truncation marker", () => {
+    const bigSummary = "x".repeat(2048);
+    const manyTasks: Parameters<typeof buildPriorTaskHandoff>[0] = Array.from(
+      { length: 20 },
+      (_unused, i) => ({
+        title: `Task title ${i + 1}`,
+        status: "completed" as const,
+        effectiveVerdict: "ship" as const,
+        structuredReport: {
+          status: "completed" as const,
+          summary: bigSummary + ` end-${i}`,
+          filesChanged: Array.from({ length: 30 }, (__, j) => `pkg/file_${i}_${j}.ts`),
+          unresolvedItems: Array.from({ length: 20 }, (__, j) => `item ${i}-${j}`),
+        },
+      })
+    );
+    const handoff = buildPriorTaskHandoff(manyTasks);
+    assert.ok(
+      handoff.length <= 4096,
+      `default cap should be 4096 chars, got ${handoff.length}`
+    );
+    assert.match(handoff, /^Prior Tasks \(Handoff\):/);
+    assert.match(handoff, /… \(truncated\)/);
+  });
+
+  it("caps total size at a caller-supplied maxSize", () => {
+    const bigSummary = "y".repeat(1024);
+    const handoff = buildPriorTaskHandoff(
+      Array.from({ length: 8 }, (_, i) => ({
+        title: `T${i}`,
+        effectiveVerdict: "ship" as const,
+        structuredReport: { status: "completed" as const, summary: bigSummary },
+      })),
+      { maxSize: 512 }
+    );
+    assert.ok(handoff.length <= 512, `expected ≤512, got ${handoff.length}`);
+    assert.match(handoff, /… \(truncated\)/);
+  });
+
+  it("preserves the most recent task when even one complete task block exceeds the cap", () => {
+    const handoff = buildPriorTaskHandoff(
+      Array.from({ length: 3 }, (_, i) => ({
+        title: `T${i + 1}`,
+        effectiveVerdict: "ship" as const,
+        structuredReport: {
+          status: "completed" as const,
+          summary: `${`summary-${i + 1} `.repeat(100)}END-${i + 1}`,
+        },
+      })),
+      { maxSize: 128 }
+    );
+    assert.ok(handoff.length <= 128, `expected ≤128, got ${handoff.length}`);
+    assert.match(handoff, /\(2 earlier tasks omitted\)/);
+    assert.match(handoff, /Task 3: T3/);
+    assert.equal(handoff.includes("Task 1: T1"), false);
+    assert.equal(handoff.includes("Task 2: T2"), false);
+    assert.match(handoff, /… \(truncated\)/);
+  });
+
+  it("clips per-task summary, filesChanged, and unresolvedItems to keep individual tasks bounded", () => {
+    const handoff = buildPriorTaskHandoff([
+      {
+        title: "Mega task",
+        effectiveVerdict: "ship",
+        structuredReport: {
+          status: "completed",
+          summary: "z".repeat(2000),
+          filesChanged: Array.from({ length: 50 }, (_, i) => `f${i}.ts`),
+          unresolvedItems: Array.from({ length: 30 }, (_, i) => `u${i}`),
+        },
+      },
+    ], { perTaskSummaryChars: 80, perTaskMaxFiles: 4, perTaskMaxUnresolved: 3 });
+    assert.match(handoff, /Files: f0\.ts, f1\.ts, f2\.ts, f3\.ts \(\+46 more\)/);
+    assert.match(handoff, /Unresolved: u0; u1; u2 \(\+27 more\)/);
+    // Summary line should be truncated under the per-task summary cap (≤80 chars after the "Summary: " label).
+    const summaryMatch = handoff.match(/Summary: ([^\n]*)/);
+    assert.ok(summaryMatch, "expected a summary line");
+    assert.ok(
+      summaryMatch![1].length <= 80,
+      `expected per-task summary ≤80 chars, got ${summaryMatch![1].length}`
+    );
+  });
+
+  it("excludes raw output, reviewer stdout/stderr, and log fragments from the handoff", () => {
+    // The handoff input type does not even surface these fields. To prove the
+    // exclusion, we pass a TaskResult-shaped object via the runtime adapter
+    // and check the rendered handoff string never contains the poison strings.
+    const POISON_RAW_OUTPUT = "POISON_RAW_OUTPUT_zzz";
+    const POISON_REVIEWER_STDOUT = "POISON_REVIEWER_STDOUT_zzz";
+    const POISON_REVIEWER_STDERR = "POISON_REVIEWER_STDERR_zzz";
+    const POISON_LOG_FRAGMENT = "POISON_LOG_FRAGMENT_zzz";
+    const POISON_FINDING_MESSAGE = "POISON_FINDING_MESSAGE_zzz";
+    const POISON_VALIDATION_ERROR = "POISON_VALIDATION_ERROR_zzz";
+
+    const taskResultLike: any = {
+      title: "Has secrets",
+      description: "ignored",
+      executionCode: 0,
+      reviewCode: 0,
+      status: "completed",
+      effectiveVerdict: "ship",
+      // Raw model output — must never appear in handoff.
+      output: POISON_RAW_OUTPUT,
+      // Reviewer process output captured during execution — must never appear.
+      reviewerExitDiagnostic: POISON_REVIEWER_STDERR,
+      validationError: POISON_VALIDATION_ERROR,
+      reviewResult: {
+        verdict: "ship",
+        summary: POISON_REVIEWER_STDOUT,
+        findings: [
+          { priority: "P0", confidence: 1, message: POISON_FINDING_MESSAGE, status: "fixed" },
+        ],
+      },
+      // Pretend a "log fragment" was attached as a free-form field; the
+      // adapter must not pick it up.
+      logFragment: POISON_LOG_FRAGMENT,
+      structuredReport: {
+        status: "completed",
+        summary: "Clean structured summary only.",
+        filesChanged: ["a.ts"],
+        unresolvedItems: [],
+      },
+    };
+    const handoff = priorTaskHandoffFromResults([taskResultLike]);
+    assert.match(handoff, /Summary: Clean structured summary only\./);
+    for (const poison of [
+      POISON_RAW_OUTPUT,
+      POISON_REVIEWER_STDOUT,
+      POISON_REVIEWER_STDERR,
+      POISON_LOG_FRAGMENT,
+      POISON_FINDING_MESSAGE,
+      POISON_VALIDATION_ERROR,
+    ]) {
+      assert.equal(
+        handoff.includes(poison),
+        false,
+        `handoff should never contain sensitive/raw field "${poison}", got: ${handoff}`
+      );
+    }
+  });
+
+  it("drops oldest tasks first and notes that earlier tasks were omitted when over maxTasks", () => {
+    const inputs = Array.from({ length: 9 }, (_, i) => ({
+      title: `T${i + 1}`,
+      effectiveVerdict: "ship" as const,
+      structuredReport: { status: "completed" as const, summary: `s${i + 1}` },
+    }));
+    const handoff = buildPriorTaskHandoff(inputs, { maxTasks: 3 });
+    // Oldest dropped: T1..T6. Kept: T7..T9. Task indices reflect the original
+    // chronological position.
+    assert.match(handoff, /\(6 earlier tasks omitted\)/);
+    assert.match(handoff, /Task 7: T7/);
+    assert.match(handoff, /Task 8: T8/);
+    assert.match(handoff, /Task 9: T9/);
+    assert.equal(handoff.includes("Task 1: T1"), false);
+  });
+});
+
+describe("buildSubagentTaskPrompt injects the prior task handoff into Task N≥2 prompts", () => {
+  const task1 = {
+    title: "Task one",
+    description: "Do thing one",
+    acceptanceCriteria: "Thing one is done",
+  } as any;
+  const task2 = {
+    title: "Task two",
+    description: "Do thing two",
+    acceptanceCriteria: "Thing two is done",
+  } as any;
+  const parentSummary = "Parent goal summary";
+
+  it("does not inject a handoff block on Task 1 (no prior tasks)", () => {
+    const handoff = priorTaskHandoffFromResults([]);
+    const prompt = buildSubagentTaskPrompt(task1, parentSummary, handoff);
+    assert.equal(handoff, "");
+    assert.equal(prompt.includes("Prior Tasks (Handoff):"), false);
+    assert.match(prompt, /Task: Task one/);
+    assert.match(prompt, /Parent Workflow Context \(Summary\): Parent goal summary/);
+  });
+
+  it("injects Task 1's title, verdict, summary, filesChanged, and unresolvedItems into Task 2's prompt", () => {
+    const task1Result: any = {
+      title: "Task one",
+      description: "ignored",
+      executionCode: 0,
+      reviewCode: 0,
+      status: "completed",
+      effectiveVerdict: "ship",
+      output: "RAW_MODEL_OUTPUT_DO_NOT_SHOW",
+      structuredReport: {
+        status: "completed",
+        summary: "Implemented foo bar baz with care.",
+        filesChanged: ["src/foo.ts", "tests/foo.test.ts"],
+        unresolvedItems: ["Polish error messages"],
+      },
+    };
+    const handoff = priorTaskHandoffFromResults([task1Result]);
+    const prompt = buildSubagentTaskPrompt(task2, parentSummary, handoff);
+
+    // The structured handoff block appears between parent context and the task body.
+    assert.match(prompt, /Prior Tasks \(Handoff\):/);
+    assert.match(prompt, /Task 1: Task one/);
+    assert.match(prompt, /Verdict: ship\b/);
+    assert.match(prompt, /Summary: Implemented foo bar baz with care\./);
+    assert.match(prompt, /Files: src\/foo\.ts, tests\/foo\.test\.ts/);
+    assert.match(prompt, /Unresolved: Polish error messages/);
+    // Task 2's own body is still present.
+    assert.match(prompt, /Task: Task two/);
+    assert.match(prompt, /Description:\nDo thing two/);
+    // Raw model output is never leaked into Task 2's prompt.
+    assert.equal(prompt.includes("RAW_MODEL_OUTPUT_DO_NOT_SHOW"), false);
+    // Stable ordering: handoff block appears before the Task: line and after the Parent context.
+    const parentIdx = prompt.indexOf("Parent Workflow Context");
+    const handoffIdx = prompt.indexOf("Prior Tasks (Handoff):");
+    const taskIdx = prompt.indexOf("Task: Task two");
+    assert.ok(parentIdx >= 0 && handoffIdx > parentIdx && taskIdx > handoffIdx,
+      `expected parent < handoff < task ordering, got ${parentIdx}/${handoffIdx}/${taskIdx}`);
+  });
+
+  it("keeps Task N's prompt size bounded even when prior tasks are very large", () => {
+    const priorResults: any[] = Array.from({ length: 12 }, (_, i) => ({
+      title: `Heavy task ${i + 1}`,
+      description: "ignored",
+      executionCode: 0,
+      reviewCode: 0,
+      status: "completed",
+      effectiveVerdict: "ship",
+      output: "x".repeat(20000),
+      structuredReport: {
+        status: "completed",
+        summary: "summary ".repeat(500),
+        filesChanged: Array.from({ length: 40 }, (__, j) => `pkg/dir_${i}/file_${j}.ts`),
+        unresolvedItems: Array.from({ length: 20 }, (__, j) => `pending-${i}-${j}`),
+      },
+    }));
+    const handoff = priorTaskHandoffFromResults(priorResults);
+    const prompt = buildSubagentTaskPrompt(task2, parentSummary, handoff);
+    // The handoff portion of the prompt must be ≤ default 4096 cap.
+    assert.ok(handoff.length <= 4096, `handoff cap exceeded: ${handoff.length}`);
+    assert.match(handoff, /… \(truncated\)/);
+    // The overall prompt stays comfortably bounded (handoff cap + small body).
+    assert.ok(prompt.length < 8 * 1024, `prompt unexpectedly large: ${prompt.length}`);
   });
 });

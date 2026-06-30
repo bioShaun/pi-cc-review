@@ -1,64 +1,76 @@
 {
   "schema": "sprint-contract-v1",
   "story": {
-    "title": "Survey omp's architecture and public surface",
-    "description": "Building on docs/omp-research-scope.md (which fixes the target as Oh My Posh / oh-my-posh), produce a concise architecture map of OMP that the CC Review Orchestrator plugin can learn from. The map must list (a) workflow stages of OMP's prompt-rendering pipeline, (b) configuration precedence rules across flag / env / built-in default, (c) command-line / subcommand entry points and notable flags, (d) extension points (segments, templates, themes), and (e) observability/logging surfaces (debug subcommand, strict mode, cache). Deliverable is a single doc, ≤500 words of body prose (front-matter/headings/lists do not count). No source code, no test changes."
+    "title": "Add maxTaskExecutionRetries with self-repair feedback loop",
+    "description": "Rename the per-task execution retry constant from maxExecutionRetries to maxTaskExecutionRetries (default 2 retries on top of the initial attempt = 3 total dispatches). The existing retryFeedback self-repair mechanism (which already injects prior attempt's exitCode + errorMessage/stderr/validationError into the next prompt) must remain intact and continue to bound the per-task subagent dispatch loop near .pi/extensions/cc-review.ts lines 3503-3696. Do not alter planning retries (maxPlanRetries=3) or structured-report parsing. Add new behavior tests covering (a) failure-then-success retry carrying failure text, (b) total dispatches == maxTaskExecutionRetries + 1 on full failure, (c) single dispatch on first-try success. Update static test assertions and existing behavior test that already used the new name."
   },
   "project_file_index": [
     {
-      "path": "docs/omp-architecture-survey.md",
-      "role": "New deliverable. Concise architecture map covering five required sections: workflow stages, configuration precedence, CLI/flags, extension points, observability/logging. Body prose ≤500 words. Must reference Oh My Posh (consistent with docs/omp-research-scope.md) and stay vendor-neutral on whether each lesson should be adopted by CC Review."
-    },
-    {
-      "path": "docs/omp-research-scope.md",
-      "role": "READ-ONLY context for this story. Defines the target ('Oh My Posh') and the comparison areas; this survey must stay inside those boundaries and must not silently re-point to a different 'omp'."
-    },
-    {
       "path": ".pi/extensions/cc-review.ts",
-      "role": "READ-ONLY. Not edited. Referenced only to keep symbol names accurate when the survey notes CC-Review-side analogues."
+      "role": "Implementation site. Rename local constant maxExecutionRetries → maxTaskExecutionRetries (=2). Loop bound becomes attempt <= maxTaskExecutionRetries + 1 (i.e., 3 total dispatches). Keep retryFeedback construction (Exit code, Error, Unresolved items, Output) and prompt augmentation (Previous attempt feedback:) unchanged. Update emitTrace retry maxAttempts label, noteRetry call and log message to use the new total-attempts value. Confine changes to the per-task subagent dispatch loop around lines 3500-3700."
+    },
+    {
+      "path": "tests/cc-review-behavior.test.ts",
+      "role": "Add a new describe block 'task execution self-repair retry loop (maxTaskExecutionRetries)' with (a)(b)(c) tests using existing piMock/registeredTool harness. Also update the pre-existing 'retry exhaustion for subagent and planning' test: subagentCalls should now equal maxTaskExecutionRetries + 1 = 3."
+    },
+    {
+      "path": "tests/cc-review-static.test.mjs",
+      "role": "Update regex patterns from maxExecutionRetries to maxTaskExecutionRetries and the loop bound to attempt <= maxTaskExecutionRetries + 1. Keep the maxPlanRetries=3 assertion intact."
+    },
+    {
+      "path": "workflow-optimization-criteria.md",
+      "role": "READ-ONLY context. Already documents maxTaskExecutionRetries (default 2)."
     }
   ],
   "definition_of_done": [
     {
       "id": "DOD-1",
-      "description": "docs/omp-architecture-survey.md exists and contains all five required sections: workflow stages, configuration precedence, CLI/flags, extension points, observability/logging.",
+      "description": "Source declares `const maxTaskExecutionRetries = 2` and the per-task dispatch loop bound uses maxTaskExecutionRetries + 1 (3 total dispatches on full failure). The existing retryFeedback self-repair body remains and is injected via 'Previous attempt feedback:' in the next prompt.",
       "edge_cases": [
-        "All five section headings present (case-insensitive match on the key noun).",
-        "File is not empty and not a stub."
+        "Constant default = 2.",
+        "Loop runs at most 3 times when every attempt fails.",
+        "retryFeedback contains exitCode and the prior attempt's error/stderr/validationError text."
       ],
-      "verify_command": "test -f docs/omp-architecture-survey.md && for k in workflow precedence cli extension 'observab|logging'; do grep -qiE \"$k\" docs/omp-architecture-survey.md || { echo \"missing section keyword: $k\"; exit 1; }; done && echo ok",
+      "verify_command": "grep -n 'maxTaskExecutionRetries' .pi/extensions/cc-review.ts | head",
       "timeout_ms": 10000
     },
     {
       "id": "DOD-2",
-      "description": "Body prose of docs/omp-architecture-survey.md is ≤500 words (excluding ATX headings, fenced code blocks, and pure list-marker tokens — counted via a deterministic word count on lines that are neither blank, heading, nor fence).",
+      "description": "New behavior tests: (a) first dispatch fails with a recognizable stderr string, second dispatch succeeds and its prompt contains both 'Previous attempt feedback' and the prior failure text — exactly 2 dispatches. (b) every dispatch fails → exactly maxTaskExecutionRetries+1 (=3) dispatches and the final task is marked failed. (c) first-try success → exactly 1 dispatch.",
       "edge_cases": [
-        "Empty file fails (word count 0 should not happen — file must be non-trivial).",
-        "Counted words is between 50 and 500 inclusive.",
-        "Fenced code blocks (``` … ```) excluded from the count."
+        "Self-repair text propagation works across the retry boundary.",
+        "Counter is exact (not >= or off-by-one)."
       ],
-      "verify_command": "awk 'BEGIN{infence=0; n=0} /^```/{infence=!infence; next} { if (infence) next; if ($0 ~ /^#/) next; for (i=1;i<=NF;i++){ w=$i; gsub(/[`*_>\\-]/,\"\",w); if (w ~ /[A-Za-z0-9]/) n++ } } END{ if (n<50||n>500){ print \"word count out of range: \" n; exit 1 } else { print \"ok: \" n \" words\" } }' docs/omp-architecture-survey.md",
-      "timeout_ms": 10000
+      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -20",
+      "timeout_ms": 180000
     },
     {
       "id": "DOD-3",
-      "description": "Target named in this survey matches the target fixed by docs/omp-research-scope.md (Oh My Posh). Survey must not silently re-scope to a different 'omp'.",
+      "description": "Existing behavior test 'retry exhaustion for subagent and planning' is updated so subagentCalls equals 3 (= maxTaskExecutionRetries + 1) and still passes alongside the planning side (plannerCalls == 3).",
       "edge_cases": [
-        "Survey mentions 'Oh My Posh' or 'oh-my-posh' at least once."
+        "Pre-existing tests in cc-review-behavior.test.ts continue to pass."
       ],
-      "verify_command": "grep -qiE 'oh[ -]?my[ -]?posh' docs/omp-architecture-survey.md && echo ok",
-      "timeout_ms": 5000
+      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -10",
+      "timeout_ms": 180000
     },
     {
       "id": "DOD-4",
-      "description": "No source code or test files are modified by this story. Only docs/omp-architecture-survey.md (new) and sprint-contract.json (this contract) may change.",
+      "description": "Static test (tests/cc-review-static.test.mjs) is updated to reflect the renamed constant and new loop bound, and continues to pass; the maxPlanRetries=3 assertion is preserved.",
       "edge_cases": [
-        ".pi/extensions/cc-review.ts is unchanged.",
-        "tests/cc-review-behavior.test.ts and tests/cc-review-static.test.mjs are unchanged.",
-        "docs/omp-research-scope.md is unchanged."
+        "Pattern matches `const maxTaskExecutionRetries = 2` literal.",
+        "Pattern matches `attempt <= maxTaskExecutionRetries + 1` loop bound."
       ],
-      "verify_command": "test -f .pi/extensions/cc-review.ts && test -f tests/cc-review-behavior.test.ts && test -f tests/cc-review-static.test.mjs && test -f docs/omp-research-scope.md && echo ok",
-      "timeout_ms": 5000
+      "verify_command": "node tests/cc-review-static.test.mjs 2>&1 | tail -10",
+      "timeout_ms": 60000
+    },
+    {
+      "id": "DOD-5",
+      "description": "All target tests pass together.",
+      "edge_cases": [
+        "Behavior + static suites both green."
+      ],
+      "verify_command": "node --experimental-strip-types tests/cc-review-behavior.test.ts 2>&1 | tail -5; node tests/cc-review-static.test.mjs 2>&1 | tail -5",
+      "timeout_ms": 240000
     }
   ]
 }

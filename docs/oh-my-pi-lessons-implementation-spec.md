@@ -212,7 +212,7 @@ Add structured parsing with text fallback.
 Implementation steps:
 
 1. Update `buildSubagentTaskPrompt(...)` to require a final JSON object.
-2. Add `extractLastJsonObject(...)` or generalize existing `extractJsonObject(...)` to support final JSON parsing.
+2. Reuse the shared `extractBalancedJsonObject(text, "last")` helper from `.pi/extensions/cc-review/structured.ts` for subagent final-JSON parsing (the planner path uses the same helper with `"first"`).
 3. Add `parseSubagentStructuredReport(text)`.
 4. Update `validateSubagentOutput(...)` to prefer the structured report.
 5. Store parse status and structured report in the task artifact.

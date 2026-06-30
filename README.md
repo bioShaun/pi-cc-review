@@ -45,7 +45,7 @@ node tests/cc-review-static.test.mjs && node --experimental-strip-types tests/cc
 
 ### 2.2. Review Provider Configuration
 
-By default, CC Review keeps the existing behavior: Codex plans tasks and Codex reviews each completed task. Planning always uses Codex in this version; the explicit `reviewProvider` option or `CC_REVIEW_PROVIDER` changes only the per-task review/fix phase.
+By default, Codex plans tasks and reviews each completed task. The explicit `reviewProvider` option or `CC_REVIEW_PROVIDER` selects both the planner and reviewer backend.
 
 Supported review provider values are `codex` and `claude`:
 
@@ -72,7 +72,7 @@ pi --mode json -p "Use the cc_review tool to implement: <goal>"
 pi --mode json -p 'Use the cc_review tool with goal "<goal>" and reviewProvider "claude"'
 pi --mode json -p 'Use the cc_review tool with goal "<goal>" and reviewProvider "codex"'
 
-# Environment fallback: use Claude only for the review/fix phase when no explicit option is passed
+# Environment fallback: use Claude for planning and review when no explicit option is passed
 CC_REVIEW_PROVIDER=claude pi --mode json -p "Use the cc_review tool to implement: <goal>"
 
 # Persist provider selection for the current shell
@@ -80,7 +80,7 @@ export CC_REVIEW_PROVIDER=claude
 pi --mode json -p "Use the cc_review tool to implement: <goal>"
 ```
 
-Review backend initialization is selected-provider only: after `reviewProvider`, `--provider`, or `CC_REVIEW_PROVIDER` is normalized, the extension launches only the chosen review CLI as a subprocess. Authentication is delegated entirely to that CLI's own login session or env (no API-key preflight) — just like the planner's `codex` invocation today.
+Backend initialization is selected-provider only: after `reviewProvider`, `--provider`, or `CC_REVIEW_PROVIDER` is normalized, the extension launches only the chosen CLI for planning and review. Authentication is delegated entirely to that CLI's own login session or environment.
 
 Selected Codex review setup:
 
@@ -109,16 +109,40 @@ export CODEX_MODEL="<optional Codex review model>"
 pi --mode json -p "Use the cc_review tool to implement: <goal>"
 ```
 
-### 2.3. Troubleshooting Provider Setup
+### 2.3. Review Timing
+
+CC Review supports two execution modes:
+
+- `per-task` (default): execute, validate, and review each task before starting the next task.
+- `after-all`: execute and validate every task first, then invoke the reviewer once for the complete workflow. The final reviewer can fix cross-task integration issues, runs the configured post-review verification once, and writes the shared verdict into every task artifact.
+
+Select the mode through one of these interfaces:
+
+```bash
+# Slash command
+/cc-review --review-mode after-all <goal>
+
+# Tool parameter
+pi --mode json -p 'Use cc_review with goal "<goal>" and reviewMode "after-all"'
+
+# Environment fallback
+CC_REVIEW_MODE=after-all pi --mode json -p "Use cc_review to implement: <goal>"
+```
+
+An explicit `reviewMode` or `--review-mode` takes precedence over `CC_REVIEW_MODE`. Supported values are exactly `per-task` and `after-all`; omitted configuration defaults to `per-task`.
+
+In `after-all` mode, an unrecoverable task execution or output-validation failure still halts immediately because there is no complete workflow to review.
+
+### 2.4. Troubleshooting Provider Setup
 
 - **Missing CLI**: if the selected provider's CLI (`codex` or `claude`) is not installed or not on `PATH`, install it or switch providers. The subprocess will fail with the CLI's own error message; CC Review does not preflight credentials.
 - **Auth failures from the CLI**: if `claude` or `codex` reports an auth/login error inside the review step, run the CLI directly once (`claude` / `codex login`) to refresh its login session, or export `ANTHROPIC_API_KEY`/`CLAUDE_API_KEY` (Claude) or `CODEX_API_KEY`/`OPENAI_API_KEY` (Codex) and re-run. CC Review will record the non-zero review exit as `completed_with_warnings` and continue.
 - **Unselected provider credentials**: only the selected backend's CLI is spawned. Missing credentials or missing CLI for the *unselected* provider never block the workflow.
 - **Unexpected provider value**: set `reviewProvider`, `--provider`, or `CC_REVIEW_PROVIDER` to exactly `codex` or `claude`, or omit/unset provider selection to use the default Codex reviewer. Values are case/whitespace normalized, but empty, whitespace-only, and unsupported names fail with an invalid provider error such as `Invalid reviewProvider` or `Invalid CC_REVIEW_PROVIDER`.
 - **Provider precedence confusion**: explicit `reviewProvider` or `--provider` values take precedence over `CC_REVIEW_PROVIDER`; `CC_REVIEW_PROVIDER` is used only when no explicit option is supplied.
-- **Planning provider confusion**: Claude provider selection does not replace Codex planning; Codex remains the planner and Claude is used only for review/fix when selected.
+- **Planning provider confusion**: provider selection applies to both planning and review.
 
-### 2.4. Strict Type-Checking
+### 2.5. Strict Type-Checking
 
 The extension `.pi/extensions/cc-review.ts` must maintain **100% strict type safety**. It should compile with zero TypeScript diagnostics under Node's standard type configuration.
 
@@ -129,6 +153,7 @@ Since this workspace sits inside the Pi test environment, you can type-check the
 ../adversarial/node_modules/.bin/tsc --noEmit \
   --target es2022 \
   --moduleResolution bundler \
+  --allowImportingTsExtensions \
   --typeRoots ../adversarial/node_modules/@types \
   --types node \
   --strict true \
@@ -137,7 +162,7 @@ Since this workspace sits inside the Pi test environment, you can type-check the
 
 *Note: Clean strict type-checking must always return `exit code 0` with absolutely no output/errors.*
 
-### 2.5. Manual Verification Checklist
+### 2.6. Manual Verification Checklist
 
 Use this checklist after changes that affect plugin registration, provider selection, release packaging, or marketplace/display metadata. Do not commit real credentials or secret-bearing logs.
 
@@ -150,7 +175,7 @@ Use this checklist after changes that affect plugin registration, provider selec
 - [ ] **Old-name repository search**: run `rg -n "codex[-_ ]workflow|Codex[- ]Workflow" .` and confirm matches are limited to historical migration notes/tests that intentionally describe old names, not active source or user-facing command documentation.
 - [ ] **Automated regression commands**: run `node tests/cc-review-static.test.mjs`, `node --experimental-strip-types tests/cc-review-behavior.test.ts`, and the strict `tsc --noEmit ... .pi/extensions/cc-review.ts` command above.
 
-### 2.6. Log Display and Observability
+### 2.7. Log Display and Observability
 
 CC Review separates **durable observability** (full history on disk) from **compact live surfaces** (TUI widget and tool `onUpdate` deltas). The persisted `workflow-logs.jsonl` in the workspace root always records every normalized log entry for the run. The compact widget and `onUpdate` stream apply additional presentation rules so long goals, noisy info lines, and verbose bodies do not overwhelm the default view.
 

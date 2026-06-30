@@ -324,6 +324,9 @@ export function extractBalancedJsonObject(raw: string, position: "first" | "last
       }
       if (end === -1) break;
       found.push(candidate.substring(start, end + 1));
+      if (position === "first") {
+        return found[0];
+      }
       searchFrom = end + 1;
     }
   }

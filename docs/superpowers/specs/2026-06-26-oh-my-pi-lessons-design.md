@@ -92,7 +92,7 @@ flowchart TD
 
 ### Subagent Final Report
 
-Parse the **last** balanced JSON object from final assistant text (planner continues to use first object via existing `extractJsonObject`).
+Parse the **last** balanced JSON object from final assistant text via the shared helper `extractBalancedJsonObject(text, "last")` exported from `.pi/extensions/cc-review/structured.ts` (the planner path uses the same helper with `"first"`).
 
 ```json
 {
