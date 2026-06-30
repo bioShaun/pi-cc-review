@@ -174,7 +174,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; reviewMode\?: string; error\?: string \}/);
+  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; reviewMode\?: string; taskTimeoutMs\?: number; error\?: string \}/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -290,7 +290,12 @@ test("Claude review subprocess integration uses workspace-capable Claude Code", 
   assert.match(source, /"-p"/);
   assert.match(source, /CLAUDE_MODEL/);
   assert.match(source, /buildReviewPrompt\(task\)/);
-  assert.match(source, /runProcess\(\n\s+reviewProviderConfig\.label,\n\s+reviewProviderConfig\.command,\n\s+reviewArgs,/);
+  assert.match(source, /runReviewerProcess\(\n\s+reviewProviderConfig\.label,\n\s+reviewProviderConfig\.command,\n\s+reviewArgs/);
+  // P0-3: claude planner+reviewer stream NDJSON for live observability.
+  assert.match(source, /"--output-format", "stream-json"/);
+  assert.match(source, /"--verbose"/);
+  // P0-3: codex planner+reviewer stream JSONL for live observability.
+  assert.match(source, /"--json"/);
   assert.doesNotMatch(source, /runClaudeReviewClient/);
   assert.doesNotMatch(source, /\/v1\/messages/);
   assert.doesNotMatch(source, /globalThis\.fetch/);
@@ -607,7 +612,7 @@ test("log-level resolver is exported with the documented signature and wired thr
   assert.match(source, /logLevel:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional minimum log severity/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+reviewMode\?: string;\n\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+reviewMode\?: string;\n\s+taskTimeoutMs\?: number;\n\}/
   );
   assert.match(
     source,
@@ -765,9 +770,9 @@ test("improved cancellation and timeout behavior features are present", () => {
   assert.match(source, /process\.kill\(-proc\.pid, "SIGTERM"\)/);
   assert.match(source, /process\.kill\(-pid, "SIGKILL"\)/);
 
-  // Test subagent task timeout
+  // Test subagent task timeout (now configurable, was hardcoded 300000)
   assert.match(source, /const taskAbortController = new AbortController\(\)/);
-  assert.match(source, /const subagentTimeoutMs = 300000/);
+  assert.match(source, /const subagentTimeoutMs = resolvedTaskTimeoutMs/);
   assert.match(source, /taskAbortController\.abort\(new Error\(`Subagent execution timed out/);
 
   // Test pending state marking consistently when cancellation happens
@@ -1008,5 +1013,8 @@ test("reference summary records intentionally deferred patterns and scope guard"
 
 test("planner reuses shared JSON extraction helper", () => {
   assert.doesNotMatch(source, /function extractJsonObject\(/);
-  assert.match(source, /extractBalancedJsonObject\(plannerStdoutBuffer,\s*"first"\)/);
+  // Planner now extracts assistant text from the stream first (P0-3), then
+  // uses the shared JSON extraction helper on the recovered text.
+  assert.match(source, /extractAssistantTextFromStream\(plannerStdoutBuffer\)/);
+  assert.match(source, /extractBalancedJsonObject\(plannerText,\s*"first"\)/);
 });

@@ -1,8 +1,12 @@
 # CC Review Orchestrator — Reliability Issues & Remediation Spec
 
-Status: Draft
+Status: Implemented
 Scope: `.pi/extensions/cc-review.ts`
 Date: 2026-06-30
+Implemented: 2026-06-30
+
+All seven issues (P0-1 through P2-1) have been implemented and verified.
+Static tests: 62/62 pass. Behavior tests: 138/138 pass. Strict tsc: exit 0.
 
 This spec captures the concrete defects found while investigating "the plugin
 errors a lot when used", with the supporting evidence, the root cause of each,

@@ -213,6 +213,36 @@ pi --mode json -p "Use the cc_review tool to implement: <goal>"
 
 Structured trace output (`emitTrace` → stderr and `workflow-trace.jsonl`) is unchanged: it remains lightweight, redacted, and independent of the human-readable `workflow-logs.jsonl` file.
 
+#### Execution timeouts (`--task-timeout` / `CC_REVIEW_TASK_TIMEOUT_MS`)
+
+The per-attempt subagent execution timeout is configurable. The default is 30 minutes (1800000 ms); set it to `0` to disable the timeout entirely.
+
+- **Explicit API/tool parameter**: pass `taskTimeoutMs: 1800000` with the `cc_review` tool call. This takes precedence over `CC_REVIEW_TASK_TIMEOUT_MS`.
+- **Slash command flag**: pass `--task-timeout 600000` or `--task-timeout=0` before or after the goal text.
+- **Environment fallback**: set `CC_REVIEW_TASK_TIMEOUT_MS=600000` when no explicit option is supplied.
+- **Default**: when omitted and unset, the timeout is 1800000 ms (30 min).
+
+Planner and reviewer subprocess timeouts are separately configurable via `CC_REVIEW_PLANNER_TIMEOUT_MS` and `CC_REVIEW_REVIEWER_TIMEOUT_MS` (default 600000 ms / 10 min each). A planner timeout triggers a retry with backoff; a reviewer timeout degrades to `completed_with_warnings` instead of aborting the workflow.
+
+```bash
+# Allow subagent tasks up to 45 minutes per attempt
+/cc-review --task-timeout 2700000 Implement the large refactor
+
+# Disable the subagent timeout entirely (use with caution)
+CC_REVIEW_TASK_TIMEOUT_MS=0 pi --mode json -p "Use the cc_review tool to implement: <goal>"
+```
+
+#### Reviewer repair loop (`CC_REVIEW_MAX_REPAIR_ROUNDS`)
+
+When the reviewer returns a `block` verdict on a task, CC Review re-dispatches the generator with the reviewer's findings as feedback, then re-reviews, up to a configurable number of repair rounds before hard-failing.
+
+- **Environment**: set `CC_REVIEW_MAX_REPAIR_ROUNDS=3` (default 2). Set to `0` to disable the repair loop and hard-fail on the first block (legacy behavior).
+
+```bash
+# Allow up to 3 repair rounds before giving up
+CC_REVIEW_MAX_REPAIR_ROUNDS=3 pi --mode json -p "Use the cc_review tool to implement: <goal>"
+```
+
 ---
 
 ## 3. Strict Architectural Contracts to Preserve

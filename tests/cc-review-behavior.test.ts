@@ -13,12 +13,16 @@ import ccReviewExtension, {
   buildCcReviewStatusText,
   buildCcReviewWidgetLines,
   buildPriorTaskHandoff,
+  buildRepairFeedback,
   buildSubagentTaskPrompt,
   priorTaskHandoffFromResults,
   classifyCcReviewSummary,
   computeChecklistWindow,
   countCcReviewTaskOutcomesFromSummary,
+  DEFAULT_MAX_REVIEW_REPAIR_ROUNDS,
+  DEFAULT_TASK_TIMEOUT_MS,
   discoverAgent,
+  extractAssistantTextFromStream,
   filterCcReviewLogEntries,
   formatSubprocessStreamLine,
   inferSubprocessStreamSeverity,
@@ -28,7 +32,11 @@ import ccReviewExtension, {
   previewWidgetText,
   renderCcReviewLogEntry,
   resolveCcReviewLogLevel,
+  resolveMaxReviewRepairRounds,
+  resolvePlannerTimeoutMs,
   resolveReviewMode,
+  resolveReviewerTimeoutMs,
+  resolveSubagentTaskTimeout,
   summarizeLogSeverities,
   summarizeSubagentToolActivity,
   truncateForWidget,
@@ -818,6 +826,182 @@ function getSummaryText(messages: any[]): string {
   const message = getSummaryMessage(messages);
   return typeof message?.content === "string" ? message.content : "";
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests for the reliability-issue remediation (P0-1 through P2-1)
+// ---------------------------------------------------------------------------
+
+describe("resolveSubagentTaskTimeout (P0-1: configurable execution timeout)", () => {
+  it("defaults to 30 minutes when nothing is configured", () => {
+    const result = resolveSubagentTaskTimeout({ env: {} });
+    assert.equal(result.timeoutMs, DEFAULT_TASK_TIMEOUT_MS);
+    assert.equal(result.timeoutMs, 1800000);
+    assert.equal(result.source, "default");
+    assert.equal(result.invalidInput, undefined);
+  });
+
+  it("reads CC_REVIEW_TASK_TIMEOUT_MS from the supplied env", () => {
+    const result = resolveSubagentTaskTimeout({ env: { CC_REVIEW_TASK_TIMEOUT_MS: "600000" } });
+    assert.equal(result.timeoutMs, 600000);
+    assert.equal(result.source, "env");
+  });
+
+  it("treats 0 as 'no timeout' (valid)", () => {
+    const result = resolveSubagentTaskTimeout({ env: { CC_REVIEW_TASK_TIMEOUT_MS: "0" } });
+    assert.equal(result.timeoutMs, 0);
+    assert.equal(result.source, "env");
+  });
+
+  it("explicit flag takes precedence over env", () => {
+    const result = resolveSubagentTaskTimeout({ flag: "120000", env: { CC_REVIEW_TASK_TIMEOUT_MS: "600000" } });
+    assert.equal(result.timeoutMs, 120000);
+    assert.equal(result.source, "flag");
+  });
+
+  it("accepts a numeric flag", () => {
+    const result = resolveSubagentTaskTimeout({ flag: 0 });
+    assert.equal(result.timeoutMs, 0);
+    assert.equal(result.source, "flag");
+  });
+
+  it("invalid env falls back to default and reports invalidInput", () => {
+    const result = resolveSubagentTaskTimeout({ env: { CC_REVIEW_TASK_TIMEOUT_MS: "abc" } });
+    assert.equal(result.timeoutMs, DEFAULT_TASK_TIMEOUT_MS);
+    assert.equal(result.source, "default");
+    assert.ok(result.invalidInput);
+    assert.equal(result.invalidInput!.source, "env");
+    assert.equal(result.invalidInput!.raw, "abc");
+  });
+
+  it("negative values are invalid", () => {
+    const result = resolveSubagentTaskTimeout({ flag: "-1" });
+    assert.equal(result.timeoutMs, DEFAULT_TASK_TIMEOUT_MS);
+    assert.ok(result.invalidInput);
+  });
+
+  it("empty env string is treated as 'not provided'", () => {
+    const result = resolveSubagentTaskTimeout({ env: { CC_REVIEW_TASK_TIMEOUT_MS: "  " } });
+    assert.equal(result.timeoutMs, DEFAULT_TASK_TIMEOUT_MS);
+    assert.equal(result.source, "default");
+    assert.equal(result.invalidInput, undefined);
+  });
+});
+
+describe("resolvePlannerTimeoutMs / resolveReviewerTimeoutMs (P0-4: phase timeouts)", () => {
+  it("planner defaults to 10 minutes", () => {
+    assert.equal(resolvePlannerTimeoutMs({}), 600000);
+  });
+
+  it("reviewer defaults to 10 minutes", () => {
+    assert.equal(resolveReviewerTimeoutMs({}), 600000);
+  });
+
+  it("reads CC_REVIEW_PLANNER_TIMEOUT_MS", () => {
+    assert.equal(resolvePlannerTimeoutMs({ CC_REVIEW_PLANNER_TIMEOUT_MS: "300000" }), 300000);
+  });
+
+  it("reads CC_REVIEW_REVIEWER_TIMEOUT_MS", () => {
+    assert.equal(resolveReviewerTimeoutMs({ CC_REVIEW_REVIEWER_TIMEOUT_MS: "0" }), 0);
+  });
+
+  it("invalid values fall back to default", () => {
+    assert.equal(resolvePlannerTimeoutMs({ CC_REVIEW_PLANNER_TIMEOUT_MS: "garbage" }), 600000);
+    assert.equal(resolveReviewerTimeoutMs({ CC_REVIEW_REVIEWER_TIMEOUT_MS: "-5" }), 600000);
+  });
+});
+
+describe("resolveMaxReviewRepairRounds (P1-1: repair loop bound)", () => {
+  it("defaults to 2", () => {
+    assert.equal(resolveMaxReviewRepairRounds({}), DEFAULT_MAX_REVIEW_REPAIR_ROUNDS);
+    assert.equal(DEFAULT_MAX_REVIEW_REPAIR_ROUNDS, 2);
+  });
+
+  it("reads CC_REVIEW_MAX_REPAIR_ROUNDS", () => {
+    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "5" }), 5);
+  });
+
+  it("0 disables the repair loop (hard-fail on first block)", () => {
+    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "0" }), 0);
+  });
+
+  it("invalid values fall back to default", () => {
+    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "abc" }), 2);
+    assert.equal(resolveMaxReviewRepairRounds({ CC_REVIEW_MAX_REPAIR_ROUNDS: "-1" }), 2);
+  });
+});
+
+describe("extractAssistantTextFromStream (P0-3: stream-json parsing)", () => {
+  it("extracts final text from claude stream-json result event", () => {
+    const stream = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: '{"tasks":[' }] } }),
+      JSON.stringify({ type: "result", result: '{"tasks":[{"title":"T1"}]}' }),
+    ].join("\n");
+    assert.equal(extractAssistantTextFromStream(stream), '{"tasks":[{"title":"T1"}]}');
+  });
+
+  it("accumulates text from assistant message events when no result event", () => {
+    const stream = [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Hello " }] } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "world" }] } }),
+    ].join("\n");
+    assert.equal(extractAssistantTextFromStream(stream), "Hello world");
+  });
+
+  it("returns original text when no stream events are found (plain text fallback)", () => {
+    const plain = "Review complete\n" + JSON.stringify({ verdict: "ship", summary: "ok", findings: [] });
+    assert.equal(extractAssistantTextFromStream(plain), plain);
+  });
+
+  it("returns original text for empty input", () => {
+    assert.equal(extractAssistantTextFromStream(""), "");
+  });
+
+  it("handles codex-style message events", () => {
+    const stream = [
+      JSON.stringify({ type: "message", content: "Partial " }),
+      JSON.stringify({ type: "message", content: "result" }),
+    ].join("\n");
+    assert.equal(extractAssistantTextFromStream(stream), "Partial result");
+  });
+});
+
+describe("buildRepairFeedback (P1-1: reviewer-block repair feedback)", () => {
+  it("includes verdict, block reason, summary, and unfixed findings", () => {
+    const feedback = buildRepairFeedback(
+      { verdict: "block", summary: "Critical bug found", findings: [
+        { priority: "P0", confidence: 0.9, message: "null pointer", status: "unfixed", file: "src/app.ts", line: 42 },
+        { priority: "P2", confidence: 0.5, message: "minor nit", status: "fixed" },
+      ]},
+      "unfixed_high_severity",
+      [
+        { priority: "P0", confidence: 0.9, message: "null pointer", status: "unfixed", file: "src/app.ts", line: 42 },
+        { priority: "P2", confidence: 0.5, message: "minor nit", status: "fixed" },
+      ]
+    );
+    assert.match(feedback, /Reviewer verdict: block \(unfixed_high_severity\)/);
+    assert.match(feedback, /Reviewer summary: Critical bug found/);
+    assert.match(feedback, /Unfixed findings to address:/);
+    assert.match(feedback, /\[P0\] src\/app\.ts:42: null pointer/);
+    // Fixed findings should NOT appear in the repair feedback
+    assert.doesNotMatch(feedback, /minor nit/);
+  });
+
+  it("handles null review result gracefully", () => {
+    const feedback = buildRepairFeedback(null, "explicit_block", []);
+    assert.match(feedback, /Reviewer verdict: block \(explicit_block\)/);
+    assert.doesNotMatch(feedback, /Unfixed findings/);
+  });
+
+  it("includes post-fix validation failure evidence when present", () => {
+    const feedback = buildRepairFeedback(
+      { verdict: "block", summary: "test", findings: [], postFixValidation: { status: "failed", evidence: "tests failed" } },
+      "post_review_validation_failed",
+      []
+    );
+    assert.match(feedback, /Post-fix validation failed: tests failed/);
+  });
+});
 
 describe("CC Review Behavioral Regression Tests", () => {
   let tempTestDir: string;
@@ -3108,6 +3292,173 @@ describe("CC Review Behavioral Regression Tests", () => {
       assert.match(dispatchedPrompts[1], /Previous attempt feedback/);
       assert.match(dispatchedPrompts[2], /Previous attempt feedback/);
     });
+  });
+
+  it("P1-1: reviewer block triggers a bounded repair loop instead of aborting the workflow", async () => {
+    const mockTasks = [
+      { title: "Repair task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+
+    let reviewCallCount = 0;
+    const REVIEW_BLOCK_OUTPUT = `Review found issues\n${JSON.stringify({
+      verdict: "block",
+      summary: "Critical bug found in implementation",
+      findings: [{ priority: "P0", confidence: 0.9, message: "null pointer dereference", status: "unfixed" }],
+    })}`;
+
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        mockProc.autoReviewStdout = false;
+        process.nextTick(() => {
+          if (args.includes("--output-schema")) {
+            const oIndex = args.indexOf("-o");
+            fs.writeFileSync(args[oIndex + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+            mockProc.emit("close", 0, null);
+          } else {
+            reviewCallCount++;
+            if (reviewCallCount === 1) {
+              mockProc.stdout.emit("data", Buffer.from(REVIEW_BLOCK_OUTPUT));
+            } else {
+              mockProc.stdout.emit("data", Buffer.from(REVIEW_SHIP_OUTPUT));
+            }
+            mockProc.emit("close", 0, null);
+          }
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    let subagentCallCount = 0;
+    mockSubagentHandler = async () => {
+      subagentCallCount++;
+      return {
+        content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+        details: { results: [{ exitCode: 0 }] }
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-repair-loop",
+      { goal: "Repair loop goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined, "workflow should complete successfully after repair");
+    assert.equal(result.details.status, "completed");
+    assert.ok(subagentCallCount >= 2, `expected ≥2 subagent calls (initial + repair), got ${subagentCallCount}`);
+    assert.equal(reviewCallCount, 2, `expected 2 review calls (block + ship), got ${reviewCallCount}`);
+  });
+
+  it("P1-1: reviewer block exhausts repair rounds and hard-fails", async () => {
+    const mockTasks = [
+      { title: "Unfixable task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+
+    let reviewCallCount = 0;
+    const REVIEW_BLOCK_OUTPUT = `Review found issues\n${JSON.stringify({
+      verdict: "block",
+      summary: "Critical bug persists",
+      findings: [{ priority: "P0", confidence: 0.9, message: "fatal error", status: "unfixed" }],
+    })}`;
+
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        mockProc.autoReviewStdout = false;
+        process.nextTick(() => {
+          if (args.includes("--output-schema")) {
+            const oIndex = args.indexOf("-o");
+            fs.writeFileSync(args[oIndex + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+            mockProc.emit("close", 0, null);
+          } else {
+            reviewCallCount++;
+            mockProc.stdout.emit("data", Buffer.from(REVIEW_BLOCK_OUTPUT));
+            mockProc.emit("close", 0, null);
+          }
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    const result = await registeredTool.execute(
+      "tool-call-repair-exhaust",
+      { goal: "Exhaust repair goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /blocked by reviewer/i);
+    assert.match(result.details.error, /repair round/);
+    assert.equal(reviewCallCount, 3, `expected 3 review calls (1 + 2 repair), got ${reviewCallCount}`);
+  });
+
+  it("P2-1: persisted log is not truncated between runs (history preserved)", async () => {
+    const mockTasks = [
+      { title: "Log task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+
+    const makeSpawnHandler = () => (command: string, args: string[]) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("--output-schema")) {
+            const oIndex = args.indexOf("-o");
+            fs.writeFileSync(args[oIndex + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    mockSpawnHandler = makeSpawnHandler();
+    await registeredTool.execute(
+      "tool-call-log-run-1",
+      { goal: "First run goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    const logPath = path.join(tempTestDir, "workflow-logs.jsonl");
+    const linesAfterFirst = fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+    assert.ok(linesAfterFirst.length > 0, "log should have entries after first run");
+
+    mockSpawnHandler = makeSpawnHandler();
+    await registeredTool.execute(
+      "tool-call-log-run-2",
+      { goal: "Second run goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    const linesAfterSecond = fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+    assert.ok(
+      linesAfterSecond.length > linesAfterFirst.length,
+      `log should grow across runs (was ${linesAfterFirst.length}, now ${linesAfterSecond.length})`
+    );
+    const allEntries = linesAfterSecond.map((line) => JSON.parse(line));
+    const boundaryEntries = allEntries.filter((e: any) => /Workflow run .* started/.test(e.message ?? ""));
+    assert.ok(boundaryEntries.length >= 2, "should have ≥2 run-boundary entries");
   });
 });
 

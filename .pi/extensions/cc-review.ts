@@ -182,6 +182,10 @@ const CcReviewParams = {
       type: "string",
       description: "Optional review timing. Supported values: per-task or after-all. Omit to use CC_REVIEW_MODE or the default per-task mode.",
     },
+    taskTimeoutMs: {
+      type: "number",
+      description: "Optional per-attempt subagent execution timeout in milliseconds. 0 disables the timeout. Omit to use CC_REVIEW_TASK_TIMEOUT_MS or the default 1800000 (30 min).",
+    },
   },
   required: ["goal"],
   additionalProperties: false,
@@ -192,6 +196,7 @@ interface CcReviewExecuteParams {
   reviewProvider?: string;
   logLevel?: string;
   reviewMode?: string;
+  taskTimeoutMs?: number;
 }
 
 interface Task {
@@ -439,6 +444,52 @@ function logSubprocessStreamLines(
   }
 }
 
+// Extract the final assistant text from a claude `--output-format stream-json`
+// NDJSON stream (see P0-3). When the output contains recognizable stream-json
+// events (assistant message content or a final `result` event), the
+// accumulated text is returned. When the output is plain text (e.g. from a
+// test mock that does not emit stream-json), the original text is returned
+// unchanged so callers keep working in both modes.
+export function extractAssistantTextFromStream(stdout: string): string {
+  if (!stdout) return stdout;
+  const lines = stdout.split("\n");
+  let hasStreamEvents = false;
+  let finalText = "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // Only attempt JSON parsing on lines that look like JSON objects.
+    if (!trimmed.startsWith("{")) continue;
+    let event: any;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    // Claude stream-json: assistant message with content parts.
+    if (event?.type === "assistant" && Array.isArray(event?.message?.content)) {
+      hasStreamEvents = true;
+      for (const part of event.message.content) {
+        if (part?.type === "text" && typeof part.text === "string") {
+          finalText += part.text;
+        }
+      }
+    }
+    // Claude stream-json: final result event overrides accumulated text.
+    if (event?.type === "result" && typeof event?.result === "string") {
+      hasStreamEvents = true;
+      finalText = event.result;
+    }
+    // Codex --json: message events with text content (best-effort; shape varies
+    // across versions, so we only match the common {type:"message",content:...}).
+    if (event?.type === "message" && typeof event?.content === "string") {
+      hasStreamEvents = true;
+      finalText += event.content;
+    }
+  }
+  return hasStreamEvents && finalText ? finalText : stdout;
+}
+
 function isStderrChannelLabel(label: string): boolean {
   const normalizedLabel = label.trim().toLowerCase();
   return normalizedLabel.endsWith(" error") || normalizedLabel.endsWith(" failure");
@@ -668,6 +719,126 @@ export function filterCcReviewLogEntries(
 }
 
 // ---------------------------------------------------------------------------
+// resolveSubagentTaskTimeoutMs: pure resolver for the per-attempt subagent
+// execution timeout. Previously this was hardcoded to 300000ms (5 min), which
+// killed real coding subagent runs mid-flight (exitCode 143 / SIGTERM) and was
+// the single most frequent failure in the trace (see P0-1).
+//
+// Precedence: explicit `flag` (tool param / slash flag `--task-timeout`)
+//           > `env.CC_REVIEW_TASK_TIMEOUT_MS`
+//           > default 1800000 (30 min).
+//
+// A value of 0 means "no timeout" — the timer is not installed at all. Invalid
+// input (negative, NaN, non-numeric) falls back to the default so a typo never
+// disables the safety net silently.
+// ---------------------------------------------------------------------------
+export const DEFAULT_TASK_TIMEOUT_MS = 1800000;
+
+export interface ResolveSubagentTaskTimeoutOptions {
+  flag?: string | number;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ResolveSubagentTaskTimeoutResult {
+  timeoutMs: number;
+  source: "flag" | "env" | "default";
+  invalidInput?: { source: "flag" | "env"; raw: string };
+}
+
+function parseTimeoutCandidate(raw: unknown): number | undefined {
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : undefined;
+  }
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return Math.floor(parsed);
+}
+
+export function resolveSubagentTaskTimeout(
+  options: ResolveSubagentTaskTimeoutOptions = {}
+): ResolveSubagentTaskTimeoutResult {
+  if (options.flag !== undefined && options.flag !== null) {
+    const parsed = parseTimeoutCandidate(options.flag);
+    if (parsed !== undefined) {
+      return { timeoutMs: parsed, source: "flag" };
+    }
+    return {
+      timeoutMs: DEFAULT_TASK_TIMEOUT_MS,
+      source: "default",
+      invalidInput: {
+        source: "flag",
+        raw: typeof options.flag === "string" ? options.flag : String(options.flag),
+      },
+    };
+  }
+
+  const env = options.env ?? process.env;
+  const rawEnv = env.CC_REVIEW_TASK_TIMEOUT_MS;
+  if (typeof rawEnv === "string" && rawEnv.trim() !== "") {
+    const parsed = parseTimeoutCandidate(rawEnv);
+    if (parsed !== undefined) {
+      return { timeoutMs: parsed, source: "env" };
+    }
+    return {
+      timeoutMs: DEFAULT_TASK_TIMEOUT_MS,
+      source: "default",
+      invalidInput: { source: "env", raw: rawEnv },
+    };
+  }
+
+  return { timeoutMs: DEFAULT_TASK_TIMEOUT_MS, source: "default" };
+}
+
+// ---------------------------------------------------------------------------
+// resolvePhaseTimeoutMs: resolver for planner/reviewer subprocess timeouts.
+// Previously planning and review phases had NO timeout, so a stuck
+// claude/codex could hang forever with no recovery and no signal (see P0-4).
+//
+// Precedence: `env.CC_REVIEW_PLANNER_TIMEOUT_MS` / `CC_REVIEW_REVIEWER_TIMEOUT_MS`
+//           > default.
+// Invalid input falls back to the default. 0 means "no timeout".
+// ---------------------------------------------------------------------------
+export const DEFAULT_PLANNER_TIMEOUT_MS = 600000; // 10 min
+export const DEFAULT_REVIEWER_TIMEOUT_MS = 600000; // 10 min
+
+export function resolvePlannerTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePhaseTimeoutFromEnv(env, "CC_REVIEW_PLANNER_TIMEOUT_MS", DEFAULT_PLANNER_TIMEOUT_MS);
+}
+
+export function resolveReviewerTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePhaseTimeoutFromEnv(env, "CC_REVIEW_REVIEWER_TIMEOUT_MS", DEFAULT_REVIEWER_TIMEOUT_MS);
+}
+
+function resolvePhaseTimeoutFromEnv(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key];
+  if (typeof raw !== "string" || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
+// ---------------------------------------------------------------------------
+// resolveMaxReviewRepairRounds: resolver for the reviewer-block repair loop
+// bound (see P1-1). On a reviewer "block" verdict, the orchestrator re-dispatches
+// the generator with the reviewer's findings as feedback, then re-reviews, up
+// to this many rounds before hard-failing.
+//
+// Precedence: `env.CC_REVIEW_MAX_REPAIR_ROUNDS` > default 2.
+// ---------------------------------------------------------------------------
+export const DEFAULT_MAX_REVIEW_REPAIR_ROUNDS = 2;
+
+export function resolveMaxReviewRepairRounds(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CC_REVIEW_MAX_REPAIR_ROUNDS;
+  if (typeof raw !== "string" || raw.trim() === "") return DEFAULT_MAX_REVIEW_REPAIR_ROUNDS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MAX_REVIEW_REPAIR_ROUNDS;
+  return Math.floor(parsed);
+}
+
+// ---------------------------------------------------------------------------
 // resolveCcReviewLogLevel: pure precedence resolver for the user-visible
 // minimum log severity. The resolved level drives the compact widget live-log
 // slice and the onUpdate delta stream. The persisted JSONL log is intentionally
@@ -820,6 +991,10 @@ const WIDGET_LIVE_LOG_LINES = 5;
 const WORKFLOW_LOG_FILE = "workflow-logs.jsonl";
 const WORKFLOW_LOG_MAX_LINES_DEFAULT = 2000;
 const WORKFLOW_LOG_TRUNCATE_KEEP = 1500;
+// Heartbeat interval for subprocess progress logging (P0-3). Emits a "still
+// running" log line at this cadence while any planner/reviewer subprocess is
+// active, so the user can distinguish a working-but-slow run from a hang.
+const SUBPROCESS_HEARTBEAT_MS = 30000;
 
 // ANSI-naive width truncation with ellipsis. Sufficient because cc-review widget
 // lines are plain text (we strip ANSI when normalizing log messages).
@@ -1351,6 +1526,11 @@ function buildCodexReviewArgs(task: Task, env: NodeJS.ProcessEnv = process.env):
     "exec",
     "--skip-git-repo-check",
     "--dangerously-bypass-approvals-and-sandbox",
+    // Stream JSONL events to stdout for live observability (P0-3). Without
+    // this, codex buffers all output and the user sees nothing for the entire
+    // review duration. The final text is recovered from the stream via
+    // extractAssistantTextFromStream.
+    "--json",
   ];
   const model = readTrimmedEnv(env, "CODEX_MODEL");
   if (model) {
@@ -1365,6 +1545,12 @@ function buildClaudeReviewArgs(task: Task, env: NodeJS.ProcessEnv = process.env)
     "-p",
     "--dangerously-skip-permissions",
     "--no-session-persistence",
+    // Stream NDJSON events to stdout for live observability (P0-3). Without
+    // this, `claude -p` buffers all output and flushes only at the end, so
+    // the user sees nothing for the entire review duration. The final text is
+    // recovered from the stream via extractAssistantTextFromStream.
+    "--output-format", "stream-json",
+    "--verbose",
   ];
   const model = readTrimmedEnv(env, "CLAUDE_MODEL");
   if (model) {
@@ -1487,6 +1673,7 @@ interface RunCcReviewWorkflowOptions {
   reviewProvider?: string;
   logLevel?: string;
   reviewMode?: string;
+  taskTimeoutMs?: number;
   validationCommands?: VerificationCommand[];
 }
 
@@ -1623,7 +1810,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter compact surfaces.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing. Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> (or the CC_REVIEW_LOG_LEVEL env fallback) to filter compact surfaces. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -1646,6 +1833,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           reviewProvider: parsedArgs.reviewProvider,
           logLevel: parsedArgs.logLevel,
           reviewMode: parsedArgs.reviewMode,
+          taskTimeoutMs: parsedArgs.taskTimeoutMs,
         });
         ctx?.ui?.notify?.("CC Review completed.", "info");
         
@@ -1681,7 +1869,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the per-task default. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error, or omit it to use CC_REVIEW_LOG_LEVEL / the info default.",
+    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the per-task default. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error, or omit it to use CC_REVIEW_LOG_LEVEL / the info default. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
       onUpdate?.({ content: [{ type: "text", text: "Starting CC Review..." }] });
@@ -1691,6 +1879,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           reviewProvider: params.reviewProvider,
           logLevel: params.logLevel,
           reviewMode: params.reviewMode,
+          taskTimeoutMs: params.taskTimeoutMs,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
@@ -1719,11 +1908,12 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; reviewMode?: string; error?: string } {
+function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; reviewMode?: string; taskTimeoutMs?: number; error?: string } {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
   const hasReviewModeFlag = /(?:^|\s)--review-mode(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag && !hasReviewModeFlag) {
+  const hasTaskTimeoutFlag = /(?:^|\s)--task-timeout(?:=|\s|$)/.test(args);
+  if (!hasProviderFlag && !hasLogLevelFlag && !hasReviewModeFlag && !hasTaskTimeoutFlag) {
     return { goal: args.trim() };
   }
 
@@ -1732,6 +1922,7 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
   let reviewProvider: string | undefined;
   let logLevel: string | undefined;
   let reviewMode: string | undefined;
+  let taskTimeoutMs: number | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -1792,6 +1983,31 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
       continue;
     }
 
+    const equalsTaskTimeoutMatch = token.match(/^--task-timeout=(.*)$/);
+    if (equalsTaskTimeoutMatch) {
+      const raw = equalsTaskTimeoutMatch[1];
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isFinite(parsed) || parsed < 0) {
+        return { goal: "", error: `Invalid --task-timeout value "${raw}". Expected a non-negative number of milliseconds (0 disables).` };
+      }
+      taskTimeoutMs = Math.floor(parsed);
+      continue;
+    }
+
+    if (token === "--task-timeout") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a non-negative number of milliseconds (0 disables).` };
+      }
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        return { goal: "", error: `Invalid --task-timeout value "${value}". Expected a non-negative number of milliseconds (0 disables).` };
+      }
+      taskTimeoutMs = Math.floor(parsed);
+      i++;
+      continue;
+    }
+
     goalTokens.push(token);
   }
 
@@ -1800,6 +2016,7 @@ function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?
     reviewProvider,
     logLevel,
     reviewMode,
+    taskTimeoutMs,
   };
 }
 
@@ -1830,6 +2047,38 @@ function summarizeParentContext(goal: string): string {
     summary += sentence;
   }
   return summary.trim();
+}
+
+// ---------------------------------------------------------------------------
+// buildRepairFeedback: produces a compact feedback string from a reviewer
+// "block" verdict, to be injected into the generator's next attempt prompt
+// during the repair loop (P1-1). Includes only structured fields: the verdict,
+// block reason, reviewer summary, and unfixed findings with locations. This
+// lets the generator address the reviewer's concrete findings instead of
+// hard-failing the entire workflow on the first block.
+// ---------------------------------------------------------------------------
+export function buildRepairFeedback(
+  reviewResult: ReviewResult | null,
+  blockReason: BlockReason | undefined,
+  findings: ReviewFinding[]
+): string {
+  const parts: string[] = [];
+  parts.push(`Reviewer verdict: block (${blockReason ?? "explicit_block"})`);
+  if (reviewResult?.summary) {
+    parts.push(`Reviewer summary: ${reviewResult.summary}`);
+  }
+  const unfixed = findings.filter((f) => f.status === "unfixed");
+  if (unfixed.length > 0) {
+    parts.push("Unfixed findings to address:");
+    for (const f of unfixed) {
+      const loc = f.file ? `${f.file}${f.line ? `:${f.line}` : ""}` : "workspace";
+      parts.push(`- [${f.priority}] ${loc}: ${f.message}`);
+    }
+  }
+  if (reviewResult?.postFixValidation?.status === "failed") {
+    parts.push(`Post-fix validation failed: ${reviewResult.postFixValidation.evidence ?? "no evidence provided"}`);
+  }
+  return parts.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -2266,6 +2515,17 @@ async function runPiAgentSubprocess(
   let finalAssistantText = "";
   let stderrBuf = "";
   let wasAborted = false;
+  // Capture the abort reason so we can surface the true cause (timeout vs
+  // user abort) instead of masking it with residual stderr text. Without this,
+  // a harmless stderr warning line gets promoted to the failure reason whenever
+  // the subprocess is aborted by a timeout, hiding the real cause (see P0-2).
+  let abortReason: string | undefined;
+  // Throttle timestamp for forwarding incremental text/thinking deltas (P0-3).
+  // The pi generator emits message_update / text_delta events as the model
+  // streams; without forwarding them the live log shows only discrete tool
+  // calls, never the model's in-progress reasoning.
+  let lastTextDeltaForwardMs = 0;
+  const TEXT_DELTA_THROTTLE_MS = 3000;
 
   const exitCode: number = await new Promise<number>((resolve) => {
     const proc = childProcess.spawn(invocation.command, invocation.args, {
@@ -2309,6 +2569,30 @@ async function runPiAgentSubprocess(
         }
         return;
       }
+      // Forward incremental text/thinking deltas (throttled) so the live log
+      // shows the model's in-progress reasoning, not just discrete tool calls
+      // (P0-3). pi --mode json emits these as message_update / text_delta
+      // events; previously handleLine ignored them entirely.
+      if ((event?.type === "message_update" || event?.type === "text_delta") && onUpdate) {
+        const deltaText =
+          typeof event?.delta === "string" ? event.delta
+          : typeof event?.delta?.text === "string" ? event.delta.text
+          : typeof event?.text === "string" ? event.text
+          : "";
+        if (deltaText) {
+          const now = Date.now();
+          if (now - lastTextDeltaForwardMs >= TEXT_DELTA_THROTTLE_MS) {
+            lastTextDeltaForwardMs = now;
+            const preview = clipSubprocessLogText(deltaText, 100);
+            try {
+              onUpdate({ content: [{ type: "text", text: `… ${preview}` }] });
+            } catch {
+              // ignore observer errors
+            }
+          }
+        }
+        return;
+      }
       if (event?.type === "message_end" && event.message?.role === "assistant") {
         const parts = Array.isArray(event.message.content) ? event.message.content : [];
         for (const part of parts) {
@@ -2341,6 +2625,15 @@ async function runPiAgentSubprocess(
 
     const onAbort = () => {
       wasAborted = true;
+      // Read the abort reason from the signal so the true cause (e.g. a
+      // timeout) is carried through to the error message instead of being
+      // replaced by stale stderr (see P0-2).
+      const reason = signal?.reason;
+      if (reason instanceof Error) {
+        abortReason = reason.message;
+      } else if (typeof reason === "string" && reason) {
+        abortReason = reason;
+      }
       try {
         proc.kill("SIGTERM");
       } catch {
@@ -2383,7 +2676,17 @@ async function runPiAgentSubprocess(
 
   const stderr = stderrBuf.trim();
   const isError = exitCode !== 0 || wasAborted;
-  const textOut = finalAssistantText.trim() || (isError ? (stderr || `pi subprocess exited with code ${exitCode}`) : "");
+  // Surface the true abort cause instead of masking it with residual stderr.
+  // When the subprocess was aborted (timeout or user), prefer the captured
+  // abort reason over stderr. This ensures timeout errors contain "timeout"
+  // so isTransientError classifies them correctly and the retry path engages
+  // with the right reason (see P0-2).
+  const abortMessage = wasAborted ? (abortReason || "Subagent aborted") : undefined;
+  const exitMessage = `pi subprocess exited with code ${exitCode}`;
+  const errorMessage = isError
+    ? (abortMessage || stderr || exitMessage)
+    : undefined;
+  const textOut = finalAssistantText.trim() || (isError ? (errorMessage || stderr || exitMessage) : "");
 
   return {
     content: [{ type: "text", text: textOut }],
@@ -2393,7 +2696,7 @@ async function runPiAgentSubprocess(
           agent: agent.name,
           exitCode,
           stderr: stderr || undefined,
-          errorMessage: isError ? (stderr || (wasAborted ? "Subagent aborted" : `pi subprocess exited with code ${exitCode}`)) : undefined,
+          errorMessage,
         },
       ],
     },
@@ -2529,6 +2832,13 @@ function validateSubagentOutput(result: SubagentToolResult, task: Task): Subagen
     };
   }
 
+  // Free-text fallback (last resort only — structured report is preferred
+  // above). Previously this path used a broad regex
+  // `(failed|not met|pending|todo|unresolved|skip).*${criterion}` which matched
+  // any narrative sentence using those words near the criterion text, producing
+  // false "incomplete" verdicts (P1-2). That regex is removed; criterion
+  // validation is now handled exclusively by the structured report path. The
+  // remaining checks target explicit status markers only.
   const unresolvedItems: string[] = [];
   const lines = textContent.split("\n");
   for (const line of lines) {
@@ -2536,20 +2846,14 @@ function validateSubagentOutput(result: SubagentToolResult, task: Task): Subagen
     if (lowerLine.includes("todo:") || lowerLine.includes("fixme:") || lowerLine.includes("unresolved:") || lowerLine.includes("pending:")) {
       unresolvedItems.push(line.trim());
     } else if (
-      (lowerLine.includes("could not") || lowerLine.includes("failed to") || lowerLine.includes("unable to")) &&
+      // Only flag "could not / failed to / unable to" when it appears as an
+      // explicit failure statement at the start of a line (after optional
+      // whitespace/label), not mid-sentence in narrative prose.
+      /^\s*(could not|failed to|unable to)\b/i.test(line) &&
       !lowerLine.includes("no issues found") &&
       !lowerLine.includes("zero")
     ) {
       unresolvedItems.push(line.trim());
-    }
-  }
-
-  const criteriaList = task.acceptanceCriteria.split("\n").map(c => c.trim()).filter(Boolean);
-  for (const crit of criteriaList) {
-    const critEscaped = crit.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-    const rx = new RegExp(`(failed|not met|pending|todo|unresolved|skip).*${critEscaped}`, "i");
-    if (rx.test(textContent)) {
-      unresolvedItems.push(`Acceptance Criterion Unresolved: "${crit}"`);
     }
   }
 
@@ -2737,6 +3041,18 @@ async function runCcReviewWorkflow(
   const reviewMode = resolveReviewMode(options.reviewMode);
   const logLevelResolution = resolveCcReviewLogLevel({ flag: options.logLevel, env: process.env });
   const resolvedLogLevel: CcReviewLogSeverity = logLevelResolution.level;
+  // Resolve the per-attempt subagent execution timeout (P0-1). Previously this
+  // was hardcoded to 300000ms (5 min); real coding subagent runs routinely
+  // exceed that and were killed mid-flight. The default is now 30 min and is
+  // configurable via tool param / slash flag / env. 0 disables the timeout.
+  const taskTimeoutResolution = resolveSubagentTaskTimeout({ flag: options.taskTimeoutMs, env: process.env });
+  const resolvedTaskTimeoutMs = taskTimeoutResolution.timeoutMs;
+  // Resolve planner/reviewer subprocess timeouts (P0-4). Previously these
+  // phases had NO timeout, so a stuck claude/codex could hang forever.
+  const resolvedPlannerTimeoutMs = resolvePlannerTimeoutMs(process.env);
+  const resolvedReviewerTimeoutMs = resolveReviewerTimeoutMs(process.env);
+  // Resolve the reviewer-block repair round bound (P1-1).
+  const maxReviewRepairRounds = resolveMaxReviewRepairRounds(process.env);
 
   // Trace workflow start
   emitTrace(ctx, "workflow_start", {
@@ -2744,6 +3060,10 @@ async function runCcReviewWorkflow(
     reviewProvider: reviewProviderConfig.provider,
     reviewMode,
     logLevel: resolvedLogLevel,
+    taskTimeoutMs: resolvedTaskTimeoutMs,
+    plannerTimeoutMs: resolvedPlannerTimeoutMs,
+    reviewerTimeoutMs: resolvedReviewerTimeoutMs,
+    maxReviewRepairRounds,
   });
 
   // FLOW NOTE: This orchestrator manages the lifecycle of:
@@ -2769,8 +3089,11 @@ async function runCcReviewWorkflow(
     filePath: path.join(workflowCwd, WORKFLOW_LOG_FILE),
     appendedLineCount: 0,
   };
-  // Reset prior session file so the persisted log reflects only this run.
-  try { fs.rmSync(persistedLogState.filePath, { force: true }); } catch { /* ignore */ }
+  // Preserve prior run history: do NOT truncate the persisted log at workflow
+  // start (P0-1). Previously the file was wiped every run, removing all
+  // post-mortem visibility. A run-boundary entry is emitted as the first log
+  // line (below, after the log function is defined) so individual runs remain
+  // separable in the accumulated file.
 
   const workflowRunId = generateWorkflowRunId();
   const verificationPlanLoad = loadVerificationPlan(workflowCwd, options.validationCommands);
@@ -3077,6 +3400,16 @@ async function runCcReviewWorkflow(
     }
   };
 
+  // Emit a run-boundary entry as the first line of this run's log so
+  // individual runs remain separable in the accumulated workflow-logs.jsonl
+  // (P2-1). Previously the file was truncated per run; now history is
+  // preserved and this boundary marks where the current run begins.
+  log({
+    severity: "info",
+    source: "cc-review",
+    message: `=== Workflow run ${workflowRunId} started (provider=${reviewProviderConfig.provider}, mode=${reviewMode}) ===`,
+  });
+
   // If the log-level resolver flagged an invalid user input (bad flag or bad
   // env var) emit EXACTLY ONE warning entry so the workflow can continue with
   // the safe `info` default instead of crashing. The warning itself is `warn`
@@ -3091,6 +3424,18 @@ async function runCcReviewWorkflow(
       message:
         `Ignoring invalid log level ${JSON.stringify(rawDisplay)} from ${invalidSource}; ` +
         `falling back to default 'info'.`,
+    });
+  }
+
+  if (taskTimeoutResolution.invalidInput) {
+    const { source: invalidSource, raw } = taskTimeoutResolution.invalidInput;
+    const rawDisplay = typeof raw === "string" ? raw : String(raw ?? "");
+    log({
+      severity: "warning",
+      source: "cc-review",
+      message:
+        `Ignoring invalid task timeout ${JSON.stringify(rawDisplay)} from ${invalidSource}; ` +
+        `falling back to default ${DEFAULT_TASK_TIMEOUT_MS}ms.`,
     });
   }
 
@@ -3165,10 +3510,26 @@ async function runCcReviewWorkflow(
         if (settled) return;
         settled = true;
         activeProcesses.delete(proc);
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         fn();
       };
 
       let timeoutTimer: NodeJS.Timeout | undefined;
+      // Heartbeat: emit a periodic log line while any subprocess is running so
+      // the user can tell whether the run is working or hung (see P0-3). Without
+      // this, buffered (non-streaming) planner/reviewer invocations produce no
+      // visible output for their entire duration.
+      let heartbeatTimer: NodeJS.Timeout | undefined;
+      let heartbeatElapsed = 0;
+      heartbeatTimer = setInterval(() => {
+        if (settled) return;
+        heartbeatElapsed += SUBPROCESS_HEARTBEAT_MS;
+        log({
+          severity: "info",
+          source: label.includes("planner") ? "planner" : label.includes("reviewer") || label.includes("review") ? "reviewer" : "subagent",
+          message: `${label} still running (${Math.round(heartbeatElapsed / 1000)}s)...`,
+        });
+      }, SUBPROCESS_HEARTBEAT_MS);
       if (timeoutMs) {
         timeoutTimer = setTimeout(async () => {
           if (settled) return;
@@ -3229,6 +3590,7 @@ async function runCcReviewWorkflow(
 
       proc.on("error", (err) => {
         if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         settle(() => {
           emitTrace(ctx, "failure", {
             phase: "subprocess_start",
@@ -3242,6 +3604,7 @@ async function runCcReviewWorkflow(
 
       proc.on("close", (code, closeSignal) => {
         if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         settle(() => {
           const exitCode = code ?? (closeSignal ? 1 : 0);
           emitTrace(ctx, "tool_execution_end", {
@@ -3274,6 +3637,55 @@ async function runCcReviewWorkflow(
           });
         });
       });
+    });
+  };
+
+  // Wrapper around runProcess for reviewer subprocesses that applies the
+  // configured reviewer timeout (P0-4) and treats a timeout as a synthetic
+  // non-zero exit (exit code 124) instead of letting the rejection propagate
+  // and abort the whole workflow. The existing deriveEffectiveVerdict logic
+  // then classifies the non-zero exit as ship_with_warnings.
+  const runReviewerProcess = (
+    label: string,
+    command: string,
+    args: string[]
+  ): Promise<ProcessResult> => {
+    return runProcess(
+      label,
+      command,
+      args,
+      (data) => {
+        logSubprocessStreamLines(log, data.toString(), "stdout", "reviewer");
+      },
+      (data) => {
+        logSubprocessStreamLines(log, data.toString(), "stderr", "reviewer");
+      },
+      resolvedReviewerTimeoutMs > 0 ? resolvedReviewerTimeoutMs : undefined
+    ).catch((err: any) => {
+      const errorMessage = err?.message || String(err);
+      if (/timed out/i.test(errorMessage)) {
+        log({
+          severity: "warning",
+          source: "reviewer",
+          message: `${label} timed out after ${resolvedReviewerTimeoutMs}ms; continuing with warnings.`,
+        });
+        emitTrace(ctx, "failure", {
+          phase: "reviewer_timeout",
+          label,
+          command,
+          timeoutMs: resolvedReviewerTimeoutMs,
+        });
+        const syntheticStderr = `Reviewer timed out after ${resolvedReviewerTimeoutMs}ms`;
+        return {
+          code: 124,
+          exitCode: 124,
+          stdout: "",
+          stderr: syntheticStderr,
+          combinedOutput: "",
+          output: "",
+        };
+      }
+      throw err;
     });
   };
 
@@ -3320,6 +3732,8 @@ async function runCcReviewWorkflow(
         "exec",
         "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
+        // Stream JSONL events to stdout for live observability (P0-3).
+        "--json",
         "--output-schema",
         schemaPath,
         "-o",
@@ -3335,7 +3749,15 @@ async function runCcReviewWorkflow(
       // plugin dependencies).
       captureStdoutForPlanner = true;
       plannerCommand = "claude";
-      plannerArgs = ["-p", "--dangerously-skip-permissions", "--no-session-persistence"];
+      // Use stream-json for live observability (P0-3). The final task-list JSON
+      // is recovered from the stream via extractAssistantTextFromStream.
+      plannerArgs = [
+        "-p",
+        "--dangerously-skip-permissions",
+        "--no-session-persistence",
+        "--output-format", "stream-json",
+        "--verbose",
+      ];
       const claudeModel = readTrimmedEnv(process.env, "CLAUDE_MODEL");
       if (claudeModel) plannerArgs.push("--model", claudeModel);
       const claudePlannerPrompt = [
@@ -3386,19 +3808,46 @@ async function runCcReviewWorkflow(
       });
 
       let plannerStdoutBuffer = "";
-      const planResult = await runProcess(
-        plannerLabel,
-        plannerCommand,
-        plannerArgs,
-        (data) => {
-          const chunk = data.toString();
-          if (captureStdoutForPlanner) plannerStdoutBuffer += chunk;
-          logSubprocessStreamLines(log, chunk, "stdout", "planner");
-        },
-        (data) => {
-          logSubprocessStreamLines(log, data.toString(), "stderr", "planner");
+      let planResult: ProcessResult;
+      try {
+        planResult = await runProcess(
+          plannerLabel,
+          plannerCommand,
+          plannerArgs,
+          (data) => {
+            const chunk = data.toString();
+            if (captureStdoutForPlanner) plannerStdoutBuffer += chunk;
+            logSubprocessStreamLines(log, chunk, "stdout", "planner");
+          },
+          (data) => {
+            logSubprocessStreamLines(log, data.toString(), "stderr", "planner");
+          },
+          resolvedPlannerTimeoutMs > 0 ? resolvedPlannerTimeoutMs : undefined
+        );
+      } catch (err: any) {
+        // Planner timeout (P0-4): treat as a retryable failure so the existing
+        // backoff/retry loop engages, instead of letting the rejection propagate
+        // and abort the whole workflow.
+        const errorMessage = err?.message || String(err);
+        const isPlannerTimeout = /timed out/i.test(errorMessage);
+        if (isPlannerTimeout && attempt < maxPlanRetries) {
+          emitTrace(ctx, "retry", {
+            phase: "planning",
+            attempt,
+            maxAttempts: maxPlanRetries,
+            error: errorMessage,
+          });
+          const backoff = Math.pow(2, attempt) * 1000;
+          log({
+            severity: "warning",
+            source: "planner",
+            message: `Planning timed out after ${resolvedPlannerTimeoutMs}ms. Waiting ${backoff}ms before retrying...`,
+          });
+          await delay(backoff, signal);
+          continue;
         }
-      );
+        throw err;
+      }
 
       if (planResult.code !== 0) {
         const errorMsg = `${reviewProviderConfig.label} task planning failed with exit code ${planResult.code}`;
@@ -3423,7 +3872,10 @@ async function runCcReviewWorkflow(
 
       let rawPlanJson: string | undefined;
       if (captureStdoutForPlanner) {
-        rawPlanJson = extractBalancedJsonObject(plannerStdoutBuffer, "first");
+        // With --output-format stream-json, claude emits NDJSON events. Recover
+        // the final assistant text from the stream before extracting JSON (P0-3).
+        const plannerText = extractAssistantTextFromStream(plannerStdoutBuffer);
+        rawPlanJson = extractBalancedJsonObject(plannerText, "first");
       } else if (fs.existsSync(outputPath)) {
         rawPlanJson = fs.readFileSync(outputPath, "utf8");
       }
@@ -3501,6 +3953,10 @@ async function runCcReviewWorkflow(
       let unresolvedItems: string[] | undefined = undefined;
       let taskStatus: TaskResult["status"] = "completed";
       let retryFeedback: string | undefined = undefined;
+      // Repair feedback from a reviewer "block" verdict, injected into the next
+      // generator attempt so the subagent can fix the reviewer's findings
+      // instead of hard-failing the whole workflow (P1-1).
+      let repairFeedback: string | undefined = undefined;
       const unresolvedItemsForFailedTask: string[] = [];
 
       // Self-repair bound for per-task subagent dispatch. Default 2 retries on
@@ -3511,6 +3967,24 @@ async function runCcReviewWorkflow(
       // itself (see assignment below).
       const maxTaskExecutionRetries = 2;
       const maxTaskExecutionAttempts = maxTaskExecutionRetries + 1;
+
+      // Reviewer-block repair loop (P1-1): when the reviewer returns a "block"
+      // verdict, re-dispatch the generator with the reviewer's findings as
+      // feedback, then re-review, up to maxReviewRepairRounds. Only hard-fail
+      // after the bound is hit. Previously a single block threw and aborted the
+      // entire workflow, preventing later tasks from ever running.
+      REPAIR_LOOP: for (let repairRound = 0; ; repairRound++) {
+        if (repairRound > 0) {
+          // Inject the reviewer's findings as feedback for the repair re-execution.
+          retryFeedback = repairFeedback;
+          transitionToExecuting(i);
+          log({
+            severity: "info",
+            source: "cc-review",
+            message: `[Repair] Reviewer blocked "${task.title}". Re-executing with reviewer feedback (repair round ${repairRound}/${maxReviewRepairRounds})...`,
+          });
+        }
+
       for (let attempt = 1; attempt <= maxTaskExecutionAttempts; attempt++) {
         throwIfAborted();
         if (attempt > 1) {
@@ -3559,12 +4033,17 @@ async function runCcReviewWorkflow(
             signal.addEventListener("abort", onParentAbort);
           }
 
-          // Enforce a timeout for the long-running subagent tool call (5 minutes default)
-          const subagentTimeoutMs = 300000;
-          const timeoutTimer = setTimeout(() => {
-            log(`[Timeout] Subagent task execution exceeded timeout of ${subagentTimeoutMs}ms. Aborting subagent...`);
-            taskAbortController.abort(new Error(`Subagent execution timed out after ${subagentTimeoutMs}ms`));
-          }, subagentTimeoutMs);
+          // Enforce a per-attempt timeout for the long-running subagent tool
+          // call. Previously hardcoded to 300000ms (5 min) which killed real
+          // tasks mid-flight (P0-1). Now configurable via CC_REVIEW_TASK_TIMEOUT_MS
+          // / tool param / slash flag. 0 disables the timeout entirely.
+          const subagentTimeoutMs = resolvedTaskTimeoutMs;
+          const timeoutTimer = subagentTimeoutMs > 0
+            ? setTimeout(() => {
+                log(`[Timeout] Subagent task execution exceeded timeout of ${subagentTimeoutMs}ms. Aborting subagent...`);
+                taskAbortController.abort(new Error(`Subagent execution timed out after ${subagentTimeoutMs}ms`));
+              }, subagentTimeoutMs)
+            : undefined;
 
           try {
             result = await executeSubagentTool(
@@ -3630,7 +4109,7 @@ async function runCcReviewWorkflow(
             };
             transientDone = true;
           } finally {
-            clearTimeout(timeoutTimer);
+            if (timeoutTimer) clearTimeout(timeoutTimer);
             if (signal) {
               signal.removeEventListener("abort", onParentAbort);
             }
@@ -3784,7 +4263,7 @@ async function runCcReviewWorkflow(
           result,
         });
         log(`[Task Execution Done] Queued "${task.title}" for the final workflow review.`);
-        continue;
+        break REPAIR_LOOP;
       }
 
       // Part B: Review and Fix with the configured review provider
@@ -3799,21 +4278,18 @@ async function runCcReviewWorkflow(
       const reviewArgs = reviewProviderConfig.buildArgs({ task });
       const workspaceBeforeReview = snapshotWorkspace(workflowCwd);
 
-      const reviewProcessResult = await runProcess(
+      const reviewProcessResult = await runReviewerProcess(
         reviewProviderConfig.label,
         reviewProviderConfig.command,
-        reviewArgs,
-        (data) => {
-          logSubprocessStreamLines(log, data.toString(), "stdout", "reviewer");
-        },
-        (data) => {
-          logSubprocessStreamLines(log, data.toString(), "stderr", "reviewer");
-        }
+        reviewArgs
       );
 
       const workspaceAfterReview = snapshotWorkspace(workflowCwd);
       const workspaceChanged = workspaceSnapshotChanged(workspaceBeforeReview, workspaceAfterReview);
-      const parsedReview = parseReviewResult(reviewProcessResult.combinedOutput);
+      // Recover the final review text from the stream (claude stream-json) or
+      // fall back to the raw combined output (codex plain text) (P0-3).
+      const reviewText = extractAssistantTextFromStream(reviewProcessResult.combinedOutput);
+      const parsedReview = parseReviewResult(reviewText);
       const reviewResultObject = parsedReview.result;
       const findings = reviewResultObject?.findings ?? [];
       const reportedVerdict = reviewResultObject?.verdict ?? null;
@@ -3938,13 +4414,28 @@ async function runCcReviewWorkflow(
       });
 
       if (effectiveVerdict === "block") {
-        log(`[Workflow Halted] Blocked by reviewer on: "${task.title}".`);
-        const summary = appendPersistedLogPathToSummary(
-          buildSummaryReport(goal, taskResults, tasks),
-          persistedLogState.filePath
-        );
-        throw new WorkflowError(`Blocked by reviewer on: "${task.title}"`, summary);
+        if (repairRound >= maxReviewRepairRounds) {
+          // Exhausted repair rounds → hard-fail (P1-1).
+          log(`[Workflow Halted] Blocked by reviewer after ${maxReviewRepairRounds} repair round(s) on: "${task.title}".`);
+          const summary = appendPersistedLogPathToSummary(
+            buildSummaryReport(goal, taskResults, tasks),
+            persistedLogState.filePath
+          );
+          throw new WorkflowError(`Blocked by reviewer on: "${task.title}" (after ${maxReviewRepairRounds} repair round(s))`, summary);
+        }
+        // Build repair feedback from the reviewer's findings and re-execute +
+        // re-review (P1-1). The generator gets the concrete findings so it can
+        // fix them instead of the whole workflow aborting on the first block.
+        repairFeedback = buildRepairFeedback(reviewResultObject ?? null, derived.blockReason, findings);
+        log({
+          severity: "warning",
+          source: "reviewer",
+          message: `[Repair] Reviewer blocked on "${task.title}". Dispatching repair round ${repairRound + 1}/${maxReviewRepairRounds}...`,
+        });
+        continue REPAIR_LOOP;
       }
+      break REPAIR_LOOP; // not block → task passed review, move to next task
+      } // end REPAIR_LOOP
     }
 
     if (reviewMode === "after-all") {
@@ -3974,21 +4465,18 @@ async function runCcReviewWorkflow(
       };
       const reviewArgs = reviewProviderConfig.buildArgs({ task: batchReviewTask });
       const workspaceBeforeReview = snapshotWorkspace(workflowCwd);
-      const reviewProcessResult = await runProcess(
+      const reviewProcessResult = await runReviewerProcess(
         reviewProviderConfig.label,
         reviewProviderConfig.command,
-        reviewArgs,
-        (data) => {
-          logSubprocessStreamLines(log, data.toString(), "stdout", "reviewer");
-        },
-        (data) => {
-          logSubprocessStreamLines(log, data.toString(), "stderr", "reviewer");
-        }
+        reviewArgs
       );
 
       const workspaceAfterReview = snapshotWorkspace(workflowCwd);
       const workspaceChanged = workspaceSnapshotChanged(workspaceBeforeReview, workspaceAfterReview);
-      const parsedReview = parseReviewResult(reviewProcessResult.combinedOutput);
+      // Recover the final review text from the stream (claude stream-json) or
+      // fall back to the raw combined output (codex plain text) (P0-3).
+      const reviewText = extractAssistantTextFromStream(reviewProcessResult.combinedOutput);
+      const parsedReview = parseReviewResult(reviewText);
       const reviewResultObject = parsedReview.result;
       const findings = reviewResultObject?.findings ?? [];
       const reportedVerdict = reviewResultObject?.verdict ?? null;
