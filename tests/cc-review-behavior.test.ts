@@ -6,6 +6,7 @@ import os from "node:os";
 import child_process from "node:child_process";
 import { mock } from "node:test";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
 import ccReviewExtension, {
   appendPersistedLogEntry,
@@ -65,6 +66,52 @@ import ccReviewExtension, {
   loadCheckpoint,
   restoreBatchTaskExecutions,
   resolveCcReviewTracePath,
+  getPiSpawnCommand,
+  formatResolvedPiCommand,
+  findPiPackageRootFromEntry,
+  resolveWindowsPiCliScript,
+  CC_REVIEW_PI_BINARY_ENV,
+  PI_SUBAGENT_PI_BINARY_ENV,
+  PI_CODING_AGENT_PACKAGE,
+  type PiSpawnDeps,
+  attachPostExitStdioGuard,
+  resolvePostExitGuardTimings,
+  DEFAULT_POST_EXIT_IDLE_MS,
+  DEFAULT_POST_EXIT_HARD_MS,
+  resolveSessionContinuity,
+  resolveTaskSessionFile,
+  resolvePriorTaskSessionPath,
+  describeSessionPath,
+  CC_REVIEW_SESSION_CONTINUITY_ENV,
+  CC_REVIEW_SESSION_CHAIN_ENV,
+  splitThinkingSuffix,
+  parseFallbackModels,
+  buildModelCandidates,
+  isRetryableModelFailure,
+  formatModelAttemptNote,
+  summarizeAttemptedModels,
+  resolveModelFallbackConfig,
+  type ModelAttemptSummary,
+  type ModelFallbackConfig,
+  resolveStructuredOutputStrict,
+  resolveStructuredOutputFile,
+  readStructuredOutputFile,
+  CC_REVIEW_STRUCTURED_OUTPUT_STRICT_ENV,
+  expectsImplementationMutation,
+  isMutatingBashCommand,
+  hasMutationToolCall,
+  evaluateCompletionMutationGuard,
+  type GuardedToolEvent,
+  createSubagentActivityTracker,
+  recordActivity,
+  recordToolFailure,
+  markCompleted,
+  classifySubagentControlState,
+  emitControlEvent,
+  formatControlEventLabel,
+  formatControlStateLabel,
+  buildControlEventLogPayload,
+  DEFAULT_CONTROL_THRESHOLDS,
 } from "../.pi/extensions/cc-review.ts";
 
 const plainWidgetTheme = { fg: (_color: string, text: string) => text };
@@ -3544,9 +3591,12 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     // B. Planning retry exhaustion
     let plannerCalls = 0;
+    let plannerSchema: any;
     mockSpawnHandler = (command, args) => {
       if (command === "codex" && args.includes("-o")) {
         plannerCalls++;
+        const schemaPath = args[args.indexOf("--output-schema") + 1];
+        plannerSchema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
         const mockProc = new MockChildProcess();
         process.nextTick(() => {
           mockProc.emit("close", 1, null);
@@ -3566,6 +3616,17 @@ describe("CC Review Behavioral Regression Tests", () => {
 
     assert.equal(resultPlanExhaustion.isError, true);
     assert.equal(plannerCalls, 3); // maxPlanRetries is 3
+    assert.deepEqual(plannerSchema.properties.tasks.items.required, [
+      "title",
+      "description",
+      "acceptanceCriteria",
+      "dependsOn",
+    ]);
+    assert.match(
+      resultPlanExhaustion.content[0].text,
+      /workflow failed during planning before any tasks were created/i
+    );
+    assert.doesNotMatch(resultPlanExhaustion.content[0].text, /successfully accomplished/i);
   });
 
   it("timeout/cancellation clean handling", async () => {
@@ -6193,5 +6254,1303 @@ describe("optimization spec: preflight, validation, logs, checkpoint", () => {
     const restored = restoreBatchTaskExecutions([execution]);
     assert.equal(restored[0], undefined);
     assert.equal(restored[1], execution);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0-1: Pi CLI spawn resolution (borrowed from pi-subagents' getPiSpawnCommand).
+// Covers: explicit env override, blank override fallback, package root
+// resolution, generic macOS/Linux fallback, Windows script fallback.
+// ---------------------------------------------------------------------------
+describe("pi-spawn resolution (P0-1)", () => {
+  const baseArgs = ["--mode", "json", "-p"];
+
+  it("env override CC_REVIEW_PI_BINARY takes highest priority", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: { CC_REVIEW_PI_BINARY: "/custom/pi" },
+      platform: "darwin",
+      execPath: "/usr/local/bin/node",
+      argv1: "/some/other/script.ts",
+    });
+    assert.equal(cmd.command, "/custom/pi");
+    assert.deepEqual(cmd.args, baseArgs);
+    assert.equal(cmd.source, "env_override");
+  });
+
+  it("PI_SUBAGENT_PI_BINARY alias is respected when CC_REVIEW_PI_BINARY is absent", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: { PI_SUBAGENT_PI_BINARY: "/alias/pi" },
+      platform: "linux",
+      execPath: "/usr/bin/node",
+      argv1: "/unrelated.ts",
+    });
+    assert.equal(cmd.command, "/alias/pi");
+    assert.equal(cmd.source, "env_override");
+  });
+
+  it("blank/whitespace env override falls through to fallback", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: { CC_REVIEW_PI_BINARY: "   " },
+      platform: "darwin",
+      execPath: "/usr/local/bin/node",
+      argv1: "/unrelated.ts",
+    });
+    assert.equal(cmd.source, "path_fallback");
+    assert.equal(cmd.command, "pi");
+  });
+
+  it("CC_REVIEW_PI_BINARY takes priority over PI_SUBAGENT_PI_BINARY", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {
+        CC_REVIEW_PI_BINARY: "/primary/pi",
+        PI_SUBAGENT_PI_BINARY: "/secondary/pi",
+      },
+      platform: "darwin",
+      execPath: "/usr/local/bin/node",
+      argv1: "/unrelated.ts",
+    });
+    assert.equal(cmd.command, "/primary/pi");
+    assert.equal(cmd.source, "env_override");
+  });
+
+  it("argv[1] heuristic: pi entry script invoked through process.execPath on generic runtime", () => {
+    const fakePiScript = "/home/user/projects/pi/packages/cli/dist/pi.mjs";
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "darwin",
+      execPath: "/usr/local/bin/node",
+      argv1: fakePiScript,
+      existsSync: (p) => p === fakePiScript,
+    });
+    assert.equal(cmd.source, "argv_script");
+    assert.equal(cmd.command, "/usr/local/bin/node");
+    assert.deepEqual(cmd.args, [fakePiScript, ...baseArgs]);
+  });
+
+  it("argv[1] heuristic: skips bun virtual filesystem paths", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "darwin",
+      execPath: "/usr/local/bin/bun",
+      argv1: "/$bunfs/root/pi.mjs",
+      existsSync: () => true,
+    });
+    // bunfs path is skipped, execPath is "bun" (generic runtime) → fallback to pi
+    assert.equal(cmd.source, "path_fallback");
+    assert.equal(cmd.command, "pi");
+  });
+
+  it("argv[1] heuristic: pi-coding-agent substring matches", () => {
+    const fakeScript = "/opt/pi-coding-agent/cli.mjs";
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "linux",
+      execPath: "/usr/bin/node",
+      argv1: fakeScript,
+      existsSync: (p) => p === fakeScript,
+    });
+    assert.equal(cmd.source, "argv_script");
+    assert.deepEqual(cmd.args, [fakeScript, ...baseArgs]);
+  });
+
+  it("argv[1] heuristic: @earendil-works path matches", () => {
+    const fakeScript = "/home/user/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/bin/pi.mjs";
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "darwin",
+      execPath: "/usr/local/bin/node",
+      argv1: fakeScript,
+      existsSync: (p) => p === fakeScript,
+    });
+    assert.equal(cmd.source, "argv_script");
+  });
+
+  it("generic macOS/Linux fallback to pi on PATH when argv[1] is unrelated", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "darwin",
+      execPath: "/usr/local/bin/node",
+      argv1: "/home/user/test/runner.ts",
+      existsSync: () => false,
+    });
+    assert.equal(cmd.source, "path_fallback");
+    assert.equal(cmd.command, "pi");
+    assert.deepEqual(cmd.args, baseArgs);
+  });
+
+  it("non-generic runtime with unrelated argv[1] reuses the current executable", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "darwin",
+      execPath: "/usr/local/bin/custom-runtime",
+      argv1: "/unrelated.ts",
+      existsSync: () => false,
+    });
+    assert.equal(cmd.source, "current_executable");
+    assert.equal(cmd.command, "/usr/local/bin/custom-runtime");
+    assert.deepEqual(cmd.args, baseArgs);
+  });
+
+  it("compiled Bun Pi reuses its executable when argv[1] is virtual", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "darwin",
+      execPath: "/Applications/Pi.app/Contents/MacOS/pi-agent",
+      argv1: "/$bunfs/root/pi.mjs",
+      existsSync: () => true,
+    });
+    assert.equal(cmd.source, "current_executable");
+    assert.equal(cmd.command, "/Applications/Pi.app/Contents/MacOS/pi-agent");
+    assert.deepEqual(cmd.args, baseArgs);
+  });
+
+  it("Windows: resolves CLI script from package.json bin via process.execPath", () => {
+    const packageRoot = "/fake/pi-pkg";
+    const binScript = "/fake/pi-pkg/dist/cli.mjs";
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "win32",
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      argv1: "C:\\unrelated\\script.js",
+      existsSync: (p) => p === binScript || p === path.join(packageRoot, "package.json"),
+      readFileSync: (p) => {
+        if (p === path.join(packageRoot, "package.json")) {
+          return JSON.stringify({
+            name: PI_CODING_AGENT_PACKAGE,
+            bin: { pi: "dist/cli.mjs" },
+          });
+        }
+        return "";
+      },
+      piPackageRoot: packageRoot,
+    });
+    assert.equal(cmd.source, "windows_package_bin");
+    assert.equal(cmd.command, "C:\\Program Files\\nodejs\\node.exe");
+    assert.deepEqual(cmd.args, [binScript, ...baseArgs]);
+  });
+
+  it("Windows: falls back to pi on PATH when package resolution fails", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "win32",
+      execPath: "C:\\node.exe",
+      argv1: "C:\\unrelated.js",
+      existsSync: () => false,
+      piPackageRoot: undefined,
+    });
+    assert.equal(cmd.source, "path_fallback");
+    assert.equal(cmd.command, "pi");
+  });
+
+  it("Windows: argv[1] is a runnable script — uses it directly", () => {
+    // Use a forward-slash absolute path so path.resolve works on the test
+    // host (macOS). On real Windows the path would use backslashes.
+    const scriptPath = "/fake/pi/cli.mjs";
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: {},
+      platform: "win32",
+      execPath: "C:\\node.exe",
+      argv1: scriptPath,
+      existsSync: (p) => p === scriptPath,
+    });
+    assert.equal(cmd.source, "windows_package_bin");
+    assert.deepEqual(cmd.args, [scriptPath, ...baseArgs]);
+  });
+
+  it("findPiPackageRootFromEntry walks up to find the package", () => {
+    const root = "/home/user/.npm/lib/node_modules/@earendil-works/pi-coding-agent";
+    const entry = `${root}/dist/cli.mjs`;
+    const result = findPiPackageRootFromEntry(entry, {
+      existsSync: (p) => p === path.join(root, "package.json"),
+      readFileSync: (p) => {
+        if (p === path.join(root, "package.json")) {
+          return JSON.stringify({ name: PI_CODING_AGENT_PACKAGE });
+        }
+        return "";
+      },
+    });
+    assert.equal(result, root);
+  });
+
+  it("findPiPackageRootFromEntry returns undefined when package not found", () => {
+    const result = findPiPackageRootFromEntry("/home/user/unrelated/script.mjs", {
+      existsSync: () => false,
+      readFileSync: () => "",
+    });
+    assert.equal(result, undefined);
+  });
+
+  it("formatResolvedPiCommand produces a readable label", () => {
+    const cmd = getPiSpawnCommand(baseArgs, {
+      env: { CC_REVIEW_PI_BINARY: "/custom/pi" },
+      platform: "darwin",
+      execPath: "/node",
+      argv1: "/unrelated.ts",
+    });
+    const formatted = formatResolvedPiCommand(cmd);
+    assert.match(formatted, /\[env_override\]/);
+    assert.match(formatted, /\/custom\/pi/);
+  });
+
+  it("preflight reports resolved pi spawn command when env override is active", () => {
+    const result = runPreflight({
+      provider: "codex",
+      providerCli: "__missing__",
+      checkPi: true,
+      env: { CC_REVIEW_PI_BINARY: "/custom/pi", PATH: "/nonexistent" },
+    });
+    assert.ok(result.resolved.piSpawn);
+    assert.equal(result.resolved.piSpawn!.source, "env_override");
+    assert.equal(result.resolved.piSpawn!.command, "/custom/pi");
+    // Should not warn about pi missing on PATH since env override is active
+    const piWarning = result.warnings.find((w) => w.includes("`pi`"));
+    assert.equal(piWarning, undefined);
+  });
+
+  it("preflight warns about pi on PATH when fallback mode is needed", () => {
+    const result = runPreflight({
+      provider: "codex",
+      providerCli: "__missing__",
+      checkPi: true,
+      env: { PATH: "/nonexistent" },
+    });
+    assert.ok(result.resolved.piSpawn);
+    assert.equal(result.resolved.piSpawn!.source, "path_fallback");
+    const piWarning = result.warnings.find((w) => w.includes("`pi`"));
+    assert.ok(piWarning);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0-2: Post-exit stdio guard (borrowed from pi-subagents).
+// Simulates a child that emits `exit` without ever ending stdout/stderr (the
+// classic "grandchildren keep stdio open" hang). The guard must destroy the
+// streams so `close` fires and the parent promise resolves.
+// ---------------------------------------------------------------------------
+describe("post-exit stdio guard (P0-2)", () => {
+  it("resolvePostExitGuardTimings returns defaults when env unset", () => {
+    const timings = resolvePostExitGuardTimings({});
+    assert.equal(timings.idleMs, DEFAULT_POST_EXIT_IDLE_MS);
+    assert.equal(timings.hardMs, DEFAULT_POST_EXIT_HARD_MS);
+  });
+
+  it("resolvePostExitGuardTimings respects env overrides", () => {
+    const timings = resolvePostExitGuardTimings({
+      CC_REVIEW_POST_EXIT_IDLE_MS: "500",
+      CC_REVIEW_POST_EXIT_HARD_MS: "2000",
+    });
+    assert.equal(timings.idleMs, 500);
+    assert.equal(timings.hardMs, 2000);
+  });
+
+  it("resolvePostExitGuardTimings falls back on invalid input", () => {
+    const timings = resolvePostExitGuardTimings({
+      CC_REVIEW_POST_EXIT_IDLE_MS: "not-a-number",
+      CC_REVIEW_POST_EXIT_HARD_MS: "-5",
+    });
+    assert.equal(timings.idleMs, DEFAULT_POST_EXIT_IDLE_MS);
+    assert.equal(timings.hardMs, DEFAULT_POST_EXIT_HARD_MS);
+  });
+
+  it("destroys unended stdout/stderr after idle window post-exit", async () => {
+    // Build a fake child process: an EventEmitter with stdout/stderr that are
+    // PassThrough streams (so they don't auto-end). We emit `exit` but never
+    // end the streams — the guard must destroy them.
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdout, stderr });
+
+    attachPostExitStdioGuard(child as any, { idleMs: 20, hardMs: 5000 });
+
+    const stdoutDestroyed = new Promise<void>((resolve) => {
+      stdout.on("close", () => resolve());
+    });
+
+    child.emit("exit", 0, null);
+
+    // Streams should be destroyed within ~idleMs (20ms) plus tolerance.
+    await Promise.race([
+      stdoutDestroyed,
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error("stdout not destroyed in time")), 500)),
+    ]);
+    assert.ok(stdout.destroyed, "stdout should be destroyed after idle window");
+  });
+
+  it("idle timer resets on new data post-exit", async () => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdout, stderr });
+
+    attachPostExitStdioGuard(child as any, { idleMs: 50, hardMs: 5000 });
+
+    let destroyed = false;
+    stdout.on("close", () => { destroyed = true; });
+
+    child.emit("exit", 0, null);
+
+    // Send data every 20ms for 150ms — idle timer should keep resetting.
+    for (let i = 0; i < 7; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      if (!stdout.destroyed) stdout.write("x");
+    }
+    // After 140ms of continuous data (idleMs=50 never reached), not destroyed yet.
+    assert.equal(destroyed, false, "stdout should not be destroyed while data flows");
+
+    // Stop sending data — now the idle timer should fire.
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(destroyed, true, "stdout should be destroyed after data stops");
+  });
+
+  it("hard ceiling destroys streams regardless of data flow", async () => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdout, stderr });
+
+    attachPostExitStdioGuard(child as any, { idleMs: 10000, hardMs: 60 });
+
+    let destroyed = false;
+    stdout.on("close", () => { destroyed = true; });
+
+    child.emit("exit", 0, null);
+
+    // Send data continuously — idle timer (10s) would never fire, but the hard
+    // ceiling (60ms) must still destroy the stream.
+    const interval = setInterval(() => stdout.write("x"), 10);
+    try {
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(destroyed, true, "hard ceiling should destroy stdout even with continuous data");
+    } finally {
+      clearInterval(interval);
+    }
+  });
+
+  it("normal close path clears timers without destroying streams", async () => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdout, stderr });
+
+    const clearTimers = attachPostExitStdioGuard(child as any, { idleMs: 20, hardMs: 50 });
+
+    child.emit("exit", 0, null);
+    // Immediately emit close (normal completion) — timers should clear.
+    child.emit("close", 0, null);
+
+    // Give any would-be timers a chance to fire (they shouldn't).
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(stdout.destroyed, false, "stdout should NOT be destroyed on normal close");
+    clearTimers();
+    stdout.destroy();
+    stderr.destroy();
+  });
+
+  it("cleanup function clears timers idempotently", () => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdout, stderr });
+
+    const clearTimers = attachPostExitStdioGuard(child as any, { idleMs: 20, hardMs: 50 });
+    child.emit("exit", 0, null);
+    clearTimers();
+    // Calling again should be a no-op (idempotent).
+    clearTimers();
+    stdout.destroy();
+    stderr.destroy();
+  });
+
+  it("existing runSubprocess resolves when child exits but stdio stays open", async () => {
+    // Regression-style test: spawn a real child that exits immediately but
+    // leaves a grandchild holding stdout open. Without the guard, runSubprocess
+    // would hang until the grandchild closes stdio.
+    const script = `
+      const { spawn } = require("node:child_process");
+      // Spawn a grandchild that inherits stdout and sleeps 2s.
+      const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2000)"], {
+        stdio: "inherit",
+        detached: true
+      });
+      grandchild.unref();
+      process.exit(0);
+    `;
+    const result = await runSubprocess({
+      label: "test-post-exit-guard",
+      command: process.execPath,
+      args: ["-e", script],
+      cwd: os.tmpdir(),
+      maxStreamBytes: 1024 * 1024,
+    });
+    // Must resolve with exit code 0 — the guard destroyed the inherited stdio.
+    assert.equal(result.code, 0);
+    assert.equal(result.aborted, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-1: Session-file continuity for fallback subagent execution.
+// Verifies: default OFF (--no-session), env-gated ON (--session <file>),
+// chaining behavior, parallel sibling independence, and session path exposure.
+// ---------------------------------------------------------------------------
+describe("session-file continuity (P1-1)", () => {
+  it("selects the actual single dependency rather than the previous task index", () => {
+    const paths = ["/sessions/task-0.json", "/sessions/task-1.json", undefined];
+    assert.equal(resolvePriorTaskSessionPath(2, [1], paths), paths[0]);
+    assert.equal(resolvePriorTaskSessionPath(2, [2], paths), paths[1]);
+  });
+
+  it("does not chain independent or multi-dependency tasks", () => {
+    const paths = ["/sessions/task-0.json", "/sessions/task-1.json"];
+    assert.equal(resolvePriorTaskSessionPath(1, [], paths), undefined);
+    assert.equal(resolvePriorTaskSessionPath(2, [1, 2], paths), undefined);
+  });
+
+  it("preserves previous-task chaining for legacy ordered plans", () => {
+    const paths = ["/sessions/task-0.json"];
+    assert.equal(resolvePriorTaskSessionPath(1, undefined, paths), paths[0]);
+  });
+
+  it("resolveSessionContinuity defaults to disabled", () => {
+    const config = resolveSessionContinuity({ env: {} });
+    assert.equal(config.enabled, false);
+    assert.equal(config.chain, false);
+  });
+
+  it("resolveSessionContinuity enables via CC_REVIEW_SESSION_CONTINUITY", () => {
+    for (const val of ["1", "true", "yes", "TRUE"]) {
+      const config = resolveSessionContinuity({ env: { [CC_REVIEW_SESSION_CONTINUITY_ENV]: val } });
+      assert.equal(config.enabled, true, `expected enabled for "${val}"`);
+    }
+    for (const val of ["0", "false", "no", "", "random"]) {
+      const config = resolveSessionContinuity({ env: { [CC_REVIEW_SESSION_CONTINUITY_ENV]: val } });
+      assert.equal(config.enabled, false, `expected disabled for "${val}"`);
+    }
+  });
+
+  it("resolveSessionContinuity enables chaining via CC_REVIEW_SESSION_CHAIN", () => {
+    const config = resolveSessionContinuity({
+      env: {
+        [CC_REVIEW_SESSION_CONTINUITY_ENV]: "1",
+        [CC_REVIEW_SESSION_CHAIN_ENV]: "1",
+      },
+    });
+    assert.equal(config.enabled, true);
+    assert.equal(config.chain, true);
+  });
+
+  it("resolveTaskSessionFile returns --no-session when continuity disabled", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      const config = { enabled: false, chain: false };
+      const resolution = resolveTaskSessionFile(tmpDir, 0, "run-abc", config);
+      assert.equal(resolution.sessionPath, undefined);
+      assert.equal(resolution.priorSessionPath, undefined);
+      assert.deepEqual(resolution.flag, ["--no-session"]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveTaskSessionFile returns --session <path> when continuity enabled", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      const config = { enabled: true, chain: false };
+      const resolution = resolveTaskSessionFile(tmpDir, 2, "run-abc", config);
+      assert.ok(resolution.sessionPath);
+      assert.ok(resolution.sessionPath!.includes("sessions"));
+      assert.ok(resolution.sessionPath!.includes("task-2"));
+      assert.ok(resolution.sessionPath!.includes("run-abc"));
+      assert.deepEqual(resolution.flag, ["--session", resolution.sessionPath!]);
+      assert.equal(resolution.priorSessionPath, undefined);
+      // sessions directory should be created
+      assert.ok(fs.existsSync(path.join(tmpDir, "sessions")));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveTaskSessionFile chains from prior session when chaining enabled and prior exists", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      // Create a fake prior session file
+      const sessionsDir = path.join(tmpDir, "sessions");
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      const priorPath = path.join(sessionsDir, "task-0-run-abc.session.json");
+      fs.writeFileSync(priorPath, "{}", "utf-8");
+
+      const config = { enabled: true, chain: true };
+      const resolution = resolveTaskSessionFile(tmpDir, 1, "run-abc", config, priorPath);
+      // When chaining and prior exists, should reuse the prior path
+      assert.equal(resolution.sessionPath, priorPath);
+      assert.equal(resolution.priorSessionPath, priorPath);
+      assert.deepEqual(resolution.flag, ["--session", priorPath]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveTaskSessionFile does NOT chain when chaining disabled", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      const sessionsDir = path.join(tmpDir, "sessions");
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      const priorPath = path.join(sessionsDir, "task-0-run-abc.session.json");
+      fs.writeFileSync(priorPath, "{}", "utf-8");
+
+      const config = { enabled: true, chain: false };
+      const resolution = resolveTaskSessionFile(tmpDir, 1, "run-abc", config, priorPath);
+      // Chaining disabled → new file for this task, not the prior one
+      assert.notEqual(resolution.sessionPath, priorPath);
+      assert.ok(resolution.sessionPath!.includes("task-1"));
+      assert.equal(resolution.priorSessionPath, undefined);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveTaskSessionFile does NOT chain when prior session does not exist", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      const config = { enabled: true, chain: true };
+      const nonexistentPrior = path.join(tmpDir, "nonexistent.session.json");
+      const resolution = resolveTaskSessionFile(tmpDir, 1, "run-abc", config, nonexistentPrior);
+      // Prior doesn't exist → new file for this task
+      assert.ok(resolution.sessionPath);
+      assert.ok(resolution.sessionPath!.includes("task-1"));
+      assert.equal(resolution.priorSessionPath, undefined);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("parallel sibling tasks get distinct session files", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      const config = { enabled: true, chain: false };
+      const task0 = resolveTaskSessionFile(tmpDir, 0, "run-abc", config);
+      const task1 = resolveTaskSessionFile(tmpDir, 1, "run-abc", config);
+      assert.notEqual(task0.sessionPath, task1.sessionPath);
+      assert.ok(task0.sessionPath!.includes("task-0"));
+      assert.ok(task1.sessionPath!.includes("task-1"));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("describeSessionPath returns undefined for undefined input", () => {
+    assert.equal(describeSessionPath(undefined), undefined);
+  });
+
+  it("describeSessionPath returns a readable label for a path", () => {
+    const label = describeSessionPath("/some/dir/task-0-run-abc.session.json");
+    assert.equal(label, "session:task-0-run-abc.session.json");
+  });
+
+  it("sequential two-task test: Task 2 can chain from Task 1's session path", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-session-test-"));
+    try {
+      const config = { enabled: true, chain: true };
+
+      // Task 1 runs — gets its own session file.
+      const task0Resolution = resolveTaskSessionFile(tmpDir, 0, "run-seq", config);
+      assert.ok(task0Resolution.sessionPath);
+
+      // Simulate Task 1 completing and writing a session file.
+      fs.mkdirSync(path.dirname(task0Resolution.sessionPath!), { recursive: true });
+      fs.writeFileSync(task0Resolution.sessionPath!, '{"messages":[]}', "utf-8");
+
+      // Task 2 runs with Task 1's session path as priorSessionPath.
+      const task1Resolution = resolveTaskSessionFile(tmpDir, 1, "run-seq", config, task0Resolution.sessionPath);
+      // With chaining enabled and prior existing, Task 2 reuses Task 1's session.
+      assert.equal(task1Resolution.sessionPath, task0Resolution.sessionPath);
+      assert.equal(task1Resolution.priorSessionPath, task0Resolution.sessionPath);
+      assert.deepEqual(task1Resolution.flag, ["--session", task0Resolution.sessionPath!]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-3: Model fallback and attempted-model reporting.
+// Verifies: candidate building, retryable failure classification, attempt
+// summarization, and settings resolution.
+// ---------------------------------------------------------------------------
+describe("model fallback (P1-3)", () => {
+  it("splitThinkingSuffix separates base model and thinking suffix", () => {
+    assert.deepEqual(splitThinkingSuffix("claude-sonnet"), { baseModel: "claude-sonnet", thinkingSuffix: "" });
+    assert.deepEqual(splitThinkingSuffix("claude-sonnet:high"), { baseModel: "claude-sonnet", thinkingSuffix: ":high" });
+    assert.deepEqual(splitThinkingSuffix("provider/claude:low"), { baseModel: "provider/claude", thinkingSuffix: ":low" });
+  });
+
+  it("parseFallbackModels splits comma-separated string", () => {
+    assert.deepEqual(parseFallbackModels("a, b, c"), ["a", "b", "c"]);
+    assert.deepEqual(parseFallbackModels("a,, b,"), ["a", "b"]);
+    assert.deepEqual(parseFallbackModels(""), []);
+    assert.deepEqual(parseFallbackModels(undefined), []);
+    assert.deepEqual(parseFallbackModels(123), []);
+  });
+
+  it("buildModelCandidates puts primary first, dedupes", () => {
+    const candidates = buildModelCandidates({
+      primaryModel: "primary-model",
+      fallbackModels: ["fallback-a", "primary-model", "fallback-b"],
+    });
+    assert.deepEqual(candidates, ["primary-model", "fallback-a", "fallback-b"]);
+  });
+
+  it("buildModelCandidates handles undefined primary", () => {
+    const candidates = buildModelCandidates({
+      primaryModel: undefined,
+      fallbackModels: ["fallback-a", "fallback-b"],
+    });
+    assert.deepEqual(candidates, ["fallback-a", "fallback-b"]);
+  });
+
+  it("buildModelCandidates returns empty when no models", () => {
+    assert.deepEqual(buildModelCandidates({ primaryModel: undefined, fallbackModels: [] }), []);
+  });
+
+  it("isRetryableModelFailure detects rate limits", () => {
+    assert.equal(isRetryableModelFailure("Rate limit exceeded"), true);
+    assert.equal(isRetryableModelFailure("Too many requests (429)"), true);
+    assert.equal(isRetryableModelFailure("quota exceeded"), true);
+  });
+
+  it("isRetryableModelFailure detects auth/key errors", () => {
+    assert.equal(isRetryableModelFailure("Unauthorized: invalid API key"), true);
+    assert.equal(isRetryableModelFailure("token expired"), true);
+    assert.equal(isRetryableModelFailure("forbidden"), true);
+  });
+
+  it("isRetryableModelFailure detects model unavailable", () => {
+    assert.equal(isRetryableModelFailure("model not found"), true);
+    assert.equal(isRetryableModelFailure("Model is disabled"), true);
+    assert.equal(isRetryableModelFailure("provider unavailable"), true);
+  });
+
+  it("isRetryableModelFailure detects network/timeout errors", () => {
+    assert.equal(isRetryableModelFailure("connection refused"), true);
+    assert.equal(isRetryableModelFailure("fetch failed"), true);
+    assert.equal(isRetryableModelFailure("socket hang up"), true);
+    assert.equal(isRetryableModelFailure("Request timed out"), true);
+    assert.equal(isRetryableModelFailure("503 Service unavailable"), true);
+  });
+
+  it("isRetryableModelFailure returns false for non-retryable errors", () => {
+    assert.equal(isRetryableModelFailure("Syntax error in task prompt"), false);
+    assert.equal(isRetryableModelFailure("Task validation failed"), false);
+    assert.equal(isRetryableModelFailure("File not found"), false);
+    assert.equal(isRetryableModelFailure(undefined), false);
+    assert.equal(isRetryableModelFailure(""), false);
+  });
+
+  it("formatModelAttemptNote includes next model when provided", () => {
+    const attempt: ModelAttemptSummary = { model: "model-a", success: false, exitCode: 1, error: "rate limit" };
+    const note = formatModelAttemptNote(attempt, "model-b");
+    assert.match(note, /model-a failed: rate limit/);
+    assert.match(note, /Retrying with model-b/);
+  });
+
+  it("formatModelAttemptNote omits next model when not provided", () => {
+    const attempt: ModelAttemptSummary = { model: "model-a", success: false, exitCode: 1, error: "timeout" };
+    const note = formatModelAttemptNote(attempt);
+    assert.match(note, /model-a failed: timeout/);
+    assert.doesNotMatch(note, /Retrying/);
+  });
+
+  it("summarizeAttemptedModels returns undefined for single attempt", () => {
+    const attempts: ModelAttemptSummary[] = [
+      { model: "model-a", success: true, exitCode: 0 },
+    ];
+    assert.equal(summarizeAttemptedModels(attempts), undefined);
+  });
+
+  it("summarizeAttemptedModels lists all attempts with status", () => {
+    const attempts: ModelAttemptSummary[] = [
+      { model: "model-a", success: false, exitCode: 1, error: "rate limit" },
+      { model: "model-b", success: true, exitCode: 0 },
+    ];
+    const summary = summarizeAttemptedModels(attempts);
+    assert.ok(summary);
+    assert.match(summary!, /1\. model-a — failed \(rate limit\)/);
+    assert.match(summary!, /2\. model-b — ok/);
+  });
+
+  it("resolveModelFallbackConfig reads frontmatter fallbackModels", () => {
+    const config = resolveModelFallbackConfig({
+      agentFrontmatter: { model: "primary", fallbackModels: "fb1, fb2" },
+      agentName: "worker",
+    });
+    assert.equal(config.primaryModel, "primary");
+    assert.deepEqual(config.fallbackModels, ["fb1", "fb2"]);
+  });
+
+  it("resolveModelFallbackConfig reads settings overrides", () => {
+    const settings = {
+      subagents: {
+        agentOverrides: {
+          worker: { model: "settings-primary", fallbackModels: "settings-fb1,settings-fb2" },
+        },
+      },
+    };
+    const config = resolveModelFallbackConfig({
+      agentFrontmatter: {},
+      settings,
+      agentName: "worker",
+    });
+    assert.equal(config.primaryModel, "settings-primary");
+    assert.deepEqual(config.fallbackModels, ["settings-fb1", "settings-fb2"]);
+  });
+
+  it("resolveModelFallbackConfig merges frontmatter and settings fallbacks, dedupes", () => {
+    const settings = {
+      defaultModel: "default-model",
+      subagents: {
+        agentOverrides: {
+          worker: { fallbackModels: "fb2, fb3" },
+        },
+      },
+    };
+    const config = resolveModelFallbackConfig({
+      agentFrontmatter: { model: "primary", fallbackModels: "fb1, fb2" },
+      settings,
+      agentName: "worker",
+    });
+    assert.equal(config.primaryModel, "primary");
+    // fb1 from frontmatter, fb2 from both (deduped), fb3 from settings
+    assert.deepEqual(config.fallbackModels, ["fb1", "fb2", "fb3"]);
+  });
+
+  it("resolveModelFallbackConfig falls back to defaultModel when no primary", () => {
+    const settings = { defaultModel: "default-model" };
+    const config = resolveModelFallbackConfig({
+      agentFrontmatter: {},
+      settings,
+      agentName: "worker",
+    });
+    assert.equal(config.primaryModel, "default-model");
+    assert.deepEqual(config.fallbackModels, []);
+  });
+
+  it("resolveModelFallbackConfig returns empty when nothing configured", () => {
+    const config = resolveModelFallbackConfig({});
+    assert.equal(config.primaryModel, undefined);
+    assert.deepEqual(config.fallbackModels, []);
+  });
+
+  it("successful primary model — no fallback needed (candidates has 1 entry)", () => {
+    const candidates = buildModelCandidates({
+      primaryModel: "primary",
+      fallbackModels: [],
+    });
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0], "primary");
+  });
+
+  it("retryable primary failure followed by fallback success — candidates ordered", () => {
+    const candidates = buildModelCandidates({
+      primaryModel: "primary",
+      fallbackModels: ["fallback-a", "fallback-b"],
+    });
+    assert.deepEqual(candidates, ["primary", "fallback-a", "fallback-b"]);
+    // Simulate: primary fails with retryable error, fallback-a succeeds
+    const attempts: ModelAttemptSummary[] = [
+      { model: "primary", success: false, exitCode: 1, error: "rate limit exceeded" },
+      { model: "fallback-a", success: true, exitCode: 0 },
+    ];
+    assert.equal(isRetryableModelFailure(attempts[0]!.error), true);
+    const summary = summarizeAttemptedModels(attempts);
+    assert.ok(summary);
+    assert.match(summary!, /primary — failed/);
+    assert.match(summary!, /fallback-a — ok/);
+  });
+
+  it("non-retryable failure with no fallback — single candidate, no summary", () => {
+    const candidates = buildModelCandidates({
+      primaryModel: "primary",
+      fallbackModels: [],
+    });
+    assert.equal(candidates.length, 1);
+    const error = "Syntax error in generated code";
+    assert.equal(isRetryableModelFailure(error), false);
+    // Non-retryable → no fallback attempt, single entry → no summary
+    const attempts: ModelAttemptSummary[] = [
+      { model: "primary", success: false, exitCode: 1, error },
+    ];
+    assert.equal(summarizeAttemptedModels(attempts), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-2: Structured-output strict mode.
+// Verifies: config resolution, file path/instruction generation, file reading
+// and parsing, missing-file failure, and invalid-JSON failure.
+// ---------------------------------------------------------------------------
+describe("structured-output strict mode (P1-2)", () => {
+  it("is wired into worker prompt construction and validation", () => {
+    const executionPhaseSource = fs.readFileSync(
+      path.join(process.cwd(), ".pi/extensions/cc-review/workflow/orchestrator/execution-phase.ts"),
+      "utf-8",
+    );
+    assert.match(executionPhaseSource, /resolveStructuredOutputStrict\(\)/);
+    assert.match(executionPhaseSource, /structuredOutput\?\.promptInstruction/);
+    assert.match(executionPhaseSource, /readStructuredOutputFile\(structuredOutput\.outputPath\)/);
+    assert.match(executionPhaseSource, /cachedSubagentResult = resultForValidation/);
+  });
+
+  it("resolveStructuredOutputStrict defaults to disabled", () => {
+    assert.equal(resolveStructuredOutputStrict({}).enabled, false);
+    assert.equal(resolveStructuredOutputStrict({ [CC_REVIEW_STRUCTURED_OUTPUT_STRICT_ENV]: "" }).enabled, false);
+  });
+
+  it("resolveStructuredOutputStrict enables via env", () => {
+    for (const val of ["1", "true", "yes"]) {
+      assert.equal(resolveStructuredOutputStrict({ [CC_REVIEW_STRUCTURED_OUTPUT_STRICT_ENV]: val }).enabled, true);
+    }
+    for (const val of ["0", "false", "no", "random"]) {
+      assert.equal(resolveStructuredOutputStrict({ [CC_REVIEW_STRUCTURED_OUTPUT_STRICT_ENV]: val }).enabled, false);
+    }
+  });
+
+  it("resolveStructuredOutputFile returns undefined when strict disabled", () => {
+    const result = resolveStructuredOutputFile("/tmp/artifacts", 0, { enabled: false });
+    assert.equal(result, undefined);
+  });
+
+  it("resolveStructuredOutputFile returns path and instruction when enabled", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const result = resolveStructuredOutputFile(tmpDir, 3, { enabled: true });
+      assert.ok(result);
+      assert.ok(result!.outputPath.includes("structured"));
+      assert.ok(result!.outputPath.includes("task-3"));
+      assert.ok(result!.promptInstruction.includes("REQUIRED"));
+      assert.ok(result!.promptInstruction.includes(result!.outputPath));
+      assert.ok(fs.existsSync(path.join(tmpDir, "structured")));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("readStructuredOutputFile returns found:false when file missing", () => {
+    const result = readStructuredOutputFile("/nonexistent/path/task-0.json");
+    assert.equal(result.found, false);
+    assert.ok(result.error);
+    assert.match(result.error!, /not found/i);
+  });
+
+  it("readStructuredOutputFile parses valid JSON", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const filePath = path.join(tmpDir, "task-0.json");
+      const expected = { status: "completed", summary: "done" };
+      fs.writeFileSync(filePath, JSON.stringify(expected), "utf-8");
+      const result = readStructuredOutputFile(filePath);
+      assert.equal(result.found, true);
+      assert.deepEqual(result.parsed, expected);
+      assert.equal(result.error, undefined);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("readStructuredOutputFile strips markdown code fences", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const filePath = path.join(tmpDir, "task-0.json");
+      const expected = { status: "completed", summary: "done" };
+      fs.writeFileSync(filePath, "```json\n" + JSON.stringify(expected) + "\n```", "utf-8");
+      const result = readStructuredOutputFile(filePath);
+      assert.equal(result.found, true);
+      assert.deepEqual(result.parsed, expected);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("readStructuredOutputFile returns error for empty file", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const filePath = path.join(tmpDir, "task-0.json");
+      fs.writeFileSync(filePath, "", "utf-8");
+      const result = readStructuredOutputFile(filePath);
+      assert.equal(result.found, true);
+      assert.equal(result.parsed, undefined);
+      assert.match(result.error!, /empty/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("readStructuredOutputFile returns error for invalid JSON", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const filePath = path.join(tmpDir, "task-0.json");
+      fs.writeFileSync(filePath, "{not valid json}", "utf-8");
+      const result = readStructuredOutputFile(filePath);
+      assert.equal(result.found, true);
+      assert.equal(result.parsed, undefined);
+      assert.match(result.error!, /invalid JSON/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("strict-mode-required task fails clearly when output file is missing", () => {
+    // Simulate the strict-mode validation path: worker ran but didn't write
+    // the structured output file. The read should report found:false with a
+    // clear error that the caller can surface as a validation failure.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const resolution = resolveStructuredOutputFile(tmpDir, 0, { enabled: true });
+      assert.ok(resolution);
+      const result = readStructuredOutputFile(resolution!.outputPath);
+      assert.equal(result.found, false);
+      assert.ok(result.error);
+      assert.match(result.error!, /not found/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("valid output is read and can be schema-checked by parseSubagentStructuredReport", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-structured-test-"));
+    try {
+      const filePath = path.join(tmpDir, "task-0.json");
+      const expected = {
+        status: "completed",
+        summary: "Implemented the parser fix",
+        filesChanged: ["src/parser.ts"],
+        acceptanceCriteria: [
+          { criterion: "handles null input", status: "met", evidence: "added null check" },
+        ],
+      };
+      fs.writeFileSync(filePath, JSON.stringify(expected), "utf-8");
+      const result = readStructuredOutputFile(filePath);
+      assert.equal(result.found, true);
+      assert.deepEqual(result.parsed, expected);
+      // The caller would pass result.parsed to parseSubagentStructuredReport
+      // or validate it directly; the file-read layer just provides the JSON.
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-1: Completion mutation guard.
+// Verifies: mutation expectation inference, mutating-bash classification,
+// mutation tool call detection, and guard trigger logic.
+// ---------------------------------------------------------------------------
+describe("completion mutation guard (P2-1)", () => {
+  it("expectsImplementationMutation: worker with implement intent", () => {
+    assert.equal(expectsImplementationMutation("worker", "Implement the parser fix"), true);
+    assert.equal(expectsImplementationMutation("worker", "Fix the null pointer bug"), true);
+    assert.equal(expectsImplementationMutation("worker", "Refactor the auth module"), true);
+    assert.equal(expectsImplementationMutation("worker", "Update the README"), true);
+  });
+
+  it("expectsImplementationMutation: review-only tasks do not expect mutation", () => {
+    assert.equal(expectsImplementationMutation("worker", "Review only the changes"), false);
+    assert.equal(expectsImplementationMutation("worker", "Return findings only"), false);
+  });
+
+  it("expectsImplementationMutation: explicit no-edit tasks do not expect mutation", () => {
+    assert.equal(expectsImplementationMutation("worker", "Do not edit any files"), false);
+    assert.equal(expectsImplementationMutation("worker", "Do not modify the source"), false);
+  });
+
+  it("expectsImplementationMutation: scoped no-edit still allows mutation", () => {
+    assert.equal(expectsImplementationMutation("worker", "Fix the parser. Do not edit files outside src/"), true);
+  });
+
+  it("expectsImplementationMutation: research/scout agents do not expect mutation", () => {
+    assert.equal(expectsImplementationMutation("research", "Find all usages of foo()"), false);
+    assert.equal(expectsImplementationMutation("scout", "Investigate the architecture"), false);
+  });
+
+  it("expectsImplementationMutation: reviewer agent only expects mutation with explicit edit patterns", () => {
+    assert.equal(expectsImplementationMutation("reviewer", "Review the changes"), false);
+    assert.equal(expectsImplementationMutation("reviewer", "Must edit the files to fix issues"), true);
+    assert.equal(expectsImplementationMutation("reviewer", "Apply the fixes directly"), true);
+  });
+
+  it("isMutatingBashCommand: detects file writes", () => {
+    assert.equal(isMutatingBashCommand("echo hello > file.txt"), true);
+    assert.equal(isMutatingBashCommand("cat config.json > backup.json"), true);
+    assert.equal(isMutatingBashCommand("tee output.log"), true);
+  });
+
+  it("isMutatingBashCommand: detects file operations", () => {
+    assert.equal(isMutatingBashCommand("rm temp.txt"), true);
+    assert.equal(isMutatingBashCommand("mv a.txt b.txt"), true);
+    assert.equal(isMutatingBashCommand("mkdir newdir"), true);
+    assert.equal(isMutatingBashCommand("touch newfile.txt"), true);
+  });
+
+  it("isMutatingBashCommand: detects git mutations", () => {
+    assert.equal(isMutatingBashCommand("git add -A"), true);
+    assert.equal(isMutatingBashCommand("git commit -m msg"), true);
+    assert.equal(isMutatingBashCommand("git push"), true);
+  });
+
+  it("isMutatingBashCommand: detects package installs", () => {
+    assert.equal(isMutatingBashCommand("npm install express"), true);
+    assert.equal(isMutatingBashCommand("pnpm add lodash"), true);
+    assert.equal(isMutatingBashCommand("pip install requests"), true);
+  });
+
+  it("isMutatingBashCommand: detects sed -i", () => {
+    assert.equal(isMutatingBashCommand("sed -i 's/foo/bar/' file.txt"), true);
+  });
+
+  it("isMutatingBashCommand: returns false for read-only commands", () => {
+    assert.equal(isMutatingBashCommand("ls -la"), false);
+    assert.equal(isMutatingBashCommand("cat file.txt"), false);
+    assert.equal(isMutatingBashCommand("grep pattern file.txt"), false);
+    assert.equal(isMutatingBashCommand("node --version"), false);
+    assert.equal(isMutatingBashCommand(""), false);
+  });
+
+  it("hasMutationToolCall: detects edit tool", () => {
+    const events: GuardedToolEvent[] = [{ name: "edit", arguments: { path: "file.txt" } }];
+    assert.equal(hasMutationToolCall(events), true);
+  });
+
+  it("hasMutationToolCall: detects write tool", () => {
+    const events: GuardedToolEvent[] = [{ name: "write", arguments: { file_path: "file.txt" } }];
+    assert.equal(hasMutationToolCall(events), true);
+  });
+
+  it("hasMutationToolCall: detects mutating bash", () => {
+    const events: GuardedToolEvent[] = [{ name: "bash", arguments: { command: "rm file.txt" } }];
+    assert.equal(hasMutationToolCall(events), true);
+  });
+
+  it("hasMutationToolCall: returns false for read-only tools", () => {
+    const events: GuardedToolEvent[] = [
+      { name: "read", arguments: { path: "file.txt" } },
+      { name: "bash", arguments: { command: "ls -la" } },
+    ];
+    assert.equal(hasMutationToolCall(events), false);
+  });
+
+  it("hasMutationToolCall: returns false for empty events", () => {
+    assert.equal(hasMutationToolCall([]), false);
+  });
+
+  it("evaluateCompletionMutationGuard: triggers when mutation expected but not attempted", () => {
+    const result = evaluateCompletionMutationGuard({
+      agent: "worker",
+      task: "Implement the parser fix",
+      toolEvents: [{ name: "read", arguments: { path: "parser.ts" } }],
+    });
+    assert.equal(result.expectedMutation, true);
+    assert.equal(result.attemptedMutation, false);
+    assert.equal(result.triggered, true);
+    assert.ok(result.reason);
+  });
+
+  it("evaluateCompletionMutationGuard: does not trigger when mutation expected and attempted", () => {
+    const result = evaluateCompletionMutationGuard({
+      agent: "worker",
+      task: "Implement the parser fix",
+      toolEvents: [{ name: "edit", arguments: { path: "parser.ts" } }],
+    });
+    assert.equal(result.expectedMutation, true);
+    assert.equal(result.attemptedMutation, true);
+    assert.equal(result.triggered, false);
+    assert.equal(result.reason, undefined);
+  });
+
+  it("evaluateCompletionMutationGuard: does not trigger for review-only tasks", () => {
+    const result = evaluateCompletionMutationGuard({
+      agent: "worker",
+      task: "Review only the changes and report findings",
+      toolEvents: [],
+    });
+    assert.equal(result.expectedMutation, false);
+    assert.equal(result.triggered, false);
+  });
+
+  it("evaluateCompletionMutationGuard: does not trigger for research agents", () => {
+    const result = evaluateCompletionMutationGuard({
+      agent: "research",
+      task: "Investigate the codebase structure",
+      toolEvents: [],
+    });
+    assert.equal(result.expectedMutation, false);
+    assert.equal(result.triggered, false);
+  });
+
+  it("evaluateCompletionMutationGuard: read-only tools override task text", () => {
+    const result = evaluateCompletionMutationGuard({
+      agent: "worker",
+      task: "Implement the parser fix",
+      toolEvents: [],
+      tools: ["read", "grep", "find"],
+    });
+    assert.equal(result.expectedMutation, false);
+    assert.equal(result.triggered, false);
+  });
+
+  it("guard records a clear validation message when triggered", () => {
+    const result = evaluateCompletionMutationGuard({
+      agent: "worker",
+      task: "Fix the authentication bug",
+      toolEvents: [],
+    });
+    assert.equal(result.triggered, true);
+    assert.ok(result.reason);
+    assert.match(result.reason!, /expects file mutation/i);
+    assert.match(result.reason!, /no edit\/write\/mutating-bash/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-2: Long-running and needs-attention control events.
+// Verifies: tracker lifecycle, state classification, event deduplication,
+// and label formatting.
+// ---------------------------------------------------------------------------
+describe("subagent control events (P2-2)", () => {
+  const thresholds = { idleMs: 1000, longRunningMs: 5000, toolFailureThreshold: 3 };
+
+  it("createSubagentActivityTracker initializes with sensible defaults", () => {
+    const tracker = createSubagentActivityTracker(0, "2026-01-01T00:00:00.000Z");
+    assert.equal(tracker.taskIndex, 0);
+    assert.equal(tracker.completed, false);
+    assert.equal(tracker.consecutiveToolFailures, 0);
+    assert.equal(tracker.lastEmittedEvent, undefined);
+    assert.ok(tracker.lastActivityMs > 0);
+  });
+
+  it("classifySubagentControlState returns active when recently active", () => {
+    const tracker = createSubagentActivityTracker(0, new Date().toISOString());
+    const now = Date.now();
+    recordActivity(tracker, { timestamp: now });
+    assert.equal(classifySubagentControlState(tracker, thresholds, now), "active");
+  });
+
+  it("classifySubagentControlState returns needs_attention when idle exceeds threshold", () => {
+    const start = new Date(Date.now() - 100).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, { idleMs: 1000 });
+    const now = Date.now() + 2000; // 2s after last activity
+    assert.equal(classifySubagentControlState(tracker, thresholds, now), "needs_attention");
+  });
+
+  it("classifySubagentControlState returns active_long_running when total elapsed exceeds threshold", () => {
+    const start = new Date(Date.now() - 6000).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, { longRunningMs: 5000 });
+    const now = Date.now();
+    recordActivity(tracker, { timestamp: now - 100 }); // recently active
+    assert.equal(classifySubagentControlState(tracker, thresholds, now), "active_long_running");
+  });
+
+  it("classifySubagentControlState returns completed when tracker is completed", () => {
+    const tracker = createSubagentActivityTracker(0);
+    markCompleted(tracker);
+    assert.equal(classifySubagentControlState(tracker, thresholds), "completed");
+  });
+
+  it("emitControlEvent returns needs_attention when idle", () => {
+    const start = new Date(Date.now() - 100).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, thresholds);
+    const now = Date.now() + 2000;
+    const event = emitControlEvent(tracker, thresholds, now);
+    assert.equal(event, "needs_attention");
+    assert.equal(tracker.lastEmittedEvent, "needs_attention");
+  });
+
+  it("emitControlEvent deduplicates needs_attention", () => {
+    const start = new Date(Date.now() - 100).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, thresholds);
+    const now = Date.now() + 2000;
+    const first = emitControlEvent(tracker, thresholds, now);
+    const second = emitControlEvent(tracker, thresholds, now + 500);
+    assert.equal(first, "needs_attention");
+    assert.equal(second, undefined); // deduplicated
+  });
+
+  it("emitControlEvent returns active_long_running when long-running", () => {
+    const start = new Date(Date.now() - 6000).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, thresholds);
+    const now = Date.now();
+    recordActivity(tracker, { timestamp: now - 100 });
+    const event = emitControlEvent(tracker, thresholds, now);
+    assert.equal(event, "active_long_running");
+  });
+
+  it("emitControlEvent returns repeated_tool_failures when threshold reached", () => {
+    const tracker = createSubagentActivityTracker(0, new Date().toISOString(), thresholds);
+    recordToolFailure(tracker);
+    recordToolFailure(tracker);
+    assert.equal(emitControlEvent(tracker, thresholds), undefined); // 2 < 3
+    recordToolFailure(tracker);
+    assert.equal(emitControlEvent(tracker, thresholds), "repeated_tool_failures"); // 3 >= 3
+  });
+
+  it("recordActivity with toolSuccess resets failure counter", () => {
+    const tracker = createSubagentActivityTracker(0, new Date().toISOString(), thresholds);
+    recordToolFailure(tracker);
+    recordToolFailure(tracker);
+    recordActivity(tracker, { toolSuccess: true });
+    assert.equal(tracker.consecutiveToolFailures, 0);
+    // Should not emit repeated_tool_failures now
+    assert.equal(emitControlEvent(tracker, thresholds), undefined);
+  });
+
+  it("emitControlEvent resets dedup when activity resumes", () => {
+    const start = new Date(Date.now() - 2000).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, thresholds);
+    // Idle → emit needs_attention
+    const now1 = Date.now();
+    assert.equal(emitControlEvent(tracker, thresholds, now1), "needs_attention");
+    // Activity resumes
+    recordActivity(tracker, { timestamp: now1 + 100 });
+    // Should reset lastEmittedEvent so it can fire again later
+    assert.equal(tracker.lastEmittedEvent, undefined);
+  });
+
+  it("emitControlEvent returns undefined when completed", () => {
+    const tracker = createSubagentActivityTracker(0);
+    markCompleted(tracker);
+    assert.equal(emitControlEvent(tracker, thresholds), undefined);
+  });
+
+  it("formatControlEventLabel produces readable labels", () => {
+    assert.equal(formatControlEventLabel("active_long_running"), "long-running");
+    assert.equal(formatControlEventLabel("needs_attention"), "idle · needs attention");
+    assert.equal(formatControlEventLabel("repeated_tool_failures"), "repeated tool failures");
+  });
+
+  it("formatControlStateLabel produces readable labels", () => {
+    assert.equal(formatControlStateLabel("active"), "");
+    assert.equal(formatControlStateLabel("active_long_running"), "long-running");
+    assert.equal(formatControlStateLabel("needs_attention"), "needs attention");
+    assert.equal(formatControlStateLabel("idle"), "idle");
+    assert.equal(formatControlStateLabel("completed"), "done");
+  });
+
+  it("buildControlEventLogPayload includes timing and failure data", () => {
+    const start = new Date(Date.now() - 10000).toISOString();
+    const tracker = createSubagentActivityTracker(2, start, thresholds);
+    recordToolFailure(tracker);
+    recordToolFailure(tracker);
+    recordToolFailure(tracker);
+    const payload = buildControlEventLogPayload(tracker, "repeated_tool_failures", thresholds);
+    assert.equal(payload.controlEvent, "repeated_tool_failures");
+    assert.equal(payload.taskIndex, 2);
+    assert.ok(typeof payload.elapsedMs === "number");
+    assert.ok(payload.elapsedMs! >= 10000);
+    assert.equal(payload.consecutiveToolFailures, 3);
+    assert.ok(payload.thresholds);
+  });
+
+  it("needs_attention takes priority over active_long_running for label", () => {
+    // If a task is both long-running AND idle, needs_attention is more actionable.
+    const start = new Date(Date.now() - 10000).toISOString();
+    const tracker = createSubagentActivityTracker(0, start, thresholds);
+    const now = Date.now();
+    // lastActivity was at start, so idle for 10s > idleMs(1s), and total 10s > longRunningMs(5s)
+    const state = classifySubagentControlState(tracker, thresholds, now);
+    assert.equal(state, "needs_attention");
   });
 });

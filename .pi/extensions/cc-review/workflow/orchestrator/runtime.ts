@@ -144,6 +144,8 @@ export interface WorkflowRuntime {
   findingsRollup: CcReviewFindingsRollup;
   taskStatuses: Array<TaskStatus | "running" | undefined>;
   taskModels: TaskModelState[];
+  /** P1-1: per-task session file paths (for sequential chaining when continuity enabled). */
+  taskSessionPaths: (string | undefined)[];
   collectedTaskFindings: ReviewFinding[][];
   rollupEmitted: boolean;
   /** Whether at least one review result has been processed (R7). */
@@ -263,6 +265,8 @@ class WorkflowRuntimeImpl implements WorkflowRuntime {
   logSequence!: number;
   taskStatuses!: Array<TaskStatus | "running" | undefined>;
   taskModels!: TaskModelState[];
+  /** P1-1: per-task session file paths (for sequential chaining when continuity enabled). */
+  taskSessionPaths!: (string | undefined)[];
   collectedTaskFindings!: ReviewFinding[][];
   findingsRollup!: CcReviewFindingsRollup;
   rollupEmitted!: boolean;
@@ -468,6 +472,7 @@ export function createWorkflowRuntime(
   rt.findingsRollup = emptyFindingsRollup();
   rt.taskStatuses = [];
   rt.taskModels = [];
+  rt.taskSessionPaths = [];
   rt.collectedTaskFindings = [];
   rt.rollupEmitted = false;
   rt.hasCompletedReview = false;

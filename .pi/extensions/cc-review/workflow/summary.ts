@@ -126,7 +126,14 @@ export function buildSummaryReport(
   goal: string,
   taskResults: TaskResult[],
   tasks: Task[],
-  options?: { concurrency?: number; runId?: string; artifactDir?: string; parseFailureLines?: string[]; batchReviewResult?: BatchReviewResult }
+  options?: {
+    concurrency?: number;
+    runId?: string;
+    artifactDir?: string;
+    parseFailureLines?: string[];
+    batchReviewResult?: BatchReviewResult;
+    termination?: "failed" | "cancelled";
+  }
 ): string {
   const results = [...taskResults];
   for (let j = results.length; j < tasks.length; j++) {
@@ -156,12 +163,16 @@ export function buildSummaryReport(
   const hasCancelled = results.some((task) => task.status === "cancelled");
 
   let summaryMarkdown = `## 🏆 CC Review Orchestrator Report\n\n`;
-  if (hasCancelled) {
+  if (options?.termination === "cancelled" || hasCancelled) {
     summaryMarkdown += `The workflow was cancelled or timed out before completion.\n\n`;
   } else if (hasReviewBlocked) {
     summaryMarkdown += `The workflow was blocked by reviewer findings before completion.\n\n`;
   } else if (failedOrHalted) {
     summaryMarkdown += `The workflow terminated early due to an unrecoverable task execution or validation failure.\n\n`;
+  } else if (options?.termination === "failed" && tasks.length === 0) {
+    summaryMarkdown += `The workflow failed during planning before any tasks were created.\n\n`;
+  } else if (options?.termination === "failed") {
+    summaryMarkdown += `The workflow terminated early due to an unrecoverable workflow failure.\n\n`;
   } else if (hasSkipped) {
     summaryMarkdown += `The workflow completed partially; some tasks were skipped.\n\n`;
   } else if (hasWarnings) {

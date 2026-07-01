@@ -8,6 +8,13 @@ import type { SubagentToolExecutor, SubagentToolResult, TaskResult, ExtensionAPI
 import { stripAnsi } from "./util.ts";
 import { runSubprocess } from "../subprocess.ts";
 import { clipSubprocessLogText } from "./stream-format.ts";
+import { getPiSpawnCommand, formatResolvedPiCommand } from "./pi-spawn.ts";
+import {
+  resolveSessionContinuity,
+  resolveTaskSessionFile,
+  describeSessionPath,
+  type SessionContinuityConfig,
+} from "./session-continuity.ts";
 
 // Helper to summarize the parent workflow goal/context rather than copying wholesale
 export function summarizeParentContext(goal: string): string {
@@ -190,7 +197,8 @@ function buildSubagentTaskPrompt(
   task: Task,
   parentContextSummary: string,
   priorTaskHandoff: string = "",
-  stateBufferSection: string = ""
+  stateBufferSection: string = "",
+  structuredOutputInstruction?: string,
 ): string {
   const sections = [
     `Parent Workflow Context (Summary): ${parentContextSummary}`,
@@ -207,9 +215,17 @@ function buildSubagentTaskPrompt(
     `Acceptance Criteria:\n${task.acceptanceCriteria}`,
     "Work only on this task's stated scope in the current workspace directory.",
     "Verify the acceptance criteria before reporting completion.",
-    "End your final response with one JSON object (prose allowed above it) using this shape:",
-    '{"status":"completed|partial|blocked","summary":"...","filesChanged":["path"],"unresolvedItems":[],"acceptanceCriteria":[{"criterion":"...","status":"met|not_met|unknown","evidence":"..."}]}'
   );
+  if (structuredOutputInstruction) {
+    // P1-2: strict mode — worker must write structured JSON to a file.
+    sections.push(structuredOutputInstruction);
+  } else {
+    // Compatibility mode — worker ends its text response with a JSON object.
+    sections.push(
+      "End your final response with one JSON object (prose allowed above it) using this shape:",
+      '{"status":"completed|partial|blocked","summary":"...","filesChanged":["path"],"unresolvedItems":[],"acceptanceCriteria":[{"criterion":"...","status":"met|not_met|unknown","evidence":"..."}]}'
+    );
+  }
   return sections.join("\n\n");
 }
 
@@ -415,33 +431,22 @@ export function discoverAgent(
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
-  // Prefer the same pi binary that runs the current process, falling back to
-  // the `pi` on PATH. Mirrors `_subagent`'s logic so we don't accidentally pick
-  // up a different pi install when running under bun-compiled binaries.
+  // Delegate to the dedicated pi-spawn resolver (P0-1 borrowing). This
+  // replaces the previous inline heuristic with a more complete resolution
+  // path that supports explicit env overrides, package-root entrypoints,
+  // Windows CLI script resolution, and PATH fallback.
   //
-  // We only re-use `process.argv[1]` when it actually points at a pi entry
-  // script. In production this extension runs inside pi so argv[1] is the pi
-  // script; in test harnesses argv[1] could be an unrelated file, which would
-  // make us launch the wrong program.
-  const currentScript = process.argv[1];
-  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  const looksLikePiScript =
-    !!currentScript &&
-    !isBunVirtualScript &&
-    fs.existsSync(currentScript) &&
-    (/(^|[\/\\])pi(\.[cm]?[jt]s)?$/i.test(currentScript) ||
-      currentScript.includes("pi-coding-agent") ||
-      currentScript.includes("@earendil-works"));
-  if (looksLikePiScript) {
-    return { command: process.execPath, args: [currentScript, ...args] };
+  // The static test still verifies this function exists and that the
+  // subprocess fallback uses documented Pi JSON mode flags.
+  const resolved = getPiSpawnCommand(args);
+  if (process.env.CC_REVIEW_DEBUG) {
+    try {
+      process.stderr.write(`[cc-review] pi spawn resolved: ${formatResolvedPiCommand(resolved)}\n`);
+    } catch {
+      // ignore
+    }
   }
-
-  const execName = path.basename(process.execPath).toLowerCase();
-  const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-  if (!isGenericRuntime) {
-    return { command: process.execPath, args };
-  }
-  return { command: "pi", args };
+  return { command: resolved.command, args: resolved.args };
 }
 
 // Build a compact, non-sensitive one-line summary of a subagent tool execution
@@ -463,12 +468,28 @@ export function summarizeSubagentToolActivity(event: any): string {
   return hint ? `⚙ ${toolName}: ${hint}` : `⚙ ${toolName}`;
 }
 
+export interface SubagentSessionOptions {
+  /** Per-run artifact directory (for session file storage). */
+  artifactRunDir?: string;
+  /** 0-based task index (for session file naming). */
+  taskIndex?: number;
+  /** Stable workflow run id (for session file correlation). */
+  workflowRunId?: string;
+  /** Prior task's session path (for sequential chaining). */
+  priorSessionPath?: string;
+  /** Resolved session continuity config. If omitted, resolved from env. */
+  sessionContinuity?: SessionContinuityConfig;
+  /** P1-3: override the agent's model for this spawn (model fallback). */
+  modelOverride?: string;
+}
+
 async function runPiAgentSubprocess(
   agent: DiscoveredAgent,
   task: string,
   cwd: string,
   signal: AbortSignal | undefined,
   onUpdate: ((partial: any) => void) | undefined,
+  sessionOptions?: SubagentSessionOptions,
 ): Promise<SubagentToolResult> {
   // Write the agent system prompt to a temp file we can pass via
   // --append-system-prompt. pi accepts either text or a file path there.
@@ -480,8 +501,23 @@ async function runPiAgentSubprocess(
     await fs.promises.writeFile(tmpPromptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
   }
 
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (agent.model) args.push("--model", agent.model);
+  // Resolve session-file continuity (P1-1). Default remains --no-session;
+  // only when CC_REVIEW_SESSION_CONTINUITY=1 do we pass --session <file>.
+  const sessionConfig = sessionOptions?.sessionContinuity ?? resolveSessionContinuity();
+  const sessionResolution = (sessionOptions?.artifactRunDir && sessionOptions?.taskIndex !== undefined && sessionOptions?.workflowRunId)
+    ? resolveTaskSessionFile(
+        sessionOptions.artifactRunDir,
+        sessionOptions.taskIndex,
+        sessionOptions.workflowRunId,
+        sessionConfig,
+        sessionOptions.priorSessionPath,
+      )
+    : { sessionPath: undefined, priorSessionPath: undefined, flag: ["--no-session"] as string[] };
+
+  const args: string[] = ["--mode", "json", "-p", ...sessionResolution.flag];
+  // P1-3: modelOverride (from fallback loop) takes precedence over agent.model.
+  const effectiveModel = sessionOptions?.modelOverride || agent.model;
+  if (effectiveModel) args.push("--model", effectiveModel);
   if (agent.thinking) args.push("--thinking", agent.thinking);
   if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
   if (tmpPromptPath) args.push("--append-system-prompt", tmpPromptPath);
@@ -666,6 +702,10 @@ async function runPiAgentSubprocess(
           stderr: stderr || undefined,
           errorMessage,
           model: currentModel,
+          // P1-1: expose the session path so callers can persist it in
+          // task artifacts and chain it to the next sequential task.
+          sessionPath: sessionResolution.sessionPath,
+          sessionLabel: describeSessionPath(sessionResolution.sessionPath),
         },
       ],
     },
@@ -714,7 +754,13 @@ export function getSubagentExecutor(pi: ExtensionAPI): SubagentToolExecutor {
       };
     }
 
-    return runPiAgentSubprocess(agent, task, cwd, signal, onUpdate);
+    return runPiAgentSubprocess(agent, task, cwd, signal, onUpdate, {
+      artifactRunDir: typeof params.artifactRunDir === "string" ? params.artifactRunDir : undefined,
+      taskIndex: typeof params.taskIndex === "number" ? params.taskIndex : undefined,
+      workflowRunId: typeof params.workflowRunId === "string" ? params.workflowRunId : undefined,
+      priorSessionPath: typeof params.priorSessionPath === "string" ? params.priorSessionPath : undefined,
+      modelOverride: typeof params.modelOverride === "string" ? params.modelOverride : undefined,
+    });
   };
 }
 

@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+
 import {
   buildFindingsPayload,
   deriveEffectiveVerdict,
@@ -34,6 +36,12 @@ import {
 } from "../execution.ts";
 import { buildRepairFeedback } from "../review.ts";
 import { formatStateBufferForPrompt } from "../session.ts";
+import { resolvePriorTaskSessionPath } from "../session-continuity.ts";
+import {
+  readStructuredOutputFile,
+  resolveStructuredOutputFile,
+  resolveStructuredOutputStrict,
+} from "../structured-output.ts";
 import type { Task } from "../dependencies.ts";
 import type { WorkflowRuntime } from "./runtime.ts";
 
@@ -83,7 +91,18 @@ async function executeWorkerAttempts(
   const summarizedParentContext = summarizeParentContext(rt.goal);
   const priorHandoff = priorTaskHandoffFromResults(opts.priorResults);
   const stateBufferSection = formatStateBufferForPrompt(rt.runStateBuffer);
-  const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff, stateBufferSection);
+  const structuredOutput = resolveStructuredOutputFile(
+    rt.artifactRunDir,
+    index,
+    resolveStructuredOutputStrict(),
+  );
+  const subagentPrompt = buildSubagentTaskPrompt(
+    task,
+    summarizedParentContext,
+    priorHandoff,
+    stateBufferSection,
+    structuredOutput?.promptInstruction,
+  );
   let subagentResult: SubagentResult = { code: 0 };
   let subagentOutputText = "";
   let validationError: string | undefined = undefined;
@@ -113,6 +132,16 @@ async function executeWorkerAttempts(
       }
     } else if (opts.trackRetryState) {
       rt.clearRetry();
+    }
+
+    // A retry must produce a fresh result. Otherwise an output file left by a
+    // previous attempt could make a later non-writing attempt appear valid.
+    if (structuredOutput) {
+      try {
+        fs.rmSync(structuredOutput.outputPath, { force: true });
+      } catch {
+        // The subsequent read reports a precise failure if cleanup/write fails.
+      }
     }
 
     const attemptPrompt = retryFeedback
@@ -183,6 +212,16 @@ async function executeWorkerAttempts(
             task: attemptPrompt,
             agentScope: "both",
             cwd: rt.ctx?.cwd ?? process.cwd(),
+            // P1-1: pass session continuity context so the fallback executor
+            // can use --session <file> instead of --no-session when enabled.
+            artifactRunDir: rt.artifactRunDir,
+            taskIndex: index,
+            workflowRunId: rt.workflowRunId,
+            priorSessionPath: resolvePriorTaskSessionPath(
+              index,
+              task.dependsOn,
+              rt.taskSessionPaths,
+            ),
           },
           attemptAbortController.signal,
           (partial) => {
@@ -298,6 +337,12 @@ async function executeWorkerAttempts(
 
     const resultCode = getSubagentExitCode(result);
     const effectiveModel = result.model || result.details?.results?.[0]?.model;
+    // P1-1: capture the session path from the fallback executor so the next
+    // sequential task can chain from it (when continuity is enabled).
+    const sessionPath = result.details?.results?.[0]?.sessionPath;
+    if (sessionPath) {
+      rt.taskSessionPaths[index] = sessionPath;
+    }
     subagentResult = {
       code: resultCode,
       configuredModel: rt.taskModels[index]?.configured || rt.resolvedWorkerModel,
@@ -318,10 +363,35 @@ async function executeWorkerAttempts(
     subagentOutputText = extractSubagentText(result);
 
     // Validate subagent outputs
-    const validation = validateSubagentOutput(result, task, { allowTextValidation: rt.allowTextValidation });
+    let resultForValidation = result;
+    let strictOutputError: string | undefined;
+    if (structuredOutput && !result.isError) {
+      const fileResult = readStructuredOutputFile(structuredOutput.outputPath);
+      if (fileResult.error) {
+        strictOutputError = fileResult.error;
+      } else {
+        resultForValidation = {
+          ...result,
+          content: [{ type: "text", text: JSON.stringify(fileResult.parsed) }],
+        };
+      }
+    }
+    const validation = strictOutputError
+      ? {
+          valid: false,
+          error: strictOutputError,
+          unresolvedItems: [strictOutputError],
+          schemaParseStatus: "absent" as SchemaParseStatus,
+        }
+      : validateSubagentOutput(resultForValidation, task, {
+          // Strict mode always requires the file-backed JSON contract.
+          allowTextValidation: structuredOutput ? false : rt.allowTextValidation,
+        });
     structuredReport = validation.structuredReport ?? null;
     schemaParseStatus = validation.schemaParseStatus ?? "absent";
-    cachedSubagentResult = result;
+    // Review-phase revalidation must inspect the same file-backed report that
+    // was accepted here, not the worker's optional prose response.
+    cachedSubagentResult = resultForValidation;
     if (!validation.valid) {
       validationError = validation.error || "Output validation failed";
       appendUnique(unresolvedItemsForFailedTask, validation.unresolvedItems || [validationError]);

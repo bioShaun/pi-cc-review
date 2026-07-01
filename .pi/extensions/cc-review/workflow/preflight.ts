@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { ReviewProvider } from "../providers.ts";
+import { getPiSpawnCommand, formatResolvedPiCommand, type PiSpawnCommand } from "./pi-spawn.ts";
 
 export interface PreflightCheckResult {
   ok: boolean;
@@ -11,6 +12,8 @@ export interface PreflightCheckResult {
     provider: ReviewProvider;
     providerCli: string;
     piCli?: string;
+    /** Resolved Pi spawn command for the subagent fallback path (P0-1). */
+    piSpawn?: PiSpawnCommand;
   };
 }
 
@@ -76,9 +79,15 @@ export function runPreflight(options: RunPreflightOptions): PreflightCheckResult
   }
 
   let piCli: string | undefined;
+  let piSpawn: PiSpawnCommand | undefined;
   if (options.checkPi !== false) {
-    piCli = "pi";
-    if (!isExecutableOnPath("pi", env)) {
+    // Resolve the actual spawn command the subagent fallback will use (P0-1).
+    // This surfaces env overrides and package-root resolution in the preflight
+    // report so users can diagnose "wrong Pi binary" failures before the
+    // workflow starts.
+    piSpawn = getPiSpawnCommand(["--mode", "json"], { env });
+    piCli = piSpawn.source === "path_fallback" ? "pi" : piSpawn.command;
+    if (piSpawn.source === "path_fallback" && !isExecutableOnPath("pi", env)) {
       warnings.push(formatMissingCliMessage("pi", options.provider));
     }
   }
@@ -91,6 +100,7 @@ export function runPreflight(options: RunPreflightOptions): PreflightCheckResult
       provider: options.provider,
       providerCli: options.providerCli,
       piCli,
+      piSpawn,
     },
   };
 }
@@ -108,7 +118,14 @@ export function formatPreflightReport(result: PreflightCheckResult): string {
     lines.push("Environment OK.");
     lines.push(`- Provider: \`${result.resolved.provider}\` (\`${result.resolved.providerCli}\` on PATH)`);
     if (result.resolved.piCli) {
-      lines.push(`- Subagent fallback: \`pi\` ${result.warnings.length ? "(not on PATH — in-process subagent only)" : "on PATH"}`);
+      const spawn = result.resolved.piSpawn;
+      if (spawn && spawn.source !== "path_fallback") {
+        // Env override or package-root resolution is active — report the
+        // resolved command so users know which binary will be used.
+        lines.push(`- Subagent fallback: ${formatResolvedPiCommand(spawn)}`);
+      } else {
+        lines.push(`- Subagent fallback: \`pi\` ${result.warnings.length ? "(not on PATH — in-process subagent only)" : "on PATH"}`);
+      }
     }
   } else {
     lines.push("Environment check **failed**:");

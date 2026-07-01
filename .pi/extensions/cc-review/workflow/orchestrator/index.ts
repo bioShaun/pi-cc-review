@@ -201,6 +201,7 @@ export async function runCcReviewWorkflow(
           runId: rt.workflowRunId,
           artifactDir: rt.artifactRunDir,
           batchReviewResult: rt.batchReviewResult,
+          termination: isCancelled ? "cancelled" : "failed",
         })
       );
       rt.refreshWorkflowUi();

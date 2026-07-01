@@ -778,7 +778,7 @@ test("subagent task definition and schema incorporate acceptance criteria", () =
   assert.match(source, /export interface Task \{\n\s+title: string;\n\s+description: string;\n\s+acceptanceCriteria: string;\n\s+\/\*\* 1-based task numbers this task depends on\. Missing means preserve ordered handoff semantics\. \*\/\n\s+dependsOn\?: number\[\];\n\}/);
   assert.match(source, /acceptanceCriteria: \{ type: "string" \}/);
   assert.match(source, /dependsOn:\s*\{\n\s+type: "array",\n\s+items: \{ type: "integer", minimum: 1 \}/);
-  assert.match(source, /required: \["title", "description", "acceptanceCriteria"\]/);
+  assert.match(source, /required: \["title", "description", "acceptanceCriteria", "dependsOn"\]/);
 });
 
 test("parent workflow context is summarized and formatted in subagent prompt", () => {

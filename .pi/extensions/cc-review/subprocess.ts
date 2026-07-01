@@ -2,6 +2,11 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 
+import {
+  attachPostExitStdioGuard,
+  resolvePostExitGuardTimings,
+} from "./workflow/post-exit-stdio-guard.ts";
+
 const require = createRequire(import.meta.url);
 const childProcess = require("node:child_process") as typeof import("node:child_process");
 
@@ -172,6 +177,14 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
   let unregister: (() => void) | undefined;
   if (registerProc) unregister = registerProc(proc);
 
+  // Attach the post-exit stdio guard (P0-2). If a child exits while inherited
+  // descendants keep stdout/stderr open, `close` would never fire and the
+  // promise would hang. The guard destroys unended streams after an idle
+  // window and a hard ceiling post-`exit`, so `close` resolves promptly.
+  // Timers are unref'd so they never keep the event loop alive on their own.
+  const guardTimings = resolvePostExitGuardTimings();
+  let clearGuardTimers = attachPostExitStdioGuard(proc, guardTimings);
+
   const streamMaxBytes = maxStreamBytes ?? resolveSubprocessStreamMaxBytes();
   const stdoutStoreState = createStreamAppendState(streamMaxBytes);
   const stderrStoreState = createStreamAppendState(streamMaxBytes);
@@ -271,6 +284,7 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
       combined = appendStreamText(combined, `\n[spawn error] ${err.message}`, combinedStderrState);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (abortMode === "internal" && signal) signal.removeEventListener("abort", onAbortInternal);
+      clearGuardTimers();
       if (traceCtx) emitTrace(traceCtx, "failure", { phase: "subprocess_start", label, command, error: err.message });
       settled = true;
       if (unregister) unregister();
@@ -283,6 +297,7 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
       resolvedSignal = closeSignal ?? null;
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (abortMode === "internal" && signal) signal.removeEventListener("abort", onAbortInternal);
+      clearGuardTimers();
 
       if (onStdoutLine && stdoutLineRem.length > 0) {
         try {

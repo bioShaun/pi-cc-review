@@ -67,6 +67,8 @@ export interface TaskResult {
   status?: TaskStatus;
   configuredModel?: string;
   effectiveModel?: string;
+  /** P1-3: models attempted during execution (primary + fallbacks), if >1 was used. */
+  attemptedModels?: string[];
 }
 
 export interface BatchTaskExecution {
@@ -117,6 +119,10 @@ export interface SubagentToolResult {
       stderr?: string;
       errorMessage?: string;
       model?: string;
+      /** P1-1: session file path used by the fallback executor (when continuity enabled). */
+      sessionPath?: string;
+      /** P1-1: human-readable session label for artifacts/summaries. */
+      sessionLabel?: string;
     }>;
   };
   isError?: boolean;

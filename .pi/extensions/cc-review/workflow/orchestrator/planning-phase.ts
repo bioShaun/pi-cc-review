@@ -12,6 +12,34 @@ import { buildCcReviewSummaryMeta } from "../summary.ts";
 import { validatePlannerTasks } from "../dependencies.ts";
 import type { WorkflowRuntime, ProcessResult } from "./runtime.ts";
 
+const PLANNER_TASK_SCHEMA = {
+  type: "object",
+  properties: {
+    tasks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          description: { type: "string" },
+          acceptanceCriteria: { type: "string" },
+          dependsOn: {
+            type: "array",
+            items: { type: "integer", minimum: 1 },
+            description: "1-based task numbers that must finish before this task can start; use [] only when independent.",
+          },
+        },
+        // Codex strict structured output requires every property to appear in
+        // required. Independent tasks represent dependsOn explicitly as [].
+        required: ["title", "description", "acceptanceCriteria", "dependsOn"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["tasks"],
+  additionalProperties: false,
+} as const;
+
 export async function runPlanningPhase(rt: WorkflowRuntime): Promise<CcReviewWorkflowResult | undefined> {
     if (rt.resumeCheckpoint && rt.tasks.length > 0) {
       rt.log({
@@ -21,32 +49,7 @@ export async function runPlanningPhase(rt: WorkflowRuntime): Promise<CcReviewWor
       });
     } else {
     // Write out the task breakdown schema
-    const schema = {
-      type: "object",
-      properties: {
-        tasks: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              description: { type: "string" },
-              acceptanceCriteria: { type: "string" },
-              dependsOn: {
-                type: "array",
-                items: { type: "integer", minimum: 1 },
-                description: "1-based task numbers that must finish before this task can start; use [] only when independent.",
-              },
-            },
-            required: ["title", "description", "acceptanceCriteria"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["tasks"],
-      additionalProperties: false,
-    };
-    fs.writeFileSync(rt.schemaPath, JSON.stringify(schema, null, 2), "utf8");
+    fs.writeFileSync(rt.schemaPath, JSON.stringify(PLANNER_TASK_SCHEMA, null, 2), "utf8");
 
     // PHASE 1: Task breakdowns via the selected provider
     rt.transitionToPlanning();
@@ -98,29 +101,7 @@ export async function runPlanningPhase(rt: WorkflowRuntime): Promise<CcReviewWor
         plannerPrompt,
         "",
         "Respond with ONLY a JSON object matching this schema (no markdown fences, no prose):",
-        JSON.stringify({
-          type: "object",
-          properties: {
-            tasks: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  title: { type: "string" },
-                  description: { type: "string" },
-                  acceptanceCriteria: { type: "string" },
-                  dependsOn: {
-                    type: "array",
-                    items: { type: "integer", minimum: 1 },
-                    description: "1-based task numbers that must finish before this task can start; use [] only when independent.",
-                  },
-                },
-                required: ["title", "description", "acceptanceCriteria"],
-              },
-            },
-          },
-          required: ["tasks"],
-        }),
+        JSON.stringify(PLANNER_TASK_SCHEMA),
       ].join("\n");
       plannerArgs.push(claudePlannerPrompt);
     }
