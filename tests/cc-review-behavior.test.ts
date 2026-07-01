@@ -367,12 +367,20 @@ describe("summarizeLogSeverities rolls up CC Review liveLogs into a compact widg
   });
 
   it("is wired into buildCcReviewWidgetLines via formatPhaseSeverityLine", () => {
-    const source = fs.readFileSync(".pi/extensions/cc-review.ts", "utf8");
-    const widgetSection = source.slice(source.indexOf("export function buildCcReviewWidgetLines"));
-    assert.match(
-      widgetSection,
-      /formatPhaseSeverityLine\(state\.currentPhase, state\.liveLogs, \{ theme \}\)/
-    );
+    const liveLogs = [makeEntry("warning", 1)];
+    const expected = formatPhaseSeverityLine("Reviewing", liveLogs);
+    const lines = buildCcReviewWidgetLines({
+      goal: "Verify phase rollup",
+      tasks: [],
+      currentTaskIndex: -1,
+      displayState: "reviewing",
+      currentPhase: "Reviewing",
+      liveLogs,
+      resolvedLogLevel: "debug",
+      persistedLogPath: "/tmp/workflow.log",
+      findingsRollup: emptyFindingsRollup(),
+    });
+    assert.ok(lines.includes(expected));
   });
 });
 

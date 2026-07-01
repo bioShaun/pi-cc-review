@@ -2,18 +2,31 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-const source = fs.readFileSync(".pi/extensions/cc-review.ts", "utf8");
+function readTypeScriptTree(root) {
+  return fs.readdirSync(root, { withFileTypes: true })
+    .flatMap((entry) => {
+      const target = `${root}/${entry.name}`;
+      if (entry.isDirectory()) return readTypeScriptTree(target);
+      return entry.isFile() && entry.name.endsWith(".ts") ? [fs.readFileSync(target, "utf8")] : [];
+    })
+    .join("\n");
+}
+
+const source = [
+  fs.readFileSync(".pi/extensions/cc-review.ts", "utf8"),
+  readTypeScriptTree(".pi/extensions/cc-review"),
+].join("\n");
 const baseline = fs.readFileSync("workflow-baseline.md", "utf8");
 const criteria = fs.readFileSync("workflow-optimization-criteria.md", "utf8");
 const logAudit = fs.readFileSync("docs/plugin-log-surface-audit.md", "utf8");
 const referenceSummary = fs.readFileSync("docs/log-display-reference-patterns.md", "utf8");
 
 test("subprocess runner handles spawn errors and cancellation", () => {
-  assert.match(source, /const runProcess = \(/);
-  assert.match(source, /proc\.on\("error", \(err\) => \{/);
-  assert.match(source, /failed to start: \$\{err\.message\}/);
+  assert.match(source, /export async function runSubprocess\(/);
+  assert.match(source, /proc\.on\("error", \(err: Error\) => \{/);
+  assert.match(source, /failed to start: \$\{subprocessResult\.spawnError\.message\}/);
   assert.match(source, /signal\?\.aborted/);
-  assert.match(source, /reject\(new Error\("Workflow aborted by user"\)\)/);
+  assert.match(source, /throw new Error\("Workflow aborted by user"\)/);
 });
 
 test("slash command notifications tolerate headless contexts", () => {
@@ -704,9 +717,9 @@ test("trace payloads stay minimal and avoid sensitive task content", () => {
 
 test("subprocess executions emit structured start and end trace events without arguments", () => {
   assert.match(source, /source: "subprocess"/);
-  assert.match(source, /label,\n\s+command,\n\s+source: "subprocess"/);
-  assert.match(source, /const exitCode = code \?\? \(closeSignal \? 1 : 0\)/);
-  assert.match(source, /phase: "subprocess_exit"/);
+  assert.match(source, /emitTrace\(traceCtx, "tool_execution_start", \{ label, command, source: "subprocess" \}\)/);
+  assert.match(source, /exitCode: resolvedCode \?\? \(resolvedSignal \? 1 : 0\)/);
+  assert.match(source, /phase: timedOut \? "subprocess_timeout" : "subprocess_exit"/);
   assert.doesNotMatch(source, /emitTrace\([^)]*args/s);
 });
 
@@ -821,12 +834,13 @@ test("improved cancellation and timeout behavior features are present", () => {
   assert.match(source, /const timer = setTimeout\(/);
   assert.match(source, /reject\(new Error\("Workflow aborted by user"\)\)/);
 
-  // Test detached and process groups in runProcess
+  // Test detached and process groups in shared runSubprocess
+  assert.match(source, /export async function runSubprocess\(/);
   assert.match(source, /detached: true/);
   assert.match(source, /timeoutMs\?: number/);
   assert.match(source, /timeoutTimer = setTimeout\(/);
-  assert.match(source, /process\.kill\(-proc\.pid, "SIGTERM"\)/);
-  assert.match(source, /process\.kill\(-proc\.pid, "SIGKILL"\)/);
+  assert.match(source, /sendSignalToProcessGroup\(proc, "SIGTERM"\)/);
+  assert.match(source, /sendSignalToProcessGroup\(proc, "SIGKILL"\)/);
 
   // Test process group termination in onAbort
   assert.match(source, /process\.kill\(-proc\.pid, "SIGTERM"\)/);
@@ -882,8 +896,8 @@ test("regression test for retry exhaustion", () => {
 test("regression test for timeout/cancellation", () => {
   // Verifies that timeouts and abort signals terminate processes and update status
   assert.match(source, /timeoutTimer\s*=\s*setTimeout\(/);
-  assert.match(source, /process\.kill\(-proc\.pid,\s*"SIGTERM"\)/);
-  assert.match(source, /process\.kill\(-proc\.pid,\s*"SIGKILL"\)/);
+  assert.match(source, /sendSignalToProcessGroup\(proc,\s*"SIGTERM"\)/);
+  assert.match(source, /sendSignalToProcessGroup\(proc,\s*"SIGKILL"\)/);
   assert.match(source, /status:\s*"cancelled"/);
 });
 
