@@ -306,7 +306,10 @@ test("README manual verification checklist covers install, default, Claude, mark
     "Old-name repository search",
     "Automated regression commands",
     "node tests/cc-review-static.test.mjs",
+    "node --experimental-strip-types tests/cc-review-structured.test.ts",
+    "node --experimental-strip-types tests/cc-review-ui.test.ts",
     "node --experimental-strip-types tests/cc-review-behavior.test.ts",
+    "npm run typecheck",
     "tsc --noEmit",
   ]) {
     assert.match(readme, new RegExp(requiredTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -698,6 +701,12 @@ test("log-level and log-sources resolvers are exported with the documented signa
   assert.match(source, /logSources: parsedArgs\.logSources/);
   assert.match(source, /--concurrency <n> or --concurrency-limit <n>/);
   assert.match(source, /concurrency: parsedArgs\.concurrency/);
+  assert.match(source, /export function computeDefaultAutoConcurrency\(/);
+  assert.match(source, /export function readAvailableCpuCount\(/);
+  assert.match(source, /cpuCount: readAvailableCpuCount\(process\.env\)/);
+  assert.match(source, /emitTrace\(ctx, "execution_config"/);
+  assert.match(source, /Worker concurrency:/);
+  assert.match(source, /automatically computed from available CPUs, bounded between 1 and 8 and capped by the planned task count/);
 
   assert.match(
     source,
@@ -991,6 +1000,20 @@ test("log surface audit documents addressed log-display gaps", () => {
     "workflow-logs.jsonl` persists the full normalized human-readable log",
   ]) {
     assert.match(logAudit, new RegExp(requiredTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
+test("README documents worker concurrency and execution log defaults", () => {
+  const readme = fs.readFileSync("README.md", "utf8");
+  for (const requiredTerm of [
+    "Worker concurrency (`--concurrency` / `CC_REVIEW_CONCURRENCY`)",
+    "auto-computed from CPU count",
+    "CC_REVIEW_CPU_COUNT",
+    "Execution log file (`--log-file` / `CC_REVIEW_LOG_FILE`)",
+    "workflow-logs-<runId>.jsonl",
+    "no overwrite of prior runs",
+  ]) {
+    assert.match(readme, new RegExp(requiredTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
 });
 

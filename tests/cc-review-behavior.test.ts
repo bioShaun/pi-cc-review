@@ -20,6 +20,7 @@ import ccReviewExtension, {
   classifyCcReviewSummary,
   computeChecklistWindow,
   computeDefaultAutoConcurrency,
+  readAvailableCpuCount,
   countCcReviewTaskOutcomesFromSummary,
   createSubprocessStreamLogger,
   DEFAULT_MAX_REVIEW_REPAIR_ROUNDS,
@@ -753,6 +754,21 @@ describe("resolveReviewMode selects review timing", () => {
       () => resolveReviewMode(undefined, { CC_REVIEW_MODE: "later" } as NodeJS.ProcessEnv),
       /Invalid CC_REVIEW_MODE value "later"/
     );
+  });
+});
+
+describe("readAvailableCpuCount resolves the machine CPU count for auto concurrency", () => {
+  it("reads CC_REVIEW_CPU_COUNT when set to a non-negative integer", () => {
+    assert.equal(readAvailableCpuCount({ CC_REVIEW_CPU_COUNT: "8" } as NodeJS.ProcessEnv), 8);
+    assert.equal(readAvailableCpuCount({ CC_REVIEW_CPU_COUNT: "0" } as NodeJS.ProcessEnv), 0);
+  });
+
+  it("falls back to os.cpus().length when CC_REVIEW_CPU_COUNT is unset or invalid", () => {
+    const expected = os.cpus().length;
+    assert.equal(readAvailableCpuCount({} as NodeJS.ProcessEnv), expected);
+    assert.equal(readAvailableCpuCount({ CC_REVIEW_CPU_COUNT: "" } as NodeJS.ProcessEnv), expected);
+    assert.equal(readAvailableCpuCount({ CC_REVIEW_CPU_COUNT: "many" } as NodeJS.ProcessEnv), expected);
+    assert.equal(readAvailableCpuCount({ CC_REVIEW_CPU_COUNT: "-1" } as NodeJS.ProcessEnv), expected);
   });
 });
 
@@ -5091,6 +5107,42 @@ System prompt override`
       assert.equal(result.details.meta.concurrency, 8, "meta should report the upper-bound concurrency");
       assert.match(result.content[0].text, /- \*Worker concurrency:\* 8/);
       assert.equal(maxConcurrencyObserved, 8, "high CPU counts should be capped at the maximum concurrency");
+    });
+
+    it("caps automatic concurrency to the planned task count after planning", async () => {
+      const { result, maxConcurrencyObserved } = await runAutoConcurrencyScenario({
+        cpuCount: 16,
+        taskCount: 3,
+      });
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.meta.concurrency, 3, "meta should report task-count-capped concurrency");
+      assert.match(result.content[0].text, /- \*Worker concurrency:\* 3/);
+      assert.equal(
+        maxConcurrencyObserved,
+        3,
+        "automatic concurrency should not exceed the number of planned tasks"
+      );
+    });
+
+    it("honors CC_REVIEW_CONCURRENCY over the automatic CPU-based value", async () => {
+      const previousConcurrency = process.env.CC_REVIEW_CONCURRENCY;
+      process.env.CC_REVIEW_CONCURRENCY = "2";
+      try {
+        const { result, maxConcurrencyObserved } = await runAutoConcurrencyScenario({
+          cpuCount: 16,
+          taskCount: 6,
+        });
+        assert.equal(result.isError, undefined);
+        assert.equal(result.details.meta.concurrency, 2, "meta should report the env override");
+        assert.match(result.content[0].text, /- \*Worker concurrency:\* 2/);
+        assert.equal(maxConcurrencyObserved, 2, "CC_REVIEW_CONCURRENCY should cap concurrent execution");
+      } finally {
+        if (previousConcurrency === undefined) {
+          delete process.env.CC_REVIEW_CONCURRENCY;
+        } else {
+          process.env.CC_REVIEW_CONCURRENCY = previousConcurrency;
+        }
+      }
     });
   });
 

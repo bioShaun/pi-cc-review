@@ -93,7 +93,7 @@ Three distinct UI elements display the status of subagent tasks:
 Subagent execution is dependency-aware.
 
 - In `after-all` review mode, `runCcReviewWorkflow` builds execution levels with `buildAfterAllExecutionBatches(tasks)`.
-- Tasks may run concurrently up to `CC_REVIEW_CONCURRENCY`, `--concurrency`, `--concurrency-limit`, or tool params `concurrency` / `concurrencyLimit` (default `4`) only when the planner marks them with explicit compatible `dependsOn` metadata.
+- Tasks may run concurrently up to `CC_REVIEW_CONCURRENCY`, `--concurrency`, `--concurrency-limit`, or tool params `concurrency` / `concurrencyLimit` only when the planner marks them with explicit compatible `dependsOn` metadata. When no explicit limit is configured, the default is auto-computed from `os.cpus().length` (bounded between 1 and 8, capped by the planned task count after planning).
 - Missing `dependsOn` metadata is treated conservatively as an ordered dependency on the previous task, preserving the prior handoff semantics for older plans and sequential workflows.
 - Each dependency batch captures a stable prior-task handoff before launching its tasks, so sibling tasks in the same parallel batch do not race to include one another's partial results.
 

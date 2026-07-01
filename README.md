@@ -36,11 +36,23 @@ Both test suites use Node's native `node:test` runner and do not require externa
 # 1. Run the static verification tests
 node tests/cc-review-static.test.mjs
 
-# 2. Run the behavioral verification tests
+# 2. Run the structured schema tests
+node --experimental-strip-types tests/cc-review-structured.test.ts
+
+# 3. Run the UI regression tests
+node --experimental-strip-types tests/cc-review-ui.test.ts
+
+# 4. Run the behavioral verification tests
 node --experimental-strip-types tests/cc-review-behavior.test.ts
 
-# 3. Run all tests together
-node tests/cc-review-static.test.mjs && node --experimental-strip-types tests/cc-review-behavior.test.ts
+# 5. Run all tests together
+node tests/cc-review-static.test.mjs && \
+  node --experimental-strip-types tests/cc-review-structured.test.ts && \
+  node --experimental-strip-types tests/cc-review-ui.test.ts && \
+  node --experimental-strip-types tests/cc-review-behavior.test.ts
+
+# 6. Strict type-check
+npm run typecheck
 ```
 
 ### 2.2. Review Provider Configuration
@@ -166,11 +178,11 @@ Use this checklist after changes that affect plugin registration, provider selec
 - [ ] **Missing selected-provider setup check**: in a disposable shell, temporarily uninstall the selected provider's CLI (`codex` or `claude`) from `PATH` and confirm the workflow surfaces the CLI's own error in the review step as `completed_with_warnings`. CC Review does not preflight credentials, so unset env vars alone will not trigger a CC Review error — the CLI's login session decides.
 - [ ] **Marketplace/display metadata**: if publishing or packaging outside this repository, inspect the extension listing, marketplace card, screenshots, and generated help text for the **CC Review** name and `cc_review` tool ID.
 - [ ] **Old-name repository search**: run `rg -n "codex[-_ ]workflow|Codex[- ]Workflow" .` and confirm matches are limited to historical migration notes/tests that intentionally describe old names, not active source or user-facing command documentation.
-- [ ] **Automated regression commands**: run `node tests/cc-review-static.test.mjs`, `node --experimental-strip-types tests/cc-review-behavior.test.ts`, and the strict `tsc --noEmit ... .pi/extensions/cc-review.ts` command above.
+- [ ] **Automated regression commands**: run `node tests/cc-review-static.test.mjs`, `node --experimental-strip-types tests/cc-review-structured.test.ts`, `node --experimental-strip-types tests/cc-review-ui.test.ts`, `node --experimental-strip-types tests/cc-review-behavior.test.ts`, and `npm run typecheck` (wraps `tsc --noEmit` via `tsconfig.json`).
 
 ### 2.7. Log Display and Observability
 
-CC Review separates **durable observability** (full history on disk) from **compact live surfaces** (TUI widget and tool `onUpdate` deltas). The persisted `workflow-logs.jsonl` in the workspace root always records every normalized log entry for the run. The compact widget and `onUpdate` stream apply additional presentation rules so long goals, noisy info lines, and verbose bodies do not overwhelm the default view.
+CC Review separates **durable observability** (full history on disk) from **compact live surfaces** (TUI widget and tool `onUpdate` deltas). Each run writes a unique `workflow-logs-<runId>.jsonl` file in the workspace root (or appends to a fixed path when `--log-file` / `CC_REVIEW_LOG_FILE` is set). Consecutive runs never overwrite prior log files unless you explicitly reuse the same fixed path. The compact widget and `onUpdate` stream apply additional presentation rules so long goals, noisy info lines, and verbose bodies do not overwhelm the default view.
 
 #### Minimum log level (`--log-level` / `CC_REVIEW_LOG_LEVEL`)
 
@@ -206,7 +218,7 @@ Optionally restrict compact widget and `onUpdate` logs to a comma-separated allo
 CC_REVIEW_LOG_SOURCES=reviewer,cc-review pi --mode json -p "Use cc_review to implement: <goal>"
 ```
 
-The tool parameter is `logSources`. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered (the persisted `workflow-logs.jsonl` is never filtered).
+The tool parameter is `logSources`. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered (the persisted JSONL log file is never filtered).
 
 #### Compact widget affordances
 
@@ -216,7 +228,7 @@ The tool parameter is `logSources`. Explicit values override the environment, in
 - **Readable provider activity**: Codex JSONL events and Claude Code `stream-json` events are buffered to complete lines and translated into actions such as `Running command`, `Using tool`, `Updated files`, `Thinking`, and `run completed`. Unknown or malformed provider JSON is omitted from the compact display instead of exposing raw payloads.
 - **Summary message renderer**: slash-command completion uses `customType: "cc-review-summary"`. When Pi exposes `registerMessageRenderer` and the TUI primitives are available, the final report renders a compact success/warning/failed/cancelled badge with a one-line headline; expand to read the full markdown body. Headless/test environments without the renderer API keep the existing markdown fallback.
 
-Structured trace output (`emitTrace` → stderr and `workflow-trace.jsonl`) is unchanged: it remains lightweight, redacted, and independent of the human-readable `workflow-logs.jsonl` file.
+Structured trace output (`emitTrace` → stderr and `workflow-trace.jsonl`) is unchanged: it remains lightweight, redacted, and independent of the human-readable persisted JSONL log file.
 
 #### Execution timeouts (`--task-timeout` / `CC_REVIEW_TASK_TIMEOUT_MS`)
 
@@ -258,6 +270,47 @@ CC_REVIEW_MAX_REPAIR_ROUNDS=3 pi --mode json -p "Use the cc_review tool to imple
 
 An explicit `reviewRepairRounds` or `--review-repair-rounds` takes precedence over `CC_REVIEW_MAX_REPAIR_ROUNDS`.
 
+#### Worker concurrency (`--concurrency` / `CC_REVIEW_CONCURRENCY`)
+
+When no explicit limit is configured, CC Review automatically derives the worker parallel count from the available CPUs (`os.cpus().length`, overridable via `CC_REVIEW_CPU_COUNT` for tests). The auto value is bounded between **1** and **8**, then further capped by the number of planned tasks after the planner finishes. Explicit configuration always wins over the automatic policy.
+
+- **Explicit API/tool parameter**: pass `concurrency: 3` or `concurrencyLimit: 3` with the `cc_review` tool call. This takes precedence over `CC_REVIEW_CONCURRENCY`.
+- **Slash command flag**: pass `--concurrency 3`, `--concurrency=3`, `--concurrency-limit 3`, or `--concurrency-limit=3` before or after the goal text.
+- **Environment fallback**: set `CC_REVIEW_CONCURRENCY=3` when no explicit option is supplied.
+- **Default**: when omitted and unset, concurrency is auto-computed from CPU count (bounded 1–8, capped by task count).
+- **Observability**: the final value appears in the `### ⚙️ Execution Configuration` section of the summary report, in `CcReviewSummaryMeta.concurrency`, and in the `execution_config` trace event.
+
+Example commands:
+
+```bash
+# Let CC Review auto-schedule workers (e.g. 6 on a 6-core machine, capped at 8)
+/cc-review Implement the auth refactor
+
+# Cap parallel workers explicitly
+/cc-review --concurrency 2 Implement the auth refactor
+/cc-review --concurrency-limit=4 Implement the auth refactor
+
+# Shell-wide fallback
+export CC_REVIEW_CONCURRENCY=2
+pi --mode json -p "Use the cc_review tool to implement: <goal>"
+
+# Pin CPU count for deterministic tests (does not affect explicit --concurrency)
+CC_REVIEW_CPU_COUNT=4 node --experimental-strip-types tests/cc-review-behavior.test.ts
+```
+
+#### Execution log file (`--log-file` / `CC_REVIEW_LOG_FILE`)
+
+By default, each workflow run creates a unique `workflow-logs-<runId>.jsonl` file in the workspace root. Consecutive runs append to separate files, so prior run history is preserved. To reuse a fixed path across runs (append mode), pass `--log-file <path>` or set `CC_REVIEW_LOG_FILE` (for example `workflow-logs.jsonl`).
+
+```bash
+# Default: unique per-run log file (no overwrite of prior runs)
+/cc-review Implement the feature
+
+# Fixed path: append across runs to the same file
+/cc-review --log-file ./my-cc-review.log.jsonl Implement the feature
+CC_REVIEW_LOG_FILE=./my-cc-review.log.jsonl pi --mode json -p "Use cc_review to implement: <goal>"
+```
+
 ---
 
 ## 3. Strict Architectural Contracts to Preserve
@@ -289,7 +342,7 @@ Any optimization, modification, or refactoring work **must preserve** the follow
 - **Rule**: Workflow steps must be instrumented with minimal trace logging without leaking sensitive file or prompt content.
 - **Contract**: Utilize `emitTrace` to output JSON lines to stderr and `workflow-trace.jsonl` on key events. Payloads must stay lightweight (e.g., logging `goal.length` instead of raw goals, and indexing tasks without copying heavy descriptions).
 - **Subprocess events** (`tool_execution_start`/`tool_execution_end` with `source: "subprocess"`) must not receive content arguments, and must correctly preserve closed process exit codes or signal outcomes.
-- **Human-readable persistence**: normalized entries are also appended to `workflow-logs.jsonl` in the workspace root. This file is never filtered by `--log-level` / `CC_REVIEW_LOG_LEVEL`; only the compact widget and `onUpdate` delta stream honor the resolved minimum severity.
+- **Human-readable persistence**: normalized entries are appended to a per-run `workflow-logs-<runId>.jsonl` file in the workspace root (or to a fixed path when `--log-file` / `CC_REVIEW_LOG_FILE` is set). This file is never filtered by `--log-level` / `CC_REVIEW_LOG_LEVEL`; only the compact widget and `onUpdate` delta stream honor the resolved minimum severity.
 
 ### D. Explicit State Transitions
 - **Rule**: The orchestrator must keep a deterministic record of active execution steps.
