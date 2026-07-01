@@ -63,6 +63,7 @@ import ccReviewExtension, {
   resolveAllowTextValidation,
   writeCheckpoint,
   loadCheckpoint,
+  restoreBatchTaskExecutions,
   resolveCcReviewTracePath,
 } from "../.pi/extensions/cc-review.ts";
 
@@ -2883,12 +2884,21 @@ describe("CC Review Behavioral Regression Tests", () => {
       };
     };
 
+    const statusSnapshots: string[] = [];
     const result = await registeredTool.execute(
       "tool-call-1",
       { goal: "Build a perfect calculator app", reviewMode: "per-task" },
       undefined,
       undefined,
-      { cwd: tempTestDir }
+      {
+        cwd: tempTestDir,
+        ui: {
+          setWidget() {},
+          setStatus: (_id: string, value: string | undefined) => {
+            if (value) statusSnapshots.push(value);
+          },
+        },
+      }
     );
 
     assert.equal(result.isError, undefined);
@@ -2897,6 +2907,10 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(plannerCalls, 1);
     assert.equal(subagentCalls, 2);
     assert.equal(reviewerCalls, 2);
+    assert.ok(
+      statusSnapshots.some((status) => status.includes("Task 1/2 Executing")),
+      "per-task execution should expose the running task in status state"
+    );
 
     const reportText = result.content[0].text;
     assert.match(reportText, /## 🏆 CC Review Orchestrator Report/);
@@ -3204,6 +3218,60 @@ describe("CC Review Behavioral Regression Tests", () => {
       "repair_started",
       "repair_completed",
     ]);
+  });
+
+  it("after-all summaries retain normalized initial-review blockers", async () => {
+    const mockTasks = [
+      { title: "Integrated task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+    const misleadingFixedReview = `Review found issues\n${JSON.stringify({
+      verdict: "ship",
+      summary: "Reviewer incorrectly claimed an existing issue was fixed",
+      findings: [{
+        priority: "P1",
+        confidence: 0.98,
+        message: "existing blocker",
+        status: "fixed",
+        file: "src/integration.ts",
+        line: 12,
+      }],
+    })}`;
+
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      mockProc.autoReviewStdout = false;
+      process.nextTick(() => {
+        if (args.includes("-o")) {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+        } else {
+          mockProc.stdout.emit("data", Buffer.from(misleadingFixedReview));
+        }
+        mockProc.emit("close", 0, null);
+      });
+      return mockProc;
+    };
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    const result = await registeredTool.execute(
+      "tool-call-after-all-normalized-findings",
+      {
+        goal: "Preserve normalized review findings",
+        reviewMode: "after-all",
+        reviewRepairRounds: 0,
+      },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, true);
+    assert.equal(result.details.meta.topBlockers.length, 1);
+    assert.equal(result.details.meta.topBlockers[0].status, "unfixed");
+    assert.match(result.content[0].text, /existing blocker \(unfixed,/);
   });
 
   it("after-all repair reruns failed orchestrator validation after the reviewer fixes it", async () => {
@@ -6100,5 +6168,30 @@ describe("optimization spec: preflight, validation, logs, checkpoint", () => {
     assert.equal(loaded?.goal, "test goal");
     assert.equal(loaded?.tasks.length, 1);
     fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("restores compact after-all executions at their task indices", () => {
+    const task = { title: "B", description: "d", acceptanceCriteria: "a" };
+    const execution = {
+      taskIndex: 1,
+      task,
+      startedAt: "2026-07-01T00:00:00.000Z",
+      subagentResult: { code: 0 },
+      subagentOutputText: "done",
+      cachedSubagentResult: {},
+      structuredReport: null,
+      schemaParseStatus: "absent",
+      result: {
+        title: task.title,
+        description: task.description,
+        executionCode: 0,
+        reviewCode: -1,
+        status: "completed",
+      },
+    } as const;
+
+    const restored = restoreBatchTaskExecutions([execution]);
+    assert.equal(restored[0], undefined);
+    assert.equal(restored[1], execution);
   });
 });

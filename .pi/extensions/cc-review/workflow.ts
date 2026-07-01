@@ -44,6 +44,7 @@ export {
   formatResumeInstructions,
   loadCheckpoint,
   listResumableRunIds,
+  restoreBatchTaskExecutions,
   resolveTasksToSkipOnResume,
   writeCheckpoint,
   writePlanArtifact,

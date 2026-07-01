@@ -9,6 +9,7 @@ import { extractAssistantTextFromStream } from "../stream-format.ts";
 import { delay } from "../util.ts";
 import type { CcReviewWorkflowResult } from "../types.ts";
 import { buildCcReviewSummaryMeta } from "../summary.ts";
+import { validatePlannerTasks } from "../dependencies.ts";
 import type { WorkflowRuntime, ProcessResult } from "./runtime.ts";
 
 export async function runPlanningPhase(rt: WorkflowRuntime): Promise<CcReviewWorkflowResult | undefined> {
@@ -244,10 +245,11 @@ export async function runPlanningPhase(rt: WorkflowRuntime): Promise<CcReviewWor
 
       try {
         const outputData = JSON.parse(rawPlanJson);
-        rt.tasks = Array.isArray(outputData?.tasks) ? outputData.tasks : [];
-        if (rt.tasks.length === 0) {
-          throw new Error(`${rt.reviewProviderConfig.label} returned an empty task list`);
+        const validation = validatePlannerTasks(outputData);
+        if (!validation.ok) {
+          throw new Error(`${rt.reviewProviderConfig.label} planner: ${validation.error}`);
         }
+        rt.tasks = validation.tasks;
         break;
       } catch (err: any) {
         if (attempt < maxPlanRetries) {

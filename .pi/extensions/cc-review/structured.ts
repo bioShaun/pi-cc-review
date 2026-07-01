@@ -803,27 +803,56 @@ export function mergeRollupFindings(taskFindings: ReviewFinding[][]): ReviewFind
 
 export function buildSummaryMeta(
   taskResults: Array<{ status?: TaskStatus; reviewResult?: ReviewResult | null }>,
-  options?: { concurrency?: number }
+  options?: { concurrency?: number; batchReviewResult?: { reviewResult?: ReviewResult | null } }
 ): CcReviewSummaryMeta {
   const taskOutcomes = { review_blocked: 0, failed: 0, warning: 0, completed: 0, cancelled: 0 };
   const blockers: ReviewFinding[] = [];
-  for (const result of taskResults) {
-    if (result.status === "review_blocked") taskOutcomes.review_blocked += 1;
-    else if (result.status === "failed" || result.status === "validation_failed") {
-      taskOutcomes.failed += 1;
-    } else if (result.status === "cancelled") {
-      taskOutcomes.cancelled += 1;
-    } else if (result.status === "completed_with_warnings" || result.status === "skipped") {
-      taskOutcomes.warning += 1;
-    } else if (result.status === "completed") {
-      taskOutcomes.completed += 1;
-    }
-    for (const finding of result.reviewResult?.findings ?? []) {
+
+  // In after-all mode, findings come from the batch review result (R8);
+  // in per-task mode, findings come from individual task results.
+  const batchFindings = options?.batchReviewResult?.reviewResult?.findings;
+  if (batchFindings) {
+    for (const finding of batchFindings) {
       if ((finding.priority === "P0" || finding.priority === "P1") && finding.status === "unfixed") {
         blockers.push(finding);
       }
     }
+  } else {
+    for (const result of taskResults) {
+      if (result.status === "review_blocked") taskOutcomes.review_blocked += 1;
+      else if (result.status === "failed" || result.status === "validation_failed") {
+        taskOutcomes.failed += 1;
+      } else if (result.status === "cancelled") {
+        taskOutcomes.cancelled += 1;
+      } else if (result.status === "completed_with_warnings" || result.status === "skipped") {
+        taskOutcomes.warning += 1;
+      } else if (result.status === "completed") {
+        taskOutcomes.completed += 1;
+      }
+      for (const finding of result.reviewResult?.findings ?? []) {
+        if ((finding.priority === "P0" || finding.priority === "P1") && finding.status === "unfixed") {
+          blockers.push(finding);
+        }
+      }
+    }
   }
+
+  // When using batch findings, still need to count task outcomes
+  if (batchFindings) {
+    for (const result of taskResults) {
+      if (result.status === "review_blocked") taskOutcomes.review_blocked += 1;
+      else if (result.status === "failed" || result.status === "validation_failed") {
+        taskOutcomes.failed += 1;
+      } else if (result.status === "cancelled") {
+        taskOutcomes.cancelled += 1;
+      } else if (result.status === "completed_with_warnings" || result.status === "skipped") {
+        taskOutcomes.warning += 1;
+      } else if (result.status === "completed") {
+        taskOutcomes.completed += 1;
+      }
+    }
+  }
+
   return {
     taskOutcomes,
     topBlockers: sortReviewFindings(blockers).slice(0, 3),

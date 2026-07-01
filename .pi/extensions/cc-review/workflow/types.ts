@@ -2,6 +2,7 @@ import type { CcReviewLogSeverity } from "../config.ts";
 import type {
   BlockReason,
   CcReviewSummaryMeta,
+  ReviewParseStatus,
   ReviewResult,
   ReviewVerdict,
   SchemaParseStatus,
@@ -80,6 +81,20 @@ export interface BatchTaskExecution {
   structuredReport: SubagentStructuredReport | null;
   schemaParseStatus: SchemaParseStatus;
   result: TaskResult;
+}
+
+/** First-class batch (workflow-level) review result for after-all mode (R8). */
+export interface BatchReviewResult {
+  reviewResult: ReviewResult | null;
+  reportedVerdict: ReviewVerdict | null;
+  effectiveVerdict: ReviewVerdict;
+  blockReason: BlockReason | null;
+  reviewerExitCode: number;
+  reviewerExitDiagnostic?: string;
+  reviewParseStatus: ReviewParseStatus;
+  /** Whether post-review validation was required and its outcome. */
+  postReviewValidationPassed: boolean;
+  postReviewValidationError: string | null;
 }
 
 export class WorkflowError extends Error {

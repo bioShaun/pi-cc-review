@@ -5,7 +5,7 @@ import { buildSummaryMeta, sortReviewFindings } from "../structured.ts";
 import type { Task } from "./dependencies.ts";
 import { formatResumeInstructions } from "./checkpoint.ts";
 import { summarizeValidationParseFailures } from "./validation.ts";
-import type { TaskResult } from "./types.ts";
+import type { BatchReviewResult, TaskResult } from "./types.ts";
 import type { TaskModelState } from "./ui.ts";
 
 export interface CcReviewTaskOutcomeCounts {
@@ -126,7 +126,7 @@ export function buildSummaryReport(
   goal: string,
   taskResults: TaskResult[],
   tasks: Task[],
-  options?: { concurrency?: number; runId?: string; artifactDir?: string; parseFailureLines?: string[] }
+  options?: { concurrency?: number; runId?: string; artifactDir?: string; parseFailureLines?: string[]; batchReviewResult?: BatchReviewResult }
 ): string {
   const results = [...taskResults];
   for (let j = results.length; j < tasks.length; j++) {
@@ -191,8 +191,13 @@ export function buildSummaryReport(
     summaryMarkdown += `\n`;
   }
 
+  // Use batch review result findings when available (after-all mode, R8);
+  // otherwise fall back to per-task reviewResult findings (per-task mode).
+  const batchFindings = options?.batchReviewResult?.reviewResult?.findings ?? [];
   const rollupFindings = sortReviewFindings(
-    results.flatMap((taskResult) => taskResult.reviewResult?.findings ?? [])
+    batchFindings.length > 0
+      ? batchFindings
+      : results.flatMap((taskResult) => taskResult.reviewResult?.findings ?? [])
   );
   if (rollupFindings.length > 0) {
     summaryMarkdown += `### 🔎 Review Findings\n\n`;
@@ -263,6 +268,9 @@ export function buildSummaryReport(
   return summaryMarkdown;
 }
 
-export function buildCcReviewSummaryMeta(taskResults: TaskResult[], options?: { concurrency?: number }): CcReviewSummaryMeta {
+export function buildCcReviewSummaryMeta(
+  taskResults: TaskResult[],
+  options?: { concurrency?: number; batchReviewResult?: BatchReviewResult }
+): CcReviewSummaryMeta {
   return buildSummaryMeta(taskResults, options);
 }

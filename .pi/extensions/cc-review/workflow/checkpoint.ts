@@ -3,7 +3,7 @@ import * as path from "node:path";
 
 import { getArtifactRunDir, WORKFLOW_ARTIFACT_DIR, type TaskStatus } from "../structured.ts";
 import type { Task } from "./dependencies.ts";
-import type { TaskResult } from "./types.ts";
+import type { BatchReviewResult, BatchTaskExecution, TaskResult } from "./types.ts";
 import type { WorkflowRunStateBuffer } from "./session.ts";
 
 export const CHECKPOINT_FILE_NAME = "checkpoint.json";
@@ -26,6 +26,10 @@ export interface WorkflowCheckpoint {
   /** Optional resume hint when workflow stopped mid-run. */
   resumeHint?: string;
   stateBuffer?: WorkflowRunStateBuffer;
+  /** Persisted after-all execution snapshots for resume (after-all mode only). */
+  batchTaskExecutions?: BatchTaskExecution[];
+  /** Persisted batch review result for resume (after-all mode only). */
+  batchReviewResult?: BatchReviewResult;
 }
 
 export interface WorkflowPlanArtifact {
@@ -133,6 +137,23 @@ export function resolveTasksToSkipOnResume(
     }
   }
   return skip;
+}
+
+/**
+ * Rebuild the sparse, task-indexed execution array from its compact checkpoint
+ * representation. Parallel cancellation can leave gaps, so array position is
+ * not a reliable substitute for taskIndex.
+ */
+export function restoreBatchTaskExecutions(
+  executions: readonly BatchTaskExecution[] | undefined
+): BatchTaskExecution[] {
+  const restored: BatchTaskExecution[] = [];
+  for (const execution of executions ?? []) {
+    if (execution && Number.isInteger(execution.taskIndex) && execution.taskIndex >= 0) {
+      restored[execution.taskIndex] = execution;
+    }
+  }
+  return restored;
 }
 
 export function formatResumeInstructions(cwd: string, runId: string): string {

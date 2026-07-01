@@ -141,7 +141,7 @@ export async function runCcReviewWorkflow(
         );
         rt.rollupEmitted = true;
       }
-      if (!rt.rollupEmitted && isCancelled && rt.reviewedTaskCount > 0) {
+      if (!rt.rollupEmitted && isCancelled && rt.hasCompletedReview) {
         const rollupFindings = mergeRollupFindings(rt.collectedTaskFindings);
         const lastArtifact =
           rt.taskResults[rt.taskResults.length - 1]?.artifactPath ??
@@ -200,10 +200,11 @@ export async function runCcReviewWorkflow(
           concurrency: rt.resolvedConcurrency,
           runId: rt.workflowRunId,
           artifactDir: rt.artifactRunDir,
+          batchReviewResult: rt.batchReviewResult,
         })
       );
       rt.refreshWorkflowUi();
-      throw new WorkflowError(err.message, summary, buildCcReviewSummaryMeta(rt.taskResults, { concurrency: rt.resolvedConcurrency }));
+      throw new WorkflowError(err.message, summary, buildCcReviewSummaryMeta(rt.taskResults, { concurrency: rt.resolvedConcurrency, batchReviewResult: rt.batchReviewResult }));
     } finally {
       try {
         fs.rmSync(rt.tempDir, { recursive: true, force: true });

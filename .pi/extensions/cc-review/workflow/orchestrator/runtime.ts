@@ -37,6 +37,7 @@ import type { Task } from "../dependencies.ts";
 import {
   formatResumeInstructions,
   loadCheckpoint,
+  restoreBatchTaskExecutions,
   resolveTasksToSkipOnResume,
   writeCheckpoint,
   type WorkflowCheckpoint,
@@ -59,6 +60,7 @@ import {
 } from "../session.ts";
 import {
   type BatchTaskExecution,
+  type BatchReviewResult,
   type RunCcReviewWorkflowOptions,
   type TaskResult,
   WorkflowError,
@@ -144,7 +146,10 @@ export interface WorkflowRuntime {
   taskModels: TaskModelState[];
   collectedTaskFindings: ReviewFinding[][];
   rollupEmitted: boolean;
-  reviewedTaskCount: number;
+  /** Whether at least one review result has been processed (R7). */
+  hasCompletedReview: boolean;
+  /** First-class batch review result (after-all mode only). Undefined in per-task mode (R8). */
+  batchReviewResult: BatchReviewResult | undefined;
   artifactRunDir: string;
   log: (input: CcReviewLogInput) => void;
   persistRunCheckpoint: (phase: WorkflowCheckpoint["phase"]) => void;
@@ -198,6 +203,127 @@ export interface WorkflowRuntime {
   runVerificationCommand: RunVerificationCommand;
 }
 
+/**
+ * Class implementation of WorkflowRuntime (R6).
+ *
+ * Replaces the former `const rt = {} as WorkflowRuntime` pattern that defeated
+ * TypeScript initialization checking. With a class, if a field is added to the
+ * interface but not declared on the class, TypeScript reports an error.
+ * Fields use `!` (definite assignment assertion) because they are assigned
+ * incrementally in `createWorkflowRuntime` rather than in a constructor.
+ */
+class WorkflowRuntimeImpl implements WorkflowRuntime {
+  // Configuration & context
+  pi!: ExtensionAPI;
+  goal!: string;
+  ctx!: any;
+  onUpdate?: (partial: any) => void;
+  signal?: AbortSignal;
+  options!: RunCcReviewWorkflowOptions;
+  reviewProviderConfig!: ReturnType<typeof resolveReviewProviderConfig>;
+  reviewMode!: ReturnType<typeof resolveReviewMode>;
+  resolvedLogLevel!: CcReviewLogSeverity;
+  resolvedLogSources!: string[] | undefined;
+  resolvedWidgetLogLines!: number;
+  resolvedChecklistWindow!: number;
+  resolvedTaskTimeoutMs!: number;
+  resolvedPlannerTimeoutMs!: number;
+  resolvedReviewerTimeoutMs!: number;
+  maxReviewRepairRounds!: number;
+  resolvedConcurrency!: number;
+  concurrencyResolution!: ReturnType<typeof resolveCcReviewConcurrency>;
+  allowTextValidation!: boolean;
+  workflowCwd!: string;
+  workflowRunId!: string;
+  resumeCheckpoint!: WorkflowCheckpoint | undefined;
+  skipTaskIndices!: Set<number>;
+  runStateBuffer!: ReturnType<typeof emptyStateBuffer>;
+  checkpointCreatedAt!: string;
+  tempDir!: string;
+  schemaPath!: string;
+  outputPath!: string;
+  logFilePath!: string;
+  persistedLogState!: PersistedLogState;
+  artifactRunDir!: string;
+  workerAgent!: ReturnType<typeof discoverAgent>;
+  resolvedWorkerModel!: string | undefined;
+  verificationPlan!: VerificationPlan | null;
+
+  // Runtime state
+  activeProcesses!: Set<any>;
+  currentTaskIndex!: number;
+  tasks!: Task[];
+  taskResults!: TaskResult[];
+  batchTaskExecutions!: BatchTaskExecution[];
+  currentPhase!: string;
+  displayState!: CcReviewDisplayState;
+  retryState!: { attempt: number; maxAttempts: number } | undefined;
+  lastTaskWarning!: string | undefined;
+  liveLogs!: CcReviewLogEntry[];
+  logSequence!: number;
+  taskStatuses!: Array<TaskStatus | "running" | undefined>;
+  taskModels!: TaskModelState[];
+  collectedTaskFindings!: ReviewFinding[][];
+  findingsRollup!: CcReviewFindingsRollup;
+  rollupEmitted!: boolean;
+  hasCompletedReview!: boolean;
+  batchReviewResult!: BatchReviewResult | undefined;
+  preRetryDisplayState!: CcReviewDisplayState | undefined;
+
+  // Resolver metadata
+  logLevelResolution!: ReturnType<typeof resolveCcReviewLogLevel>;
+  logSourcesResolution!: ReturnType<typeof resolveCcReviewLogSources>;
+  taskTimeoutResolution!: ReturnType<typeof resolveSubagentTaskTimeout>;
+
+  // Methods (assigned as closures in createWorkflowRuntime)
+  log!: (input: CcReviewLogInput) => void;
+  persistRunCheckpoint!: (phase: WorkflowCheckpoint["phase"]) => void;
+  wrapWorkflowSummary!: (summary: string) => string;
+  emitFindingsMessage!: (payload: CcReviewFindingsPayload) => Promise<void>;
+  writeTaskArtifactForIndex!: (input: {
+    taskIndex: number;
+    task: Task;
+    startedAt: string;
+    completedAt: string;
+    execution: TaskArtifact["execution"];
+    review: TaskArtifact["review"];
+    validation: TaskArtifact["validation"];
+    postReviewValidation: TaskArtifact["postReviewValidation"];
+    workflow: TaskArtifact["workflow"];
+  }) => string;
+  getTaskOrThrow!: (index: number) => Task;
+  transitionToPlanning!: () => void;
+  setPlannedTasks!: (plannedTasks: Task[]) => void;
+  updateExecutionPhase!: () => void;
+  transitionToExecuting!: (index: number) => void;
+  transitionToReviewing!: (index: number) => void;
+  transitionToBatchReviewing!: () => void;
+  noteRetry!: (attempt: number, maxAttempts: number) => void;
+  clearRetry!: () => void;
+  abortWorkflow!: (reason?: string) => void;
+  failWorkflow!: (reason?: string) => void;
+  noteReviewWarning!: (warningMessage: string) => void;
+  transitionToComplete!: () => void;
+  recordTaskResult!: (taskIndex: number, result: TaskResult, structured?: SubagentStructuredReport | null) => void;
+  buildTaskResultModelState!: (index: number, fallback?: { configuredModel?: string; effectiveModel?: string }) => {
+    configuredModel?: string;
+    effectiveModel?: string;
+  };
+  throwIfAborted!: () => void;
+  refreshWorkflowUi!: () => void;
+  runProcess!: (
+    label: string,
+    command: string,
+    args: string[],
+    onStdout: (data: Buffer) => void,
+    onStderr: (data: Buffer) => void,
+    timeoutMs?: number
+  ) => Promise<ProcessResult>;
+  runReviewerProcess!: (label: string, command: string, args: string[]) => Promise<ProcessResult>;
+  onAbort!: () => void;
+  runVerificationCommand!: RunVerificationCommand;
+}
+
 export function createWorkflowRuntime(
   pi: ExtensionAPI,
   goal: string,
@@ -206,7 +332,7 @@ export function createWorkflowRuntime(
   signal: AbortSignal | undefined,
   options: RunCcReviewWorkflowOptions
 ): WorkflowRuntime {
-  const rt = {} as WorkflowRuntime;
+  const rt = new WorkflowRuntimeImpl();
   rt.pi = pi;
   rt.goal = goal;
   rt.ctx = ctx;
@@ -344,7 +470,8 @@ export function createWorkflowRuntime(
   rt.taskModels = [];
   rt.collectedTaskFindings = [];
   rt.rollupEmitted = false;
-  rt.reviewedTaskCount = 0;
+  rt.hasCompletedReview = false;
+  rt.batchReviewResult = undefined;
   rt.artifactRunDir = getArtifactRunDir(rt.workflowCwd, rt.workflowRunId);
 
   if (rt.resumeCheckpoint) {
@@ -352,6 +479,13 @@ export function createWorkflowRuntime(
     for (const prior of rt.resumeCheckpoint.taskResults) {
       rt.taskResults.push(prior);
     }
+    // Restore after-all execution snapshots so final review can process
+    // completed tasks without re-running their workers (R1).
+    rt.batchTaskExecutions = restoreBatchTaskExecutions(
+      rt.resumeCheckpoint.batchTaskExecutions
+    );
+    // Restore batch review result if the review phase had already completed (R8).
+    rt.batchReviewResult = rt.resumeCheckpoint.batchReviewResult ?? undefined;
     for (let index = 0; index < rt.tasks.length; index++) {
       const prior = rt.resumeCheckpoint.taskResults[index];
       if (prior?.status) {
@@ -390,6 +524,11 @@ export function createWorkflowRuntime(
       phase,
       stateBuffer: rt.runStateBuffer,
       resumeHint: formatResumeInstructions(rt.workflowCwd, rt.workflowRunId),
+      // Persist after-all execution snapshots so resume can reconstruct
+      // the final-review input collection without re-running workers (R1).
+      batchTaskExecutions: rt.batchTaskExecutions.filter(Boolean),
+      // Persist batch review result so resume can skip re-reviewing (R8).
+      batchReviewResult: rt.batchReviewResult,
     });
     persistStateBuffer(rt.workflowCwd, rt.runStateBuffer);
   };
@@ -533,7 +672,10 @@ export function createWorkflowRuntime(
     });
   };
 
-  rt.updateExecutionPhase = () => {
+  // Shared display-state derivation from the canonical taskStatuses array (R2).
+  // `currentTaskIndex` is documented as the lowest running task index when
+  // multiple tasks execute concurrently.
+  const refreshExecutionDisplaysFromStatuses = () => {
     const runningIndices = rt.taskStatuses
       .map((status, idx) => (status === "running" ? idx : -1))
       .filter((idx) => idx !== -1);
@@ -550,29 +692,21 @@ export function createWorkflowRuntime(
       rt.displayState = "executing";
       rt.currentPhase = `Executing Task ${index + 1}/${rt.tasks.length}: ${task.title}`;
     }
+    // When no tasks are running, leave display state unchanged (the caller
+    // may be transitioning to reviewing/complete which sets its own state).
+  };
+
+  rt.updateExecutionPhase = () => {
+    refreshExecutionDisplaysFromStatuses();
   };
 
   rt.transitionToExecuting = (index: number) => {
     const task = rt.getTaskOrThrow(index);
-    rt.currentTaskIndex = index;
+    rt.taskStatuses[index] = "running";
     setTaskConfiguredModel(rt.taskModels, index, rt.resolvedWorkerModel);
-
-    const runningIndices = rt.taskStatuses
-      .map((status, idx) => (status === "running" ? idx : -1))
-      .filter((idx) => idx !== -1);
-
-    if (runningIndices.length > 1) {
-      rt.displayState = "executing";
-      rt.retryState = undefined;
-      rt.currentTaskIndex = runningIndices[0];
-      const taskNumbers = runningIndices.map(idx => idx + 1).join(", ");
-      rt.currentPhase = `Executing Tasks ${taskNumbers} concurrently`;
-    } else {
-      rt.currentTaskIndex = index;
-      rt.displayState = "executing";
-      rt.retryState = undefined;
-      rt.currentPhase = `Executing Task ${index + 1}/${rt.tasks.length}: ${task.title}`;
-    }
+    rt.retryState = undefined;
+    // Delegate display derivation to the shared helper (R2).
+    refreshExecutionDisplaysFromStatuses();
 
     rt.log({
       severity: "info",

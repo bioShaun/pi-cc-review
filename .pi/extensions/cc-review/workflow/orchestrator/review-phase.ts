@@ -17,6 +17,7 @@ import type { Task } from "../dependencies.ts";
 import { extractAssistantTextFromStream } from "../stream-format.ts";
 import { validateSubagentOutput } from "../validation.ts";
 import type { CcReviewWorkflowResult } from "../types.ts";
+import type { BatchReviewResult } from "../types.ts";
 import { WorkflowError } from "../types.ts";
 import { buildCcReviewSummaryMeta, buildSummaryReport } from "../summary.ts";
 import { buildRepairFeedback } from "../review.ts";
@@ -66,9 +67,10 @@ export async function finishWorkflow(rt: WorkflowRuntime): Promise<CcReviewWorkf
           concurrency: rt.resolvedConcurrency,
           runId: rt.workflowRunId,
           artifactDir: rt.artifactRunDir,
+          batchReviewResult: rt.batchReviewResult,
         })
       ),
-      meta: buildCcReviewSummaryMeta(rt.taskResults, { concurrency: rt.resolvedConcurrency }),
+      meta: buildCcReviewSummaryMeta(rt.taskResults, { concurrency: rt.resolvedConcurrency, batchReviewResult: rt.batchReviewResult }),
     };
 }
 
@@ -298,18 +300,37 @@ export async function runReviewPhase(rt: WorkflowRuntime): Promise<CcReviewWorkf
         });
         lastArtifactPath = artifactPath;
         rt.taskStatuses[execution.taskIndex] = batchStatus;
+        // Store shared verdict/status on every task but do NOT copy the
+        // batch review payload to any task — it lives in rt.batchReviewResult (R8).
         Object.assign(execution.result, {
           reviewCode: reviewProcessResult.exitCode,
           reviewWarningName: rt.reviewProviderConfig.warningName,
           status: batchStatus,
           artifactPath,
-          reviewResult: index === 0 ? reviewResultObject ?? undefined : undefined,
+          reviewResult: undefined,
           reportedVerdict,
           effectiveVerdict,
           blockReason: derived.blockReason,
           reviewerExitDiagnostic,
         });
       }
+
+      // Set the first-class batch review result so summary/meta/resume
+      // consume findings exactly once (R8). Replaces the former task-0
+      // ownership convention.
+      rt.batchReviewResult = {
+        reviewResult: reviewResultObject
+          ? { ...reviewResultObject, findings }
+          : null,
+        reportedVerdict,
+        effectiveVerdict,
+        blockReason: derived.blockReason ?? null,
+        reviewerExitCode: reviewProcessResult.exitCode,
+        reviewerExitDiagnostic,
+        reviewParseStatus: parsedReview.status,
+        postReviewValidationPassed: postReview.passed,
+        postReviewValidationError: postReview.error ?? null,
+      } satisfies BatchReviewResult;
 
       await rt.emitFindingsMessage(
         buildFindingsPayload({
@@ -325,7 +346,7 @@ export async function runReviewPhase(rt: WorkflowRuntime): Promise<CcReviewWorkf
       );
       rt.collectedTaskFindings.push(findings);
       rt.findingsRollup = updateFindingsRollup(rt.findingsRollup, effectiveVerdict, findings);
-      rt.reviewedTaskCount = 1;
+      rt.hasCompletedReview = true;
       rt.refreshWorkflowUi();
 
       if (effectiveVerdict === "block") {
@@ -335,12 +356,13 @@ export async function runReviewPhase(rt: WorkflowRuntime): Promise<CcReviewWorkf
             concurrency: rt.resolvedConcurrency,
             runId: rt.workflowRunId,
             artifactDir: rt.artifactRunDir,
+            batchReviewResult: rt.batchReviewResult,
           })
         );
         throw new WorkflowError(
           `Blocked by final workflow review (after ${rt.maxReviewRepairRounds} repair round(s))`,
           summary,
-          buildCcReviewSummaryMeta(rt.taskResults, { concurrency: rt.resolvedConcurrency })
+          buildCcReviewSummaryMeta(rt.taskResults, { concurrency: rt.resolvedConcurrency, batchReviewResult: rt.batchReviewResult })
         );
       }
       break BATCH_REPAIR_LOOP;

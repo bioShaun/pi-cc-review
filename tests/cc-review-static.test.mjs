@@ -58,7 +58,7 @@ test("slash command notifications tolerate headless contexts", () => {
 test("workflow summary preserves warning exit codes", () => {
   assert.match(source, /interface TaskResult/);
   assert.match(source, /const taskResults: TaskResult\[\] = \[\]/);
-  assert.match(source, /executionCode: subagentResult\.code/);
+  assert.match(source, /executionCode:.*subagentResult\.code/);
   assert.match(source, /reviewCode: reviewProcessResult\.exitCode/);
   assert.match(source, /Completed with warnings \(subagent exit/);
 });
@@ -789,13 +789,13 @@ test("parent workflow context is summarized and formatted in subagent prompt", (
     source,
     /function buildSubagentTaskPrompt\(\s*task: Task,\s*parentContextSummary: string,\s*priorTaskHandoff[^)]*\): string/
   );
-  assert.match(source, /const summarizedParentContext = summarizeParentContext\(goal\);/);
+  assert.match(source, /summarizeParentContext\(rt\.goal\)/);
   // The runtime now derives a structured handoff from accumulated taskResults
   // and forwards it when building the per-task prompt (with optional state buffer).
-  assert.match(source, /priorTaskHandoffFromResults\(taskResults\)/);
-  assert.match(source, /const batchPriorResults = taskResults\.filter\(/);
-  assert.match(source, /priorTaskHandoffFromResults\(batchPriorResults\)/);
-  assert.match(source, /buildAfterAllExecutionBatches\(tasks\)/);
+  assert.match(source, /priorTaskHandoffFromResults\(/);
+  assert.match(source, /const batchPriorResults = rt\.taskResults\.filter\(/);
+  assert.match(source, /priorResults: batchPriorResults/);
+  assert.match(source, /buildAfterAllExecutionBatches\(rt\.tasks\)/);
   assert.match(
     source,
     /const subagentPrompt = buildSubagentTaskPrompt\(task, summarizedParentContext, priorHandoff, stateBufferSection\);/
@@ -826,7 +826,7 @@ test("workflow handles partial results and surfaces unresolved items determinist
 });
 
 test("subagent failures are retried with structured feedback instead of thrown immediately", () => {
-  assert.match(source, /let retryFeedback: string \| undefined = undefined/);
+  assert.match(source, /let retryFeedback: string \| undefined/);
   assert.match(source, /const attemptPrompt = retryFeedback/);
   assert.match(source, /Previous attempt feedback:/);
   assert.match(source, /Resolve the previous attempt's errors or unresolved items before reporting completion/);
@@ -881,9 +881,9 @@ test("improved cancellation and timeout behavior features are present", () => {
   assert.match(source, /process\.kill\(-pid, "SIGKILL"\)/);
 
   // Test subagent task timeout (now configurable, was hardcoded 300000)
-  assert.match(source, /const taskAbortController = new AbortController\(\)/);
-  assert.match(source, /const subagentTimeoutMs = resolvedTaskTimeoutMs/);
-  assert.match(source, /taskAbortController\.abort\(new Error\(`Subagent execution timed out/);
+  assert.match(source, /const attemptAbortController = new AbortController\(\)/);
+  assert.match(source, /const subagentTimeoutMs = rt\.resolvedTaskTimeoutMs/);
+  assert.match(source, /attemptAbortController\.abort\(new Error\(`Subagent execution timed out/);
 
   // Test pending state marking consistently when cancellation happens
   assert.match(source, /status\?: TaskStatus/);
