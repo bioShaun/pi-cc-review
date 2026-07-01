@@ -1,81 +1,63 @@
 {
   "schema": "sprint-contract-v1",
   "story": {
-    "title": "Run the complete regression suite",
-    "description": "Verify the renderer, structured metadata, widget state, static assertions, and documentation changes together using the repository’s documented validation commands."
+    "title": "Capture the effective worker model and show it in the summary",
+    "description": "Extend the subagent execution result with optional model information. Use the configured worker model from frontmatter/settings, update it from Pi JSON events when available, display it in the summary report, and ensure missing metadata remains non-fatal."
   },
   "project_file_index": [
     {
       "path": ".pi/extensions/cc-review.ts",
-      "role": "Extension entry point containing registered slash commands, tools, and their respective help texts."
-    },
-    {
-      "path": "README.md",
-      "role": "User-facing usage and command/tool parameter documentation."
-    },
-    {
-      "path": "tests/cc-review-static.test.mjs",
-      "role": "Static assertion test suite."
+      "role": "Extension entry point containing registered slash commands, tools, and orchestration logic."
     },
     {
       "path": "tests/cc-review-behavior.test.ts",
       "role": "Behavioral integration test suite."
-    },
-    {
-      "path": "tests/cc-review-ui.test.ts",
-      "role": "UI widget and message renderer test suite."
-    },
-    {
-      "path": "tests/cc-review-structured.test.ts",
-      "role": "Structured report processing and parsing test suite."
     }
   ],
   "definition_of_done": [
     {
       "id": "DOD-1",
-      "description": "Verify that static test assertions pass successfully.",
+      "description": "Verify model capture from configured frontmatter and settings.",
       "edge_cases": [
-        "Docs and command help strings match requirements",
-        "Command arguments are parsed and typed correctly"
+        "Uses frontmatter model by default",
+        "Settings override takes precedence"
       ],
-      "verify_command": "node tests/cc-review-static.test.mjs",
-      "timeout_ms": 30000
+      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
+      "timeout_ms": 60000
     },
     {
       "id": "DOD-2",
-      "description": "Verify that behavioral integration tests pass successfully.",
+      "description": "Verify model update from runtime Pi JSON events (like model_select and message events).",
       "edge_cases": [
-        "Claude and Codex review providers behave as expected",
-        "Workflow orchestration handles timeout and cancellation"
+        "Actual model updates from model_select JSON event",
+        "Actual model updates from message start/update/end JSON events"
       ],
       "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
-      "timeout_ms": 300000
+      "timeout_ms": 60000
     },
     {
       "id": "DOD-3",
-      "description": "Verify that UI and rendering tests pass successfully.",
+      "description": "Verify missing model metadata is non-fatal and falls back gracefully.",
       "edge_cases": [
-        "TUI widget lines are formatted and truncated safely under narrow widths",
-        "Custom message summaries handle structured metadata details correctly"
+        "Subagents execute successfully without any model metadata"
       ],
-      "verify_command": "node --experimental-strip-types --test tests/cc-review-ui.test.ts",
+      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
       "timeout_ms": 60000
     },
     {
       "id": "DOD-4",
-      "description": "Verify that structured report parsing tests pass successfully.",
+      "description": "Verify used subagent models are rendered under tasks in summary report.",
       "edge_cases": [
-        "Balanced JSON extraction is robust against leading/trailing noise",
-        "Effective verdict blocks on P1 failures correctly"
+        "Each task lists its used subagent model if available in summary report"
       ],
-      "verify_command": "node --experimental-strip-types --test tests/cc-review-structured.test.ts",
-      "timeout_ms": 30000
+      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
+      "timeout_ms": 60000
     },
     {
       "id": "DOD-5",
       "description": "Verify strict type-checking compiles with zero diagnostics.",
       "edge_cases": [
-        "TS files conform strictly to target ES2022 and bundler module resolution with noEmit"
+        "TS files compile cleanly with tsc"
       ],
       "verify_command": "../adversarial/node_modules/.bin/tsc --noEmit --target es2022 --moduleResolution bundler --allowImportingTsExtensions --typeRoots ../adversarial/node_modules/@types --types node --strict true .pi/extensions/cc-review.ts",
       "timeout_ms": 60000

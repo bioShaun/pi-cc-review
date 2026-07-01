@@ -3925,6 +3925,157 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(widgetCleared, true, "Failed workflow should clear its widget");
     assert.equal(statusCleared, true, "Failed workflow should clear its status");
   });
+
+  describe("subagent model capture", () => {
+    it("captures model information from configuration and runtime events", async () => {
+      const mockTasks = [
+        { title: "Task 1", description: "Implement feature A", acceptanceCriteria: "A is verified" }
+      ];
+
+      const originalHome = process.env.HOME;
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.HOME = tempTestDir;
+      process.env.USERPROFILE = tempTestDir;
+
+      // Temporary agent markdown structure for worker in virtual project directory
+      const customAgentDir = path.join(tempTestDir, ".pi", "agents");
+      fs.mkdirSync(customAgentDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(customAgentDir, "worker.md"),
+        `---
+name: worker
+model: configured-worker-model
+---
+System prompt override`
+      );
+
+      let capturedSubagentArgs: string[] = [];
+      mockSpawnHandler = (command, args) => {
+        if (command === "codex") {
+          const mockProc = new MockChildProcess();
+          process.nextTick(() => {
+            if (args.includes("-o")) {
+              fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+            } else {
+              mockProc.stdout.emit("data", Buffer.from(REVIEW_SHIP_OUTPUT));
+            }
+            mockProc.emit("close", 0, null);
+          });
+          return mockProc;
+        }
+
+        // Catch the spawn of pi subagent worker
+        const isNodeOrBun = /^(node|bun)(\.exe)?$/.test(path.basename(command).toLowerCase());
+        const isPiLaunch = isNodeOrBun && args.some(a => a.includes("pi"));
+        if (command === "pi" || isPiLaunch) {
+          capturedSubagentArgs = args;
+          const mockProc = new MockChildProcess();
+          process.nextTick(() => {
+            // Emit JSON events reporting actual model
+            const event1 = { type: "model_select", model: { provider: "anthropic", id: "claude-3-5-sonnet-actual" } };
+            const event2 = { type: "message_start", message: { role: "assistant", content: [], model: "claude-3-5-sonnet-actual", provider: "anthropic" } };
+            const event3 = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Task completed successfully." }], model: "claude-3-5-sonnet-actual", provider: "anthropic" } };
+
+            mockProc.stdout.emit("data", Buffer.from(JSON.stringify(event1) + "\n"));
+            mockProc.stdout.emit("data", Buffer.from(JSON.stringify(event2) + "\n"));
+            mockProc.stdout.emit("data", Buffer.from(JSON.stringify(event3) + "\n"));
+            mockProc.emit("close", 0, null);
+          });
+          return mockProc;
+        }
+        return null;
+      };
+
+      const originalToolManager = piMock.toolManager;
+      delete piMock.toolManager;
+
+      try {
+        const result = await registeredTool.execute(
+          "cc-review-test-model-capture",
+          { goal: "Verify model capture" },
+          undefined,
+          undefined,
+          { cwd: tempTestDir }
+        );
+
+        assert.strictEqual(result.details.status, "completed");
+        assert.ok(capturedSubagentArgs.includes("configured-worker-model"), "Should run subprocess with the configured model");
+
+        // Verify model is rendered in the final summary report
+        const summaryText = result?.content?.[0]?.text || getSummaryText(sentMessages);
+        console.log("summaryText:", summaryText);
+        assert.ok(
+          summaryText.includes("Model:* `anthropic/claude-3-5-sonnet-actual`"),
+          "Summary report should list the actual used subagent model"
+        );
+      } finally {
+        piMock.toolManager = originalToolManager;
+        process.env.HOME = originalHome;
+        process.env.USERPROFILE = originalUserProfile;
+      }
+    });
+
+    it("falls back gracefully and keeps missing model metadata non-fatal", async () => {
+      const mockTasks = [
+        { title: "Task 1", description: "Implement feature A", acceptanceCriteria: "A is verified" }
+      ];
+
+      const originalHome = process.env.HOME;
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.HOME = tempTestDir;
+      process.env.USERPROFILE = tempTestDir;
+
+      mockSpawnHandler = (command, args) => {
+        if (command === "codex") {
+          const mockProc = new MockChildProcess();
+          process.nextTick(() => {
+            if (args.includes("-o")) {
+              fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+            } else {
+              mockProc.stdout.emit("data", Buffer.from(REVIEW_SHIP_OUTPUT));
+            }
+            mockProc.emit("close", 0, null);
+          });
+          return mockProc;
+        }
+
+        const isNodeOrBun = /^(node|bun)(\.exe)?$/.test(path.basename(command).toLowerCase());
+        const isPiLaunch = isNodeOrBun && args.some(a => a.includes("pi"));
+        if (command === "pi" || isPiLaunch) {
+          const mockProc = new MockChildProcess();
+          process.nextTick(() => {
+            // Emits standard non-metadata events
+            const event = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done without model info." }] } };
+            mockProc.stdout.emit("data", Buffer.from(JSON.stringify(event) + "\n"));
+            mockProc.emit("close", 0, null);
+          });
+          return mockProc;
+        }
+        return null;
+      };
+
+      const originalToolManager = piMock.toolManager;
+      delete piMock.toolManager;
+
+      try {
+        const result = await registeredTool.execute(
+          "cc-review-test-no-model",
+          { goal: "Verify missing model gracefully" },
+          undefined,
+          undefined,
+          { cwd: tempTestDir }
+        );
+
+        assert.strictEqual(result.details.status, "completed", "Should execute successfully even without model metadata");
+        const summaryText = result?.content?.[0]?.text || getSummaryText(sentMessages);
+        assert.ok(!summaryText.includes("Model"), "Summary report should not list model if none was captured");
+      } finally {
+        piMock.toolManager = originalToolManager;
+        process.env.HOME = originalHome;
+        process.env.USERPROFILE = originalUserProfile;
+      }
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

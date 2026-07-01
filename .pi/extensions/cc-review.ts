@@ -2430,6 +2430,7 @@ interface TaskResult {
   blockReason?: BlockReason;
   reviewerExitDiagnostic?: string;
   status?: TaskStatus;
+  model?: string;
 }
 
 interface BatchTaskExecution {
@@ -2465,9 +2466,11 @@ interface SubagentToolResult {
       exitCode?: number;
       stderr?: string;
       errorMessage?: string;
+      model?: string;
     }>;
   };
   isError?: boolean;
+  model?: string;
 }
 
 interface SubagentValidation {
@@ -3667,6 +3670,7 @@ async function runPiAgentSubprocess(
     }
   }
   let finalAssistantText = "";
+  let currentModel: string | undefined = agent.model;
   let stderrBuf = "";
   let wasAborted = false;
   // Capture the abort reason so we can surface the true cause (timeout vs
@@ -3697,6 +3701,33 @@ async function runPiAgentSubprocess(
         event = JSON.parse(trimmed);
       } catch {
         return;
+      }
+
+      // Extract and update current actual model from events
+      if (event?.type === "model_select" && event.model) {
+        if (typeof event.model === "string") {
+          currentModel = event.model;
+        } else if (typeof event.model === "object") {
+          const provider = event.model.provider;
+          const id = event.model.id;
+          if (provider && id) {
+            currentModel = `${provider}/${id}`;
+          } else if (id) {
+            currentModel = id;
+          }
+        }
+      } else if (event?.message?.model) {
+        const msgModel = event.message.model;
+        const msgProvider = event.message.provider;
+        if (msgProvider && typeof msgProvider === "string" && typeof msgModel === "string" && !msgModel.includes(msgProvider)) {
+          currentModel = `${msgProvider}/${msgModel}`;
+        } else if (typeof msgModel === "string") {
+          currentModel = msgModel;
+        }
+      } else if (typeof event?.model === "string") {
+        currentModel = event.model;
+      } else if (typeof event?.metadata?.model === "string") {
+        currentModel = event.metadata.model;
       }
       // Surface live in-task progress. Without this, the subagent subprocess is
       // silent for the whole (often multi-minute) execution and the user "sees
@@ -3851,10 +3882,12 @@ async function runPiAgentSubprocess(
           exitCode,
           stderr: stderr || undefined,
           errorMessage,
+          model: currentModel,
         },
       ],
     },
     isError,
+    model: currentModel,
   };
 }
 
@@ -4112,6 +4145,9 @@ function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task
     summaryMarkdown += `   - *Status:* ${formatTaskStatusText(taskResult)}\n`;
     if (taskResult.artifactPath) {
       summaryMarkdown += `   - *Artifact:* \`${taskResult.artifactPath}\`\n`;
+    }
+    if (taskResult.model) {
+      summaryMarkdown += `   - *Model:* \`${taskResult.model}\`\n`;
     }
     if (taskResult.effectiveVerdict && taskResult.reviewResult?.summary) {
       summaryMarkdown += `   - *Review Summary:* ${taskResult.reviewResult.summary}\n`;
@@ -5254,7 +5290,7 @@ async function runCcReviewWorkflow(
               {
                 agent: "worker",
                 task: attemptPrompt,
-                agentScope: "user",
+                agentScope: "both",
                 cwd: ctx?.cwd ?? process.cwd(),
               },
               taskAbortController.signal,
@@ -5433,6 +5469,7 @@ async function runCcReviewWorkflow(
           artifactPath,
           structuredReport: structuredReport ?? undefined,
           schemaParseStatus,
+          model: cachedSubagentResult.model,
         });
         throw new Error(`Task execution failed unrecoverably on: "${task.title}" (${validationError || "exit code " + subagentResult.code})`);
       }
@@ -5449,6 +5486,7 @@ async function runCcReviewWorkflow(
           status: "completed",
           structuredReport: structuredReport ?? undefined,
           schemaParseStatus,
+          model: cachedSubagentResult.model,
         };
         taskStatuses[i] = "completed";
         recordTaskResult(result);
@@ -5614,6 +5652,7 @@ async function runCcReviewWorkflow(
         effectiveVerdict,
         blockReason: derived.blockReason,
         reviewerExitDiagnostic,
+        model: cachedSubagentResult.model,
       });
 
       if (effectiveVerdict === "block") {
