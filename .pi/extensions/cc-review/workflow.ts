@@ -41,6 +41,7 @@ import {
   writeTaskArtifact,
   type RunVerificationCommand,
   WORKFLOW_ARTIFACT_DIR,
+  getArtifactRunDir,
 } from "./structured.ts";
 import {
   buildAfterAllExecutionBatches,
@@ -202,7 +203,28 @@ const CcReviewParams = {
     },
     logFile: {
       type: "string",
-      description: "Optional path for the persisted JSONL execution log. Relative paths are resolved against the workflow cwd; absolute paths are used as-is. When omitted, a unique workflow-logs-<runId>.jsonl file is created in the cwd, or CC_REVIEW_LOG_FILE is used if set.",
+      description: "Optional path for the persisted JSONL execution log. Relative paths are resolved against the workflow cwd; absolute paths are used as-is. When omitted, logs are written under .cc-review/logs/<runId>/ (or CC_REVIEW_LOG_FILE / CC_REVIEW_LOG_ROOT=1 for legacy workspace-root behavior).",
+    },
+    checkOnly: {
+      type: "boolean",
+      description: "When true, validate environment (provider CLI on PATH) and print resolved configuration without starting planning or execution.",
+    },
+    planOnly: {
+      type: "boolean",
+      description: "When true, run the planner and write a plan artifact under cc-review-artifacts/<runId>/ without dispatching subagents or reviewers.",
+    },
+    resumeRunId: {
+      type: "string",
+      description: "Resume a prior workflow run by artifact run id. Skips tasks already recorded in the checkpoint; use fromTask to force a starting index.",
+    },
+    fromTask: {
+      type: "integer",
+      minimum: 0,
+      description: "0-based task index to start from when resuming (skips all prior tasks).",
+    },
+    allowTextValidation: {
+      type: "boolean",
+      description: "When true, allow legacy text-heuristic subagent validation when structured JSON is missing. Default false (structured report required). Env fallback: CC_REVIEW_ALLOW_TEXT_VALIDATION=1.",
     },
   },
   required: ["goal"],
@@ -222,6 +244,11 @@ interface CcReviewExecuteParams {
   concurrency?: number;
   concurrencyLimit?: number;
   logFile?: string;
+  checkOnly?: boolean;
+  planOnly?: boolean;
+  resumeRunId?: string;
+  fromTask?: number;
+  allowTextValidation?: boolean;
 }
 
 interface ProcessResult {
@@ -233,9 +260,66 @@ interface ProcessResult {
   output?: string;
 }
 
-import { emitTrace, runSubprocess } from "./subprocess.ts";
+import {
+  emitTrace,
+  runSubprocess,
+} from "./subprocess.ts";
 
 export * from "./subprocess.ts";
+
+import {
+  appendPersistedLogEntry,
+  appendArtifactDirToSummary,
+  appendPersistedLogPathToSummary,
+  resolveCcReviewLogPath,
+  resolveCcReviewTracePath,
+  shouldUseWorkspaceRootLogs,
+  type PersistedLogState,
+  type ResolveCcReviewLogPathOptions,
+} from "./workflow/logging.ts";
+
+export {
+  appendPersistedLogEntry,
+  appendArtifactDirToSummary,
+  appendPersistedLogPathToSummary,
+  resolveCcReviewLogPath,
+  resolveCcReviewTracePath,
+  shouldUseWorkspaceRootLogs,
+  type PersistedLogState,
+  type ResolveCcReviewLogPathOptions,
+} from "./workflow/logging.ts";
+
+import {
+  formatResumeInstructions,
+  loadCheckpoint,
+  resolveTasksToSkipOnResume,
+  writeCheckpoint,
+  writePlanArtifact,
+  type WorkflowCheckpoint,
+} from "./workflow/checkpoint.ts";
+
+export {
+  formatResumeInstructions,
+  loadCheckpoint,
+  listResumableRunIds,
+  resolveTasksToSkipOnResume,
+  writeCheckpoint,
+  writePlanArtifact,
+} from "./workflow/checkpoint.ts";
+
+import {
+  formatStateBufferForPrompt,
+  loadStateBuffer,
+  mergeTaskResultIntoStateBuffer,
+  persistStateBuffer,
+  emptyStateBuffer,
+} from "./workflow/session.ts";
+
+import { runPreflight, shouldSkipPreflight, formatPreflightReport } from "./workflow/preflight.ts";
+export { runPreflight, shouldSkipPreflight, formatPreflightReport } from "./workflow/preflight.ts";
+
+import { validateSubagentOutput, summarizeValidationParseFailures } from "./workflow/validation.ts";
+export { validateSubagentOutput, summarizeValidationParseFailures } from "./workflow/validation.ts";
 
 type CcReviewLogSeverity = "debug" | "info" | "warning" | "error";
 
@@ -1104,6 +1188,7 @@ import {
   resolveCcReviewLogSources,
   resolveCcReviewWidgetLogLines,
   resolveCcReviewChecklistWindow,
+  resolveAllowTextValidation,
   enterCcReviewWorkflowNest,
   readAvailableCpuCount,
 } from "./config.ts";
@@ -1928,196 +2013,20 @@ export function formatCcReviewSummaryHeadline(counts: CcReviewTaskOutcomeCounts)
   return `${counts.completed} \u5b8c\u6210 \u00b7 ${counts.warnings} \u8b66\u544a \u00b7 ${counts.failed} \u5931\u8d25`;
 }
 
-export interface PersistedLogState {
-  filePath: string;
-  appendedLineCount: number;
-}
-
-// Append a normalized log entry to a bounded JSONL file in the workspace, so
-// users can inspect the full session after the compact TUI is cleared. Bounded
-// like pi's truncated-tool: when the file passes WORKFLOW_LOG_MAX_LINES_DEFAULT,
-// keep only the most recent WORKFLOW_LOG_TRUNCATE_KEEP lines + a rotation marker.
-export function appendPersistedLogEntry(
-  state: PersistedLogState,
-  entry: CcReviewLogEntry,
-  options: { maxLines?: number; keepLines?: number } = {}
-): PersistedLogState {
-  const maxLines = options.maxLines ?? WORKFLOW_LOG_MAX_LINES_DEFAULT;
-  const keepLines = options.keepLines ?? WORKFLOW_LOG_TRUNCATE_KEEP;
-  const line = JSON.stringify(entry) + "\n";
-  try {
-    const dir = path.dirname(state.filePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.appendFileSync(state.filePath, line, "utf8");
-  } catch {
-    return state;
-  }
-  const nextCount = state.appendedLineCount + 1;
-  if (nextCount <= maxLines) {
-    return { filePath: state.filePath, appendedLineCount: nextCount };
-  }
-  // Rotate: keep tail to bound disk usage. Best-effort; failure leaves the file as-is.
-  try {
-    const existing = fs.readFileSync(state.filePath, "utf8");
-    const lines = existing.split("\n");
-    // Drop trailing empty entry from final newline
-    if (lines.length && lines[lines.length - 1] === "") lines.pop();
-    const tail = lines.slice(-keepLines);
-    const rotationMarker = JSON.stringify({
-      type: "cc_review_log_rotation",
-      droppedLineCount: lines.length - tail.length,
-      timestamp: new Date().toISOString(),
-    });
-    fs.writeFileSync(state.filePath, [rotationMarker, ...tail].join("\n") + "\n", "utf8");
-    return { filePath: state.filePath, appendedLineCount: tail.length + 1 };
-  } catch {
-    return { filePath: state.filePath, appendedLineCount: nextCount };
-  }
-}
-
-export interface ResolveCcReviewLogPathOptions {
-  /** Working directory used to resolve relative paths. */
-  cwd: string;
-  /** Unique run identifier included in the generated file name. */
-  runId: string;
-  /** Explicit log file path from tool parameters / CLI flags. */
-  explicitLogFile?: string | undefined;
-  /** Optional environment override (e.g. process.env.CC_REVIEW_LOG_FILE). */
-  envLogFile?: string | undefined;
-}
-
-// Resolve the path for the persisted human-readable JSONL log.
-//
-// Precedence:
-//   1. explicitLogFile (tool/CLI flag)
-//   2. envLogFile (e.g. CC_REVIEW_LOG_FILE)
-//   3. Generated unique file in cwd: workflow-logs-<runId>.jsonl
-//
-// If the chosen explicit path is an existing directory, a unique file is
-// generated inside that directory so callers can configure a log directory
-// without specifying a full file name.
-export function resolveCcReviewLogPath(options: ResolveCcReviewLogPathOptions): string {
-  const cwd = options.cwd;
-  const logFile = options.explicitLogFile ?? options.envLogFile;
-  if (logFile) {
-    const resolved = path.isAbsolute(logFile) ? logFile : path.join(cwd, logFile);
-    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-      return path.join(resolved, `workflow-logs-${options.runId}.jsonl`);
-    }
-    return resolved;
-  }
-  return path.join(cwd, `workflow-logs-${options.runId}.jsonl`);
-}
-
 import {
   readTrimmedEnv,
   resolveReviewMode,
   resolveReviewProviderConfig,
+  resolvePlannerModelEnv,
+  resolveReviewerModelEnv,
   type ReviewProviderConfig,
 } from "./providers.ts";
 
 export * from "./providers.ts";
 
-interface SubagentResult {
-  code: number;
-  configuredModel?: string;
-  effectiveModel?: string;
-}
+import { WorkflowError, type BatchTaskExecution, type CcReviewWorkflowResult, type RunCcReviewWorkflowOptions, type SubagentResult, type SubagentToolExecutor, type SubagentToolResult, type SubagentValidation, type TaskResult } from "./workflow/types.ts";
 
-interface TaskResult {
-  title: string;
-  description: string;
-  executionCode: number;
-  reviewCode: number;
-  output?: string;
-  validationError?: string;
-  unresolvedItems?: string[];
-  reviewWarningName?: string;
-  artifactPath?: string;
-  structuredReport?: SubagentStructuredReport;
-  schemaParseStatus?: SchemaParseStatus;
-  reviewResult?: ReviewResult;
-  reportedVerdict?: ReviewVerdict | null;
-  effectiveVerdict?: ReviewVerdict;
-  blockReason?: BlockReason;
-  reviewerExitDiagnostic?: string;
-  status?: TaskStatus;
-  configuredModel?: string;
-  effectiveModel?: string;
-}
-
-interface BatchTaskExecution {
-  taskIndex: number;
-  task: Task;
-  startedAt: string;
-  subagentResult: SubagentResult;
-  subagentOutputText: string;
-  cachedSubagentResult: SubagentToolResult;
-  validationError?: string;
-  unresolvedItems?: string[];
-  structuredReport: SubagentStructuredReport | null;
-  schemaParseStatus: SchemaParseStatus;
-  result: TaskResult;
-}
-
-class WorkflowError extends Error {
-  summary: string;
-  meta?: CcReviewSummaryMeta;
-  constructor(message: string, summary: string, meta?: CcReviewSummaryMeta) {
-    super(message);
-    this.name = "WorkflowError";
-    this.summary = summary;
-    this.meta = meta;
-  }
-}
-
-interface SubagentToolResult {
-  content?: Array<{ type: string; text?: string }>;
-  details?: {
-    results?: Array<{
-      agent?: string;
-      exitCode?: number;
-      stderr?: string;
-      errorMessage?: string;
-      model?: string;
-    }>;
-  };
-  isError?: boolean;
-  model?: string;
-}
-
-interface SubagentValidation {
-  valid: boolean;
-  error?: string;
-  unresolvedItems?: string[];
-  structuredReport?: SubagentStructuredReport;
-  schemaParseStatus?: SchemaParseStatus;
-}
-
-interface RunCcReviewWorkflowOptions {
-  reviewProvider?: string;
-  logLevel?: string;
-  logSources?: string;
-  reviewMode?: string;
-  reviewRepairRounds?: number;
-  taskTimeoutMs?: number;
-  widgetLogLines?: number;
-  checklistWindow?: number;
-  validationCommands?: VerificationCommand[];
-  concurrency?: number;
-  concurrencyLimit?: number;
-  logFile?: string;
-}
-
-type SubagentToolExecutor = (
-  toolName: string,
-  params: Record<string, unknown>,
-  signal?: AbortSignal,
-  onUpdate?: (partial: any) => void,
-  ctx?: any
-) => Promise<SubagentToolResult>;
+export type { CcReviewWorkflowResult } from "./workflow/types.ts";
 
 export type CcReviewSummaryBadge = "success" | "warning" | "failed" | "cancelled";
 
@@ -2284,8 +2193,34 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (parsedArgs.checkOnly) {
+        try {
+          const workflowResult = await runCcReviewWorkflow(pi, parsedArgs.goal || "environment check", ctx, undefined, undefined, {
+            checkOnly: true,
+            reviewProvider: parsedArgs.reviewProvider,
+          });
+          await pi.sendMessage?.({
+            customType: "cc-review-summary",
+            content: workflowResult.summary,
+            details: workflowResult.meta,
+            display: true,
+          });
+        } catch (err: any) {
+          ctx?.ui?.notify?.(`CC Review check failed: ${err.message}`, "error");
+          if (err instanceof WorkflowError || err.summary) {
+            await pi.sendMessage?.({
+              customType: "cc-review-summary",
+              content: err.summary,
+              details: err.meta,
+              display: true,
+            });
+          }
+        }
+        return;
+      }
+
       let goal = parsedArgs.goal;
-      if (!goal) {
+      if (!goal && !parsedArgs.resumeRunId) {
         goal = ((await ctx?.ui?.input?.("Enter the overarching goal to accomplish:")) ?? "").trim();
         if (!goal) {
           ctx?.ui?.notify?.("Goal cannot be empty", "error");
@@ -2306,6 +2241,10 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           checklistWindow: parsedArgs.checklistWindow,
           concurrency: parsedArgs.concurrency,
           logFile: parsedArgs.logFile,
+          planOnly: parsedArgs.planOnly,
+          resumeRunId: parsedArgs.resumeRunId,
+          fromTask: parsedArgs.fromTask,
+          allowTextValidation: parsedArgs.allowTextValidation,
         });
         ctx?.ui?.notify?.("CC Review completed.", "info");
         
@@ -2368,6 +2307,11 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           concurrency: params.concurrency,
           concurrencyLimit: params.concurrencyLimit,
           logFile: params.logFile,
+          checkOnly: params.checkOnly,
+          planOnly: params.planOnly,
+          resumeRunId: params.resumeRunId,
+          fromTask: params.fromTask,
+          allowTextValidation: params.allowTextValidation,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
@@ -2531,7 +2475,25 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-export function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; logSources?: string; reviewMode?: string; reviewRepairRounds?: number; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; concurrency?: number; logFile?: string; error?: string } {
+export function parseCcReviewCommandArgs(args: string): {
+  goal: string;
+  reviewProvider?: string;
+  logLevel?: string;
+  logSources?: string;
+  reviewMode?: string;
+  reviewRepairRounds?: number;
+  taskTimeoutMs?: number;
+  widgetLogLines?: number;
+  checklistWindow?: number;
+  concurrency?: number;
+  logFile?: string;
+  checkOnly?: boolean;
+  planOnly?: boolean;
+  resumeRunId?: string;
+  fromTask?: number;
+  allowTextValidation?: boolean;
+  error?: string;
+} {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
   const hasLogSourcesFlag = /(?:^|\s)--log-sources(?:=|\s|$)/.test(args);
@@ -2542,7 +2504,28 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
   const hasChecklistWindowFlag = /(?:^|\s)--checklist-window(?:=|\s|$)/.test(args);
   const hasConcurrencyFlag = /(?:^|\s)--(?:concurrency|concurrency-limit)(?:=|\s|$)/.test(args);
   const hasLogFileFlag = /(?:^|\s)--log-file(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag && !hasLogSourcesFlag && !hasReviewModeFlag && !hasReviewRepairRoundsFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag && !hasConcurrencyFlag && !hasLogFileFlag) {
+  const hasCheckFlag = /(?:^|\s)--check(?:\s|$)/.test(args);
+  const hasPlanOnlyFlag = /(?:^|\s)--plan-only(?:\s|$)/.test(args);
+  const hasResumeFlag = /(?:^|\s)--resume(?:=|\s|$)/.test(args);
+  const hasFromTaskFlag = /(?:^|\s)--from-task(?:=|\s|$)/.test(args);
+  const hasAllowTextValidationFlag = /(?:^|\s)--allow-text-validation(?:\s|$)/.test(args);
+  if (
+    !hasProviderFlag &&
+    !hasLogLevelFlag &&
+    !hasLogSourcesFlag &&
+    !hasReviewModeFlag &&
+    !hasReviewRepairRoundsFlag &&
+    !hasTaskTimeoutFlag &&
+    !hasWidgetLogLinesFlag &&
+    !hasChecklistWindowFlag &&
+    !hasConcurrencyFlag &&
+    !hasLogFileFlag &&
+    !hasCheckFlag &&
+    !hasPlanOnlyFlag &&
+    !hasResumeFlag &&
+    !hasFromTaskFlag &&
+    !hasAllowTextValidationFlag
+  ) {
     return { goal: args.trim() };
   }
 
@@ -2558,6 +2541,11 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
   let checklistWindow: number | undefined;
   let concurrency: number | undefined;
   let logFile: string | undefined;
+  let checkOnly: boolean | undefined;
+  let planOnly: boolean | undefined;
+  let resumeRunId: string | undefined;
+  let fromTask: number | undefined;
+  let allowTextValidation: boolean | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -2776,6 +2764,65 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
       continue;
     }
 
+    if (token === "--check") {
+      checkOnly = true;
+      continue;
+    }
+
+    if (token === "--plan-only") {
+      planOnly = true;
+      continue;
+    }
+
+    const equalsResumeMatch = token.match(/^--resume=(.*)$/);
+    if (equalsResumeMatch) {
+      resumeRunId = equalsResumeMatch[1]?.trim();
+      if (!resumeRunId) {
+        return { goal: "", error: 'Invalid --resume value "". Expected a prior run id from cc-review-artifacts/<run-id>/.' };
+      }
+      continue;
+    }
+
+    if (token === "--resume") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a prior run id.` };
+      }
+      resumeRunId = value.trim();
+      i++;
+      continue;
+    }
+
+    const equalsFromTaskMatch = token.match(/^--from-task=(.*)$/);
+    if (equalsFromTaskMatch) {
+      const raw = equalsFromTaskMatch[1];
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isInteger(parsed) || parsed < 0) {
+        return { goal: "", error: `Invalid --from-task value "${raw}". Expected a non-negative integer.` };
+      }
+      fromTask = parsed;
+      continue;
+    }
+
+    if (token === "--from-task") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a non-negative integer.` };
+      }
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return { goal: "", error: `Invalid --from-task value "${value}". Expected a non-negative integer.` };
+      }
+      fromTask = parsed;
+      i++;
+      continue;
+    }
+
+    if (token === "--allow-text-validation") {
+      allowTextValidation = true;
+      continue;
+    }
+
     goalTokens.push(token);
   }
 
@@ -2791,6 +2838,11 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
     checklistWindow,
     concurrency,
     logFile,
+    checkOnly,
+    planOnly,
+    resumeRunId,
+    fromTask,
+    allowTextValidation,
   };
 }
 
@@ -3058,11 +3110,15 @@ export function priorTaskHandoffFromResults(
 function buildSubagentTaskPrompt(
   task: Task,
   parentContextSummary: string,
-  priorTaskHandoff: string = ""
+  priorTaskHandoff: string = "",
+  stateBufferSection: string = ""
 ): string {
   const sections = [
     `Parent Workflow Context (Summary): ${parentContextSummary}`,
   ];
+  if (stateBufferSection && stateBufferSection.trim().length > 0) {
+    sections.push(stateBufferSection);
+  }
   if (priorTaskHandoff && priorTaskHandoff.trim().length > 0) {
     sections.push(priorTaskHandoff);
   }
@@ -3608,107 +3664,6 @@ function appendUnique(target: string[], values: Array<string | undefined>) {
   }
 }
 
-function validateSubagentOutput(result: SubagentToolResult, task: Task): SubagentValidation {
-  if (!result) {
-    return {
-      valid: false,
-      error: "No result returned from subagent",
-      unresolvedItems: ["No result returned from subagent"],
-      schemaParseStatus: "absent",
-    };
-  }
-  const subagentResultDetail = result.details?.results?.[0];
-  const textContent = extractSubagentText(result);
-
-  if (result.isError) {
-    const error = subagentResultDetail?.errorMessage || subagentResultDetail?.stderr || textContent || "Subagent flagged an execution error (isError: true)";
-    return {
-      valid: false,
-      error,
-      unresolvedItems: [error],
-      schemaParseStatus: "absent",
-    };
-  }
-
-  if (subagentResultDetail && typeof subagentResultDetail.exitCode === "number" && subagentResultDetail.exitCode !== 0) {
-    const error = subagentResultDetail.errorMessage || subagentResultDetail.stderr || `Subagent process exited with non-zero code ${subagentResultDetail.exitCode}`;
-    return {
-      valid: false,
-      error,
-      unresolvedItems: [error],
-      schemaParseStatus: "absent",
-    };
-  }
-
-  if (!textContent) {
-    return {
-      valid: false,
-      error: "Subagent returned empty or missing text content",
-      unresolvedItems: ["Subagent returned empty or missing text content"],
-      schemaParseStatus: "absent",
-    };
-  }
-
-  const structured = parseSubagentStructuredReport(textContent);
-  if (structured.status === "parsed" && structured.report) {
-    const structuredValidation = validateStructuredSubagentReport(structured.report);
-    return {
-      ...structuredValidation,
-      structuredReport: structured.report,
-      schemaParseStatus: structured.status,
-    };
-  }
-  if (structured.status === "invalid_schema") {
-    return {
-      valid: false,
-      error: "Subagent structured report failed schema validation",
-      unresolvedItems: ["Invalid structured subagent JSON schema"],
-      schemaParseStatus: structured.status,
-    };
-  }
-
-  // Free-text fallback (last resort only — structured report is preferred
-  // above). Previously this path used a broad regex
-  // `(failed|not met|pending|todo|unresolved|skip).*${criterion}` which matched
-  // any narrative sentence using those words near the criterion text, producing
-  // false "incomplete" verdicts (P1-2). That regex is removed; criterion
-  // validation is now handled exclusively by the structured report path. The
-  // remaining checks target explicit status markers only.
-  const unresolvedItems: string[] = [];
-  const lines = textContent.split("\n");
-  for (const line of lines) {
-    const lowerLine = line.toLowerCase();
-    if (lowerLine.includes("todo:") || lowerLine.includes("fixme:") || lowerLine.includes("unresolved:") || lowerLine.includes("pending:")) {
-      unresolvedItems.push(line.trim());
-    } else if (
-      // Only flag "could not / failed to / unable to" when it appears as an
-      // explicit failure statement at the start of a line (after optional
-      // whitespace/label), not mid-sentence in narrative prose.
-      /^\s*(could not|failed to|unable to)\b/i.test(line) &&
-      !lowerLine.includes("no issues found") &&
-      !lowerLine.includes("zero")
-    ) {
-      unresolvedItems.push(line.trim());
-    }
-  }
-
-  return {
-    valid: unresolvedItems.length === 0,
-    error: unresolvedItems.length > 0 ? "Subagent reported unresolved work" : undefined,
-    unresolvedItems: unresolvedItems.length > 0 ? unresolvedItems : undefined,
-    schemaParseStatus: structured.status === "absent" ? "fallback_text" : structured.status,
-  };
-}
-
-// Surface the absolute path of the persisted workflow log file in the summary.
-// Mirrors pi's truncated-tool.ts pattern: when the compact widget/status is
-// cleared, users can still open the JSONL to inspect the full run.
-function appendPersistedLogPathToSummary(summary: string, persistedLogPath: string | undefined): string {
-  if (!persistedLogPath) return summary;
-  const trimmed = summary.replace(/\s+$/, "");
-  return `${trimmed}\n\n### 📄 Persisted Workflow Log\n\nFull human-readable JSONL log available at: \`${persistedLogPath}\`\n`;
-}
-
 function resolveDisplayedTaskModel(modelState: TaskModelState | undefined): string | undefined {
   return modelState?.effective || modelState?.configured;
 }
@@ -3775,7 +3730,12 @@ function formatTaskStatusText(taskResult: TaskResult): string {
   return `Completed with warnings (subagent exit ${taskResult.executionCode}, ${taskResult.reviewWarningName || "review"} exit ${taskResult.reviewCode})`;
 }
 
-function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task[], options?: { concurrency?: number }): string {
+function buildSummaryReport(
+  goal: string,
+  taskResults: TaskResult[],
+  tasks: Task[],
+  options?: { concurrency?: number; runId?: string; artifactDir?: string; parseFailureLines?: string[] }
+): string {
   const results = [...taskResults];
   for (let j = results.length; j < tasks.length; j++) {
     results.push({
@@ -3885,7 +3845,24 @@ function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task
     summaryMarkdown += `### 💡 Suggested Actionable Steps to Recover\n\n`;
     summaryMarkdown += `1. **Review the Error/Validation Details**: Examine task artifacts and review findings in the report above.\n`;
     summaryMarkdown += `2. **Perform Manual Fixes**: Resolve the issue in workspace files directly.\n`;
-    summaryMarkdown += `3. **Resume Execution**: Restart the workflow for remaining tasks after fixes.\n\n`;
+    if (options?.runId && options?.artifactDir) {
+      summaryMarkdown += `3. **Resume Execution**: ${formatResumeInstructions(path.dirname(options.artifactDir), options.runId).replace(/\n/g, "\n   ")}\n\n`;
+    } else {
+      summaryMarkdown += `3. **Resume Execution**: Restart the workflow for remaining tasks after fixes.\n\n`;
+    }
+  }
+
+  const parseFailures = options?.parseFailureLines ?? summarizeValidationParseFailures(taskResults);
+  if (parseFailures.length > 0) {
+    summaryMarkdown += `### 📐 Structured Report Parse Failures\n\n`;
+    for (const line of parseFailures) {
+      summaryMarkdown += `- ${line}\n`;
+    }
+    summaryMarkdown += `\n`;
+  }
+
+  if (options?.artifactDir) {
+    summaryMarkdown += `### 📁 Run Artifacts\n\nStructured artifacts and checkpoint: \`${options.artifactDir}\`\n\n`;
   }
 
   summaryMarkdown += `### ⚙️ Execution Configuration\n\n`;
@@ -3898,10 +3875,6 @@ export function buildCcReviewSummaryMeta(taskResults: TaskResult[], options?: { 
   return buildSummaryMeta(taskResults, options);
 }
 
-export interface CcReviewWorkflowResult {
-  summary: string;
-  meta: CcReviewSummaryMeta;
-}
 
 /**
  * Runs the complete CC Review orchestration.
@@ -3948,6 +3921,67 @@ async function runCcReviewWorkflow(
     cpuCount: readAvailableCpuCount(process.env),
   });
   let resolvedConcurrency = concurrencyResolution.concurrency;
+  const allowTextValidation = resolveAllowTextValidation({
+    flag: options.allowTextValidation,
+    env: process.env,
+  });
+  const workflowCwd: string = ctx?.cwd || process.cwd();
+  const workflowRunId = options.resumeRunId?.trim() || generateWorkflowRunId();
+  let resumeCheckpoint: WorkflowCheckpoint | undefined;
+  let skipTaskIndices = new Set<number>();
+  let runStateBuffer = emptyStateBuffer(workflowRunId);
+  let checkpointCreatedAt = new Date().toISOString();
+
+  if (options.checkOnly) {
+    if (!shouldSkipPreflight(process.env)) {
+      const preflight = runPreflight({
+        provider: reviewProviderConfig.provider,
+        providerCli: reviewProviderConfig.command,
+      });
+      const summary = formatPreflightReport(preflight);
+      exitCcReviewNest();
+      if (!preflight.ok) {
+        throw new WorkflowError(preflight.errors.join("; "), summary);
+      }
+      return { summary, meta: buildCcReviewSummaryMeta([], { concurrency: resolvedConcurrency }) };
+    }
+    exitCcReviewNest();
+    return {
+      summary: formatPreflightReport({
+        ok: true,
+        errors: [],
+        warnings: ["Preflight skipped (CC_REVIEW_SKIP_PREFLIGHT=1)"],
+        resolved: {
+          provider: reviewProviderConfig.provider,
+          providerCli: reviewProviderConfig.command,
+        },
+      }),
+      meta: buildCcReviewSummaryMeta([], { concurrency: resolvedConcurrency }),
+    };
+  }
+
+  if (options.resumeRunId) {
+    resumeCheckpoint = loadCheckpoint(workflowCwd, workflowRunId);
+    if (!resumeCheckpoint) {
+      exitCcReviewNest();
+      throw new WorkflowError(
+        `Cannot resume: no checkpoint found for run id "${workflowRunId}"`,
+        `No checkpoint at \`cc-review-artifacts/${workflowRunId}/checkpoint.json\`. Run plan-only first or verify the run id.`,
+        buildCcReviewSummaryMeta([], { concurrency: resolvedConcurrency })
+      );
+    }
+    if (!goal.trim()) {
+      goal = resumeCheckpoint.goal;
+    }
+    skipTaskIndices = resolveTasksToSkipOnResume(resumeCheckpoint, options.fromTask);
+    runStateBuffer = resumeCheckpoint.stateBuffer ?? loadStateBuffer(workflowCwd, workflowRunId);
+    checkpointCreatedAt = resumeCheckpoint.createdAt;
+  }
+
+  const useRootLogs = shouldUseWorkspaceRootLogs(process.env);
+  if (ctx) {
+    ctx.traceFilePath = resolveCcReviewTracePath(workflowCwd, workflowRunId, useRootLogs);
+  }
 
   // Trace workflow start
   emitTrace(ctx, "workflow_start", {
@@ -3963,6 +3997,9 @@ async function runCcReviewWorkflow(
     concurrency: resolvedConcurrency,
     reviewerTimeoutMs: resolvedReviewerTimeoutMs,
     maxReviewRepairRounds,
+    allowTextValidation,
+    resumeRunId: options.resumeRunId,
+    planOnly: options.planOnly,
   });
 
   // FLOW NOTE: This orchestrator manages the lifecycle of:
@@ -3983,8 +4020,6 @@ async function runCcReviewWorkflow(
   const liveLogs: CcReviewLogEntry[] = [];
   let logSequence = 0;
 
-  const workflowRunId = generateWorkflowRunId();
-  const workflowCwd: string = ctx?.cwd || process.cwd();
   const workerAgent = discoverAgent("worker", "both", workflowCwd);
   const resolvedWorkerModel = workerAgent?.model;
 
@@ -3994,6 +4029,7 @@ async function runCcReviewWorkflow(
     runId: workflowRunId,
     explicitLogFile: options.logFile,
     envLogFile: process.env.CC_REVIEW_LOG_FILE,
+    useWorkspaceRoot: useRootLogs,
   });
 
   let persistedLogState: PersistedLogState = {
@@ -4012,6 +4048,60 @@ async function runCcReviewWorkflow(
   const collectedTaskFindings: ReviewFinding[][] = [];
   let rollupEmitted = false;
   let reviewedTaskCount = 0;
+  const artifactRunDir = getArtifactRunDir(workflowCwd, workflowRunId);
+
+  if (resumeCheckpoint) {
+    tasks = resumeCheckpoint.tasks;
+    for (const prior of resumeCheckpoint.taskResults) {
+      taskResults.push(prior);
+    }
+    for (let index = 0; index < tasks.length; index++) {
+      const prior = resumeCheckpoint.taskResults[index];
+      if (prior?.status) {
+        taskStatuses[index] = prior.status;
+      }
+      setTaskConfiguredModel(taskModels, index, resolvedWorkerModel);
+    }
+  }
+
+  const persistRunCheckpoint = (phase: WorkflowCheckpoint["phase"]) => {
+    const completedTaskIndices: number[] = [];
+    for (let i = 0; i < taskResults.length; i++) {
+      const status = taskResults[i]?.status;
+      if (
+        status === "completed" ||
+        status === "completed_with_warnings" ||
+        status === "failed" ||
+        status === "validation_failed" ||
+        status === "review_blocked" ||
+        status === "cancelled"
+      ) {
+        completedTaskIndices.push(i);
+      }
+    }
+    writeCheckpoint(workflowCwd, {
+      schemaVersion: 1,
+      runId: workflowRunId,
+      goal,
+      createdAt: checkpointCreatedAt,
+      updatedAt: new Date().toISOString(),
+      reviewProvider: reviewProviderConfig.provider,
+      reviewMode,
+      tasks,
+      taskResults: [...taskResults],
+      completedTaskIndices,
+      phase,
+      stateBuffer: runStateBuffer,
+      resumeHint: formatResumeInstructions(workflowCwd, workflowRunId),
+    });
+    persistStateBuffer(workflowCwd, runStateBuffer);
+  };
+
+  const wrapWorkflowSummary = (summary: string): string =>
+    appendArtifactDirToSummary(
+      appendPersistedLogPathToSummary(summary, persistedLogState.filePath),
+      artifactRunDir
+    );
 
   const emitFindingsMessage = async (payload: CcReviewFindingsPayload) => {
     if (typeof pi.sendMessage === "function") {
@@ -4265,8 +4355,14 @@ async function runCcReviewWorkflow(
     log("Workflow finished!");
   };
 
-  const recordTaskResult = (result: TaskResult) => {
+  const recordTaskResult = (result: TaskResult, structured?: SubagentStructuredReport | null) => {
     taskResults.push(result);
+    runStateBuffer = mergeTaskResultIntoStateBuffer(runStateBuffer, result, structured);
+    try {
+      persistRunCheckpoint("executing");
+    } catch {
+      // best-effort checkpoint
+    }
   };
 
   const buildTaskResultModelState = (index: number, fallback?: { configuredModel?: string; effectiveModel?: string }) => {
@@ -4455,6 +4551,11 @@ async function runCcReviewWorkflow(
   const onAbort = () => {
     abortWorkflow();
     log({ severity: "warning", source: "cc-review", message: "Workflow aborted by user. Killing subprocesses..." });
+    try {
+      persistRunCheckpoint("cancelled");
+    } catch {
+      // best-effort
+    }
     const pidsToKill: number[] = [];
     for (const proc of activeProcesses) {
       if (proc.pid) {
@@ -4623,6 +4724,30 @@ async function runCcReviewWorkflow(
 
     throwIfAborted();
 
+    if (!shouldSkipPreflight(process.env)) {
+      const preflight = runPreflight({
+        provider: reviewProviderConfig.provider,
+        providerCli: reviewProviderConfig.command,
+      });
+      if (!preflight.ok) {
+        throw new WorkflowError(
+          preflight.errors.join("; "),
+          formatPreflightReport(preflight),
+          buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency })
+        );
+      }
+      for (const warning of preflight.warnings) {
+        log({ severity: "warning", source: "cc-review", message: warning });
+      }
+    }
+
+    if (resumeCheckpoint && tasks.length > 0) {
+      log({
+        severity: "info",
+        source: "cc-review",
+        message: `Resuming workflow ${workflowRunId}: ${tasks.length} tasks, skipping ${skipTaskIndices.size} already completed.`,
+      });
+    } else {
     // Write out the task breakdown schema
     const schema = {
       type: "object",
@@ -4675,7 +4800,7 @@ async function runCcReviewWorkflow(
         "-o",
         outputPath,
       ];
-      const codexModel = readTrimmedEnv(process.env, "CODEX_MODEL");
+      const codexModel = resolvePlannerModelEnv(process.env, "codex");
       if (codexModel) plannerArgs.push("--model", codexModel);
       plannerArgs.push(plannerPrompt);
     } else {
@@ -4695,7 +4820,7 @@ async function runCcReviewWorkflow(
         "--include-partial-messages",
         "--verbose",
       ];
-      const claudeModel = readTrimmedEnv(process.env, "CLAUDE_MODEL");
+      const claudeModel = resolvePlannerModelEnv(process.env, "claude");
       if (claudeModel) plannerArgs.push("--model", claudeModel);
       const claudePlannerPrompt = [
         plannerPrompt,
@@ -4875,6 +5000,29 @@ async function runCcReviewWorkflow(
     }
 
     setPlannedTasks(tasks);
+    } // end planning (skipped on resume when tasks already loaded)
+
+    if (options.planOnly) {
+      const planPath = writePlanArtifact(workflowCwd, {
+        schemaVersion: 1,
+        runId: workflowRunId,
+        goal,
+        createdAt: new Date().toISOString(),
+        reviewProvider: reviewProviderConfig.provider,
+        reviewMode,
+        tasks,
+      });
+      persistRunCheckpoint("planning");
+      transitionToComplete();
+      return {
+        summary: wrapWorkflowSummary(
+          `## Plan-only Complete\n\n**Goal:** ${goal}\n\n**${tasks.length} tasks** planned.\n\nPlan artifact: \`${planPath}\`\n\n${formatResumeInstructions(workflowCwd, workflowRunId)}`
+        ),
+        meta: buildCcReviewSummaryMeta([], { concurrency: resolvedConcurrency }),
+      };
+    }
+
+    persistRunCheckpoint("executing");
 
     // If the concurrency was automatically resolved, adjust it based on the actual planned tasks count
     if (concurrencyResolution.source === "default") {
@@ -4937,6 +5085,15 @@ async function runCcReviewWorkflow(
             const i = batchItem.index;
             throwIfAborted();
 
+            if (skipTaskIndices.has(i)) {
+              log({
+                severity: "info",
+                source: "cc-review",
+                message: `Skipping Task ${i + 1}/${tasks.length} "${task.title}" (already completed — resume).`,
+              });
+              return;
+            }
+
           const subagentRunId = `subagent-run-${workflowRunId}-${i}`;
           taskStatuses[i] = "running";
           transitionToExecuting(i);
@@ -4947,7 +5104,8 @@ async function runCcReviewWorkflow(
 
           const summarizedParentContext = summarizeParentContext(goal);
           const priorHandoff = priorTaskHandoffFromResults(batchPriorResults);
-          const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff);
+          const stateBufferSection = formatStateBufferForPrompt(runStateBuffer);
+          const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff, stateBufferSection);
           let subagentResult: SubagentResult = { code: 0 };
           let subagentOutputText = "";
           let validationError: string | undefined = undefined;
@@ -5158,7 +5316,7 @@ async function runCcReviewWorkflow(
             subagentOutputText = extractSubagentText(result);
 
             // Validate subagent outputs
-            const validation = validateSubagentOutput(result, task);
+            const validation = validateSubagentOutput(result, task, { allowTextValidation });
             structuredReport = validation.structuredReport ?? null;
             schemaParseStatus = validation.schemaParseStatus ?? "absent";
             cachedSubagentResult = result;
@@ -5371,8 +5529,16 @@ async function runCcReviewWorkflow(
     } else {
       for (let i = 0; i < tasks.length; i++) {
         throwIfAborted();
+        const task = tasks[i];
+        if (skipTaskIndices.has(i)) {
+          log({
+            severity: "info",
+            source: "cc-review",
+            message: `Skipping Task ${i + 1}/${tasks.length} "${task.title}" (already completed — resume).`,
+          });
+          continue;
+        }
         transitionToExecuting(i);
-      const task = tasks[i];
       const taskStartedAt = new Date().toISOString();
       let cachedSubagentResult: SubagentToolResult = {};
       let structuredReport: SubagentStructuredReport | null = null;
@@ -5383,7 +5549,8 @@ async function runCcReviewWorkflow(
       // subagent output and reviewer process output are intentionally excluded
       // (see priorTaskHandoffFromResults).
       const priorHandoff = priorTaskHandoffFromResults(taskResults);
-      const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff);
+      const stateBufferSection = formatStateBufferForPrompt(runStateBuffer);
+      const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff, stateBufferSection);
       let subagentResult: SubagentResult = { code: 0 };
       let subagentOutputText = "";
       let validationError: string | undefined = undefined;
@@ -5577,7 +5744,7 @@ async function runCcReviewWorkflow(
         subagentOutputText = extractSubagentText(result);
 
         // Validate subagent outputs
-        const validation = validateSubagentOutput(result, task);
+        const validation = validateSubagentOutput(result, task, { allowTextValidation });
         structuredReport = validation.structuredReport ?? null;
         schemaParseStatus = validation.schemaParseStatus ?? "absent";
         cachedSubagentResult = result;
@@ -5712,7 +5879,7 @@ async function runCcReviewWorkflow(
       const reviewResultObject = parsedReview.result;
       const findings = reviewResultObject?.findings ?? [];
       const reportedVerdict = reviewResultObject?.verdict ?? null;
-      const rerunValidation = validateSubagentOutput(cachedSubagentResult, task);
+      const rerunValidation = validateSubagentOutput(cachedSubagentResult, task, { allowTextValidation });
       const postReview = await runPostReviewValidation({
         reviewResult: reviewResultObject,
         workspaceChanged: workspaceChanged || repairRequiresPostReviewValidation,
@@ -5838,9 +6005,12 @@ async function runCcReviewWorkflow(
         if (repairRound >= maxReviewRepairRounds) {
           // Exhausted repair rounds → hard-fail (P1-1).
           log(`[Workflow Halted] Blocked by reviewer after ${maxReviewRepairRounds} repair round(s) on: "${task.title}".`);
-          const summary = appendPersistedLogPathToSummary(
-            buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }),
-            persistedLogState.filePath
+          const summary = wrapWorkflowSummary(
+            buildSummaryReport(goal, taskResults, tasks, {
+              concurrency: resolvedConcurrency,
+              runId: workflowRunId,
+              artifactDir: artifactRunDir,
+            })
           );
           throw new WorkflowError(
             `Blocked by reviewer on: "${task.title}" (after ${maxReviewRepairRounds} repair round(s))`,
@@ -5961,7 +6131,7 @@ async function runCcReviewWorkflow(
       }
       const reportedVerdict = reviewResultObject?.verdict ?? null;
       const rerunValidations = batchTaskExecutions.map((execution) =>
-        validateSubagentOutput(execution.cachedSubagentResult, execution.task)
+        validateSubagentOutput(execution.cachedSubagentResult, execution.task, { allowTextValidation })
       );
       const postReview = await runPostReviewValidation({
         reviewResult: reviewResultObject,
@@ -6122,9 +6292,12 @@ async function runCcReviewWorkflow(
 
       if (effectiveVerdict === "block") {
         log(`[Workflow Halted] Final workflow review remained blocked after ${maxReviewRepairRounds} repair round(s).`);
-        const summary = appendPersistedLogPathToSummary(
-          buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }),
-          persistedLogState.filePath
+        const summary = wrapWorkflowSummary(
+          buildSummaryReport(goal, taskResults, tasks, {
+            concurrency: resolvedConcurrency,
+            runId: workflowRunId,
+            artifactDir: artifactRunDir,
+          })
         );
         throw new WorkflowError(
           `Blocked by final workflow review (after ${maxReviewRepairRounds} repair round(s))`,
@@ -6171,8 +6344,16 @@ async function runCcReviewWorkflow(
       tasksCount: tasks.length,
     });
 
+    persistRunCheckpoint("complete");
+
     return {
-      summary: appendPersistedLogPathToSummary(buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }), persistedLogState.filePath),
+      summary: wrapWorkflowSummary(
+        buildSummaryReport(goal, taskResults, tasks, {
+          concurrency: resolvedConcurrency,
+          runId: workflowRunId,
+          artifactDir: artifactRunDir,
+        })
+      ),
       meta: buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency }),
     };
   } catch (err: any) {
@@ -6250,9 +6431,18 @@ async function runCcReviewWorkflow(
       }
     }
 
-    const summary = appendPersistedLogPathToSummary(
-      buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }),
-      persistedLogState.filePath
+    try {
+      persistRunCheckpoint(isCancelled ? "cancelled" : "failed");
+    } catch {
+      // best-effort
+    }
+
+    const summary = wrapWorkflowSummary(
+      buildSummaryReport(goal, taskResults, tasks, {
+        concurrency: resolvedConcurrency,
+        runId: workflowRunId,
+        artifactDir: artifactRunDir,
+      })
     );
     refreshWorkflowUi();
     throw new WorkflowError(err.message, summary, buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency }));

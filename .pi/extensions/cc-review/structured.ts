@@ -218,6 +218,7 @@ export function writeTaskArtifact(cwd: string, runId: string, artifact: TaskArti
 
 const WORKSPACE_SNAPSHOT_EXCLUDES = new Set([
   WORKFLOW_ARTIFACT_DIR,
+  ".cc-review",
   "workflow-logs.jsonl",
   "workflow-trace.jsonl",
   "node_modules",

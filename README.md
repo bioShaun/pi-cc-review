@@ -147,7 +147,7 @@ In `after-all` mode, an unrecoverable task execution or output-validation failur
 
 ### 2.4. Troubleshooting Provider Setup
 
-- **Missing CLI**: if the selected provider's CLI (`codex` or `claude`) is not installed or not on `PATH`, install it or switch providers. The subprocess will fail with the CLI's own error message; CC Review does not preflight credentials.
+- **Missing CLI**: CC Review runs a lightweight preflight before planning (unless `CC_REVIEW_SKIP_PREFLIGHT=1`). Use `/cc-review --check` or `checkOnly: true` to validate the environment without starting a workflow. If the selected provider CLI is missing from `PATH`, you get a CC Review-owned error with remediation hints before any planner tokens are spent.
 - **Auth failures from the CLI**: if `claude` or `codex` reports an auth/login error inside the review step, run the CLI directly once (`claude` / `codex login`) to refresh its login session, or export `ANTHROPIC_API_KEY`/`CLAUDE_API_KEY` (Claude) or `CODEX_API_KEY`/`OPENAI_API_KEY` (Codex) and re-run. CC Review will record the non-zero review exit as `completed_with_warnings` and continue.
 - **Unselected provider credentials**: only the selected backend's CLI is spawned. Missing credentials or missing CLI for the *unselected* provider never block the workflow.
 - **Unexpected provider value**: set `reviewProvider`, `--provider`, or `CC_REVIEW_PROVIDER` to exactly `codex` or `claude`, or omit/unset provider selection to use the default Codex reviewer. Values are case/whitespace normalized, but empty, whitespace-only, and unsupported names fail with an invalid provider error such as `Invalid reviewProvider` or `Invalid CC_REVIEW_PROVIDER`.
@@ -182,7 +182,7 @@ Use this checklist after changes that affect plugin registration, provider selec
 
 ### 2.7. Log Display and Observability
 
-CC Review separates **durable observability** (full history on disk) from **compact live surfaces** (TUI widget and tool `onUpdate` deltas). Each run writes a unique `workflow-logs-<runId>.jsonl` file in the workspace root (or appends to a fixed path when `--log-file` / `CC_REVIEW_LOG_FILE` is set). Consecutive runs never overwrite prior log files unless you explicitly reuse the same fixed path. The compact widget and `onUpdate` stream apply additional presentation rules so long goals, noisy info lines, and verbose bodies do not overwhelm the default view.
+CC Review separates **durable observability** (full history on disk) from **compact live surfaces** (TUI widget and tool `onUpdate` deltas). By default each run writes logs under `.cc-review/logs/<runId>/` (`workflow-logs.jsonl` and `workflow-trace.jsonl`). Set `CC_REVIEW_LOG_ROOT=1` to restore legacy workspace-root log files. Explicit `--log-file` / `CC_REVIEW_LOG_FILE` behavior is unchanged.
 
 #### Minimum log level (`--log-level` / `CC_REVIEW_LOG_LEVEL`)
 
@@ -300,7 +300,7 @@ CC_REVIEW_CPU_COUNT=4 node --experimental-strip-types tests/cc-review-behavior.t
 
 #### Execution log file (`--log-file` / `CC_REVIEW_LOG_FILE`)
 
-By default, each workflow run creates a unique `workflow-logs-<runId>.jsonl` file in the workspace root. Consecutive runs append to separate files, so prior run history is preserved. To reuse a fixed path across runs (append mode), pass `--log-file <path>` or set `CC_REVIEW_LOG_FILE` (for example `workflow-logs.jsonl`).
+By default, each workflow run writes under `.cc-review/logs/<runId>/workflow-logs.jsonl`. Consecutive runs use separate run directories. To reuse a fixed path across runs (append mode), pass `--log-file <path>` or set `CC_REVIEW_LOG_FILE`. Set `CC_REVIEW_LOG_ROOT=1` for legacy workspace-root `workflow-logs-<runId>.jsonl` files.
 
 ```bash
 # Default: unique per-run log file (no overwrite of prior runs)
@@ -310,6 +310,13 @@ By default, each workflow run creates a unique `workflow-logs-<runId>.jsonl` fil
 /cc-review --log-file ./my-cc-review.log.jsonl Implement the feature
 CC_REVIEW_LOG_FILE=./my-cc-review.log.jsonl pi --mode json -p "Use cc_review to implement: <goal>"
 ```
+
+#### Workflow control (`--plan-only`, `--resume`, role models)
+
+- **Plan only**: `/cc-review --plan-only <goal>` or `planOnly: true` — run the planner, write `cc-review-artifacts/<runId>/plan.json`, and exit without subagents or reviewers.
+- **Resume**: `/cc-review --resume <runId> <goal>` or `resumeRunId` — skip tasks already recorded in `checkpoint.json`; use `--from-task N` (0-based) to force a starting index. Checkpoints are updated after each task and on abort.
+- **Role models**: `CC_REVIEW_PLANNER_MODEL` and `CC_REVIEW_REVIEWER_MODEL` override provider default models for planning and review only; worker model continues from pi agent settings.
+- **Structured validation**: set `CC_REVIEW_ALLOW_TEXT_VALIDATION=0` or `allowTextValidation: false` to require trailing structured JSON from workers (transition default remains legacy text heuristics enabled).
 
 ---
 

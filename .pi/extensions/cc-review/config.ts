@@ -592,8 +592,20 @@ export function resolveCcReviewChecklistWindow(
   return { window: 8, source: "default" };
 }
 
+export function resolveAllowTextValidation(
+  options: { flag?: boolean; env?: NodeJS.ProcessEnv } = {}
+): boolean {
+  if (options.flag !== undefined) return options.flag === true;
+  const env = options.env ?? process.env;
+  const raw = env.CC_REVIEW_ALLOW_TEXT_VALIDATION;
+  // Transition-period default: keep legacy text heuristics enabled unless explicitly disabled.
+  if (raw === undefined || raw === "") return true;
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === "0" || normalized === "false" || normalized === "no") return false;
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
 // ---------------------------------------------------------------------------
-// DEVELOPMENT RECORD: CLI Parameters, Execution Logs, and Worker Concurrency Boundaries
 //
 // 1. Execution Log File:
 //    - Log file path generation: `path.join(workflowCwd, WORKFLOW_LOG_FILE)` where `WORKFLOW_LOG_FILE` is defined as "workflow-logs.jsonl" (defined in `.pi/extensions/cc-review/workflow.ts`).

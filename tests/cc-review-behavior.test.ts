@@ -56,9 +56,29 @@ import ccReviewExtension, {
   enterCcReviewWorkflowNest,
   CcReviewNestDepthError,
   CC_REVIEW_NEST_DEPTH_ENV,
+  runPreflight,
+  shouldSkipPreflight,
+  formatPreflightReport,
+  validateSubagentOutput,
+  resolveAllowTextValidation,
+  writeCheckpoint,
+  loadCheckpoint,
+  resolveCcReviewTracePath,
 } from "../.pi/extensions/cc-review.ts";
 
 const plainWidgetTheme = { fg: (_color: string, text: string) => text };
+
+function findWorkflowTracePath(cwd: string): string {
+  const logsRoot = path.join(cwd, ".cc-review", "logs");
+  if (!fs.existsSync(logsRoot)) {
+    throw new Error(`missing log directory: ${logsRoot}`);
+  }
+  for (const runId of fs.readdirSync(logsRoot)) {
+    const candidate = path.join(logsRoot, runId, "workflow-trace.jsonl");
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(`workflow-trace.jsonl not found under ${logsRoot}`);
+}
 
 function captureWidgetLines(
   content: string[] | ((tui: unknown, theme: unknown) => { render?: (width: number) => string[] }) | undefined,
@@ -935,13 +955,13 @@ describe("resolveCcReviewConcurrency selects the subagent concurrency limit", ()
 });
 
 describe("resolveCcReviewLogPath generates unique, stable log file paths", () => {
-  it("returns a unique path in cwd when no explicit path is configured", () => {
+  it("returns a unique path under .cc-review/logs/<runId> when no explicit path is configured", () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
     const runId = "20260701T120000000Z-abc123";
     const p = resolveCcReviewLogPath({ cwd, runId });
-    assert.equal(path.dirname(p), cwd);
-    assert.match(path.basename(p), /^workflow-logs-20260701T120000000Z-abc123\.jsonl$/);
-    assert.equal(p, path.join(cwd, "workflow-logs-20260701T120000000Z-abc123.jsonl"));
+    assert.equal(path.dirname(p), path.join(cwd, ".cc-review", "logs", runId));
+    assert.equal(path.basename(p), "workflow-logs.jsonl");
+    assert.equal(p, path.join(cwd, ".cc-review", "logs", runId, "workflow-logs.jsonl"));
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 
@@ -950,8 +970,8 @@ describe("resolveCcReviewLogPath generates unique, stable log file paths", () =>
     const p1 = resolveCcReviewLogPath({ cwd, runId: "run-a" });
     const p2 = resolveCcReviewLogPath({ cwd, runId: "run-b" });
     assert.notEqual(p1, p2);
-    assert.match(path.basename(p1), /run-a\.jsonl$/);
-    assert.match(path.basename(p2), /run-b\.jsonl$/);
+    assert.match(p1, /\/\.cc-review\/logs\/run-a\/workflow-logs\.jsonl$/);
+    assert.match(p2, /\/\.cc-review\/logs\/run-b\/workflow-logs\.jsonl$/);
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 
@@ -1608,6 +1628,7 @@ describe("CC Review Behavioral Regression Tests", () => {
     delete process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
     process.env.CC_REVIEW_LOG_FILE = "workflow-logs.jsonl";
     delete process.env.CC_REVIEW_NEST_DEPTH;
+    process.env.CC_REVIEW_SKIP_PREFLIGHT = "1";
     process.env.CODEX_API_KEY = "test-codex-review-key";
     process.env.ANTHROPIC_API_KEY = "test-claude-review-key";
     globalThis.fetch = originalFetch;
@@ -1982,7 +2003,7 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(plannerCalls, 1);
     assert.deepEqual(reviewCommands, ["claude"]);
 
-    const tracePath = path.join(tempTestDir, "workflow-trace.jsonl");
+    const tracePath = findWorkflowTracePath(tempTestDir);
     const traceLines = fs.readFileSync(tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(traceLines[0].reviewProvider, "claude");
     assert.ok(traceLines.some((entry) => entry.event === "subagent_assignment" && entry.role === "reviewer" && entry.agent === "claude"));
@@ -2878,7 +2899,7 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.match(reportText, /Task 1/);
     assert.match(reportText, /Task 2/);
 
-    const tracePath = path.join(tempTestDir, "workflow-trace.jsonl");
+    const tracePath = findWorkflowTracePath(tempTestDir);
     assert.ok(fs.existsSync(tracePath));
     const traceLines = fs.readFileSync(tracePath, "utf8").trim().split("\n");
     assert.ok(traceLines.length > 0);
@@ -2947,8 +2968,10 @@ describe("CC Review Behavioral Regression Tests", () => {
     const runDirs = fs.readdirSync(artifactRoot);
     assert.equal(runDirs.length, 1);
     const artifactFiles = fs.readdirSync(path.join(artifactRoot, runDirs[0])).sort();
-    assert.deepEqual(artifactFiles, ["task-001.json", "task-002.json"]);
-    for (const artifactFile of artifactFiles) {
+    assert.ok(artifactFiles.includes("task-001.json"));
+    assert.ok(artifactFiles.includes("task-002.json"));
+    assert.ok(artifactFiles.includes("checkpoint.json"));
+    for (const artifactFile of artifactFiles.filter((f) => f.startsWith("task-") && f.endsWith(".json"))) {
       const artifact = JSON.parse(
         fs.readFileSync(path.join(artifactRoot, runDirs[0], artifactFile), "utf8")
       );
@@ -3636,7 +3659,7 @@ describe("CC Review Behavioral Regression Tests", () => {
       assert.ok(entry.message, "every persisted entry should have a message");
     }
     // The trace file is separate from the human-readable log file.
-    const tracePath = path.join(tempTestDir, "workflow-trace.jsonl");
+    const tracePath = findWorkflowTracePath(tempTestDir);
     assert.ok(fs.existsSync(tracePath), "trace file should still exist as a separate stream");
     assert.notEqual(logPath, tracePath);
 
@@ -4505,10 +4528,17 @@ describe("CC Review Behavioral Regression Tests", () => {
       { cwd: tempTestDir }
     );
 
-    // Find the log file written by run 1
-    const filesAfterFirst = fs.readdirSync(tempTestDir).filter(f => f.startsWith("workflow-logs-") && f.endsWith(".jsonl"));
+    // Find the log file written by run 1 (default: .cc-review/logs/<runId>/workflow-logs.jsonl)
+    const listRunLogFiles = () => {
+      const logsRoot = path.join(tempTestDir, ".cc-review", "logs");
+      if (!fs.existsSync(logsRoot)) return [];
+      return fs.readdirSync(logsRoot)
+        .map((runId) => path.join(logsRoot, runId, "workflow-logs.jsonl"))
+        .filter((p) => fs.existsSync(p));
+    };
+    const filesAfterFirst = listRunLogFiles();
     assert.equal(filesAfterFirst.length, 1, "There should be exactly one unique log file after first run");
-    const firstLogPath = path.join(tempTestDir, filesAfterFirst[0]);
+    const firstLogPath = filesAfterFirst[0];
     const firstLogContent = fs.readFileSync(firstLogPath, "utf8");
     assert.match(firstLogContent, /=== Workflow run .* started/);
 
@@ -4523,13 +4553,12 @@ describe("CC Review Behavioral Regression Tests", () => {
     );
 
     // Find all log files after second run
-    const filesAfterSecond = fs.readdirSync(tempTestDir).filter(f => f.startsWith("workflow-logs-") && f.endsWith(".jsonl"));
+    const filesAfterSecond = listRunLogFiles();
     assert.equal(filesAfterSecond.length, 2, "There should be exactly two unique log files after second run");
 
     // Identify first and second log files
-    const secondLogFile = filesAfterSecond.find(f => f !== filesAfterFirst[0]);
-    assert.ok(secondLogFile, "Should find the second log file");
-    const secondLogPath = path.join(tempTestDir, secondLogFile);
+    const secondLogPath = filesAfterSecond.find((p) => p !== firstLogPath);
+    assert.ok(secondLogPath, "Should find the second log file");
 
     assert.notEqual(firstLogPath, secondLogPath, "Consecutive runs should generate different log file paths");
 
@@ -4835,7 +4864,7 @@ System prompt override`
         );
 
         // Verify workflow trace includes model name at start and end
-        const tracePath = path.join(tempTestDir, "workflow-trace.jsonl");
+        const tracePath = findWorkflowTracePath(tempTestDir);
         const traceLines = fs.readFileSync(tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 
         const assignmentEvent = traceLines.find(
@@ -5983,5 +6012,85 @@ describe("collapse consecutive identical log messages", () => {
     const logLines = lines.filter(line => line.includes("Codex planner still running"));
     assert.equal(logLines.length, 1);
     assert.ok(logLines[0].includes("(x2)"));
+  });
+});
+
+describe("optimization spec: preflight, validation, logs, checkpoint", () => {
+  it("runPreflight reports missing provider CLI with actionable text", () => {
+    const result = runPreflight({
+      provider: "claude",
+      providerCli: "__cc_review_missing_cli_xyz__",
+      checkPi: false,
+      env: { PATH: "/nonexistent" },
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.errors[0] ?? "", /CC Review:.*claude.*PATH/i);
+  });
+
+  it("shouldSkipPreflight respects CC_REVIEW_SKIP_PREFLIGHT", () => {
+    assert.equal(shouldSkipPreflight({ CC_REVIEW_SKIP_PREFLIGHT: "1" }), true);
+    assert.equal(shouldSkipPreflight({}), false);
+  });
+
+  it("validateSubagentOutput fails prose-only output when text validation is disabled", () => {
+    const result = validateSubagentOutput(
+      {
+        content: [{ type: "text", text: "All done. No issues found." }],
+        details: { results: [{ exitCode: 0 }] },
+      },
+      { title: "T", description: "d", acceptanceCriteria: "a" },
+      { allowTextValidation: false }
+    );
+    assert.equal(result.valid, false);
+    assert.match(result.error ?? "", /missing valid trailing JSON/i);
+  });
+
+  it("validateSubagentOutput allows legacy text heuristics by default (transition period)", () => {
+    const result = validateSubagentOutput(
+      {
+        content: [{ type: "text", text: "All done. No issues found." }],
+        details: { results: [{ exitCode: 0 }] },
+      },
+      { title: "T", description: "d", acceptanceCriteria: "a" },
+      { allowTextValidation: true }
+    );
+    assert.equal(result.valid, true);
+    assert.equal(result.schemaParseStatus, "fallback_text");
+  });
+
+  it("resolveAllowTextValidation defaults true during transition and honors strict env", () => {
+    assert.equal(resolveAllowTextValidation({}), true);
+    assert.equal(resolveAllowTextValidation({ env: { CC_REVIEW_ALLOW_TEXT_VALIDATION: "0" } }), false);
+    assert.equal(resolveAllowTextValidation({ env: { CC_REVIEW_ALLOW_TEXT_VALIDATION: "1" } }), true);
+  });
+
+  it("resolveCcReviewTracePath writes under .cc-review/logs/<runId>", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-trace-path-"));
+    const p = resolveCcReviewTracePath(cwd, "run-abc");
+    assert.equal(p, path.join(cwd, ".cc-review", "logs", "run-abc", "workflow-trace.jsonl"));
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("checkpoint round-trips plan and task completion state for resume", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-checkpoint-"));
+    const runId = "20260701T120000000Z-test01";
+    writeCheckpoint(cwd, {
+      schemaVersion: 1,
+      runId,
+      goal: "test goal",
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z",
+      reviewProvider: "codex",
+      reviewMode: "after-all",
+      tasks: [{ title: "A", description: "d", acceptanceCriteria: "a" }],
+      taskResults: [],
+      completedTaskIndices: [],
+      phase: "planning",
+    });
+    const loaded = loadCheckpoint(cwd, runId);
+    assert.ok(loaded);
+    assert.equal(loaded?.goal, "test goal");
+    assert.equal(loaded?.tasks.length, 1);
+    fs.rmSync(cwd, { recursive: true, force: true });
   });
 });

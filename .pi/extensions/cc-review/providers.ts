@@ -117,7 +117,7 @@ function buildCodexReviewArgs(
     // extractAssistantTextFromStream.
     "--json",
   ];
-  const model = readTrimmedEnv(env, "CODEX_MODEL");
+  const model = readTrimmedEnv(env, "CC_REVIEW_REVIEWER_MODEL") ?? readTrimmedEnv(env, "CODEX_MODEL");
   if (model) {
     args.push("--model", model);
   }
@@ -142,12 +142,24 @@ function buildClaudeReviewArgs(
     "--include-partial-messages",
     "--verbose",
   ];
-  const model = readTrimmedEnv(env, "CLAUDE_MODEL");
+  const model = readTrimmedEnv(env, "CC_REVIEW_REVIEWER_MODEL") ?? readTrimmedEnv(env, "CLAUDE_MODEL");
   if (model) {
     args.push("--model", model);
   }
   args.push(buildReviewPrompt(task, intent));
   return args;
+}
+
+export function resolvePlannerModelEnv(env: NodeJS.ProcessEnv = process.env, provider: ReviewProvider = "codex"): string | undefined {
+  const roleModel = readTrimmedEnv(env, "CC_REVIEW_PLANNER_MODEL");
+  if (roleModel) return roleModel;
+  return provider === "claude" ? readTrimmedEnv(env, "CLAUDE_MODEL") : readTrimmedEnv(env, "CODEX_MODEL");
+}
+
+export function resolveReviewerModelEnv(env: NodeJS.ProcessEnv = process.env, provider: ReviewProvider = "codex"): string | undefined {
+  const roleModel = readTrimmedEnv(env, "CC_REVIEW_REVIEWER_MODEL");
+  if (roleModel) return roleModel;
+  return provider === "claude" ? readTrimmedEnv(env, "CLAUDE_MODEL") : readTrimmedEnv(env, "CODEX_MODEL");
 }
 
 function normalizeReviewProvider(rawProvider: string, providerSource: ReviewProviderSource): ReviewProvider {

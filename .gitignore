@@ -1,5 +1,6 @@
 workflow-logs.jsonl
 workflow-trace.jsonl
+.cc-review/
 cc-review-artifacts/
 node_modules/
 

@@ -206,7 +206,11 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; logSources\?: string; reviewMode\?: string; reviewRepairRounds\?: number; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?(?:concurrency\?: number; )?(?:logFile\?: string; )?error\?: string \}/);
+  assert.match(source, /export function parseCcReviewCommandArgs\(args: string\):/);
+  assert.match(source, /checkOnly\?: boolean;/);
+  assert.match(source, /planOnly\?: boolean;/);
+  assert.match(source, /resumeRunId\?: string;/);
+  assert.match(source, /allowTextValidation\?: boolean;/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -689,7 +693,7 @@ test("log-level and log-sources resolvers are exported with the documented signa
   assert.match(source, /logSources:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional comma-separated list of compact-surface log sources/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?(?:\s+concurrency\?: number;\n)?(?:\s+concurrencyLimit\?: number;\n)?(?:\s+logFile\?: string;\n)?\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?(?:\s+concurrency\?: number;\n)?(?:\s+concurrencyLimit\?: number;\n)?(?:\s+logFile\?: string;\n)?(?:\s+checkOnly\?: boolean;\n)?(?:\s+planOnly\?: boolean;\n)?(?:\s+resumeRunId\?: string;\n)?(?:\s+fromTask\?: number;\n)?(?:\s+allowTextValidation\?: boolean;\n)?\}/
   );
   assert.match(
     source,
@@ -785,14 +789,14 @@ test("parent workflow context is summarized and formatted in subagent prompt", (
   );
   assert.match(source, /const summarizedParentContext = summarizeParentContext\(goal\);/);
   // The runtime now derives a structured handoff from accumulated taskResults
-  // and forwards it as the third argument when building the per-task prompt.
+  // and forwards it when building the per-task prompt (with optional state buffer).
   assert.match(source, /priorTaskHandoffFromResults\(taskResults\)/);
   assert.match(source, /const batchPriorResults = taskResults\.filter\(/);
   assert.match(source, /priorTaskHandoffFromResults\(batchPriorResults\)/);
   assert.match(source, /buildAfterAllExecutionBatches\(tasks\)/);
   assert.match(
     source,
-    /const subagentPrompt = buildSubagentTaskPrompt\(task, summarizedParentContext, priorHandoff\);/
+    /const subagentPrompt = buildSubagentTaskPrompt\(task, summarizedParentContext, priorHandoff, stateBufferSection\);/
   );
   assert.match(source, /Parent Workflow Context \(Summary\): \$\{parentContextSummary\}/);
   assert.match(source, /Acceptance Criteria:\\n\$\{task\.acceptanceCriteria\}/);
@@ -800,8 +804,8 @@ test("parent workflow context is summarized and formatted in subagent prompt", (
 });
 
 test("workflow validates subagent outputs before merging", () => {
-  assert.match(source, /function validateSubagentOutput\(/);
-  assert.match(source, /const validation = validateSubagentOutput\(result, task\)/);
+  assert.match(source, /export function validateSubagentOutput\(/);
+  assert.match(source, /const validation = validateSubagentOutput\(result, task, \{ allowTextValidation \}\)/);
   assert.match(source, /appendUnique\(unresolvedItemsForFailedTask, validation\.unresolvedItems \|\| \[validationError\]\)/);
   assert.match(source, /unresolvedItems = unresolvedItemsForFailedTask\.length > 0 \? \[\.\.\.unresolvedItemsForFailedTask\] : undefined/);
   assert.match(source, /validationError = validation\.error || "Output validation failed"/);
@@ -815,7 +819,7 @@ test("workflow handles partial results and surfaces unresolved items determinist
   assert.match(source, /allUnresolved\.push\(`Task Failed: "\$\{taskResult\.title\}" - Error: Subagent exited with code \$\{taskResult\.executionCode\}`\)/);
   assert.match(source, /allUnresolved\.push\(`Task Validation Failed: "\$\{taskResult\.title\}" - Reason: \$\{taskResult\.validationError\}`\)/);
   assert.match(source, /if \(err instanceof WorkflowError\)/);
-  assert.match(source, /const summary = appendPersistedLogPathToSummary\(\s*\n?\s*buildSummaryReport\(goal, taskResults, tasks(?:,\s*\{[^}]*\})?\),/);
+  assert.match(source, /const summary = wrapWorkflowSummary\(/);
   assert.match(source, /throw new WorkflowError\(err\.message, summary, buildCcReviewSummaryMeta\(taskResults(?:,\s*\{[^}]*\})?\)\);/);
 });
 
