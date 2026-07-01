@@ -161,8 +161,8 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.doesNotMatch(source, /Missing .* reviewer credentials/);
   assert.match(source, /reviewProvider:\s*\{\n\s+type: "string",\n\s+description: "Optional review backend/);
   assert.doesNotMatch(source, /reviewProvider:\s*\{\n\s+type: "string",\n\s+enum: \["codex", "claude"\]/);
-  assert.match(source, /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;/);
-  assert.match(source, /interface RunCcReviewWorkflowOptions \{\n\s+reviewProvider\?: string;/);
+  assert.match(source, /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;/);
+  assert.match(source, /interface RunCcReviewWorkflowOptions \{\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;/);
   assert.match(source, /function normalizeReviewProvider\(rawProvider: string, providerSource: ReviewProviderSource\): ReviewProvider/);
   assert.match(source, /function initializeSelectedReviewBackend\(provider: ReviewProvider, env: NodeJS\.ProcessEnv = process\.env\): ReviewProviderConfig/);
   assert.match(source, /return REVIEW_BACKEND_FACTORIES\[provider\]\.initialize\(env\)/);
@@ -180,7 +180,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
   assert.match(source, /const reviewProviderConfig = resolveReviewProviderConfig\(options\.reviewProvider\)/);
   assert.match(source, /buildArgs\(context: ReviewPromptContext\): string\[\]/);
-  assert.match(source, /buildReviewPrompt\(task\)/);
+  assert.match(source, /buildReviewPrompt\(task, intent\)/);
   assert.match(source, /reviewProviderConfig\.buildArgs\(\{ task \}\)/);
   assert.match(source, /reviewProviderConfig\.command/);
   assert.match(source, /reviewProviderConfig\.label/);
@@ -198,7 +198,7 @@ test("review timing supports per-task and after-all orchestration", () => {
   assert.match(source, /transitionToBatchReviewing\(\)/);
   assert.match(source, /const batchReviewTask: Task = \{/);
   assert.match(source, /BATCH_REPAIR_LOOP: for \(let repairRound = 0; ; repairRound\+\+\)/);
-  assert.match(source, /reviewProviderConfig\.buildArgs\(\{ task: reviewTask \}\)/);
+  assert.match(source, /reviewProviderConfig\.buildArgs\(\{\n\s+task: reviewTask,\n\s+intent: repairRound === 0 \? "inspect" : "repair",\n\s+\}\)/);
   assert.match(source, /continue BATCH_REPAIR_LOOP/);
   assert.match(source, /Queued "\$\{task\.title\}" for the final workflow review/);
 });
@@ -286,12 +286,12 @@ test("README manual verification checklist covers install, default, Claude, mark
 
 test("Claude review subprocess integration uses workspace-capable Claude Code", () => {
   assert.match(source, /command: "claude"/);
-  assert.match(source, /function buildClaudeReviewArgs\(task: Task, env: NodeJS\.ProcessEnv = process\.env\): string\[\]/);
+  assert.match(source, /function buildClaudeReviewArgs\([\s\S]*?intent: "inspect" \| "repair" = "repair"[\s\S]*?\): string\[\]/);
   assert.match(source, /"--dangerously-skip-permissions"/);
   assert.match(source, /"--no-session-persistence"/);
   assert.match(source, /"-p"/);
   assert.match(source, /CLAUDE_MODEL/);
-  assert.match(source, /buildReviewPrompt\(task\)/);
+  assert.match(source, /buildReviewPrompt\(task, intent\)/);
   assert.match(source, /runReviewerProcess\(\n\s+reviewProviderConfig\.label,\n\s+reviewProviderConfig\.command,\n\s+reviewArgs/);
   // P0-3: claude planner+reviewer stream NDJSON for live observability.
   assert.match(source, /"--output-format", "stream-json"/);
@@ -580,7 +580,7 @@ test("filter helper is exported and wired into the widget live-log slice", () =>
   );
 });
 
-test("log-level resolver is exported with the documented signature and wired through workflow + parsers", () => {
+test("log-level and log-sources resolvers are exported with the documented signature and wired through workflow + parsers", () => {
   // Resolver export with the documented signature.
   assert.match(
     source,
@@ -600,15 +600,41 @@ test("log-level resolver is exported with the documented signature and wired thr
   assert.match(source, /trimmed === "warn"\) return "warning"/);
   assert.match(source, /trimmed === "fatal"\) return "error"/);
 
+  // Log sources resolver export with the documented signature.
+  assert.match(
+    source,
+    /export interface ResolveCcReviewLogSourcesOptions \{[\s\S]*?flag\?: string;[\s\S]*?env\?: NodeJS\.ProcessEnv;[\s\S]*?\}/
+  );
+  assert.match(
+    source,
+    /export interface ResolveCcReviewLogSourcesResult \{[\s\S]*?sources: string\[\] \| undefined;[\s\S]*?source: "flag" \| "env" \| "default";[\s\S]*?invalidInput\?: \{ source: "flag" \| "env"; raw: string \};[\s\S]*?\}/
+  );
+  assert.match(
+    source,
+    /export function resolveCcReviewLogSources\(\s*\n\s*options: ResolveCcReviewLogSourcesOptions = \{\}\s*\n\s*\): ResolveCcReviewLogSourcesResult/
+  );
+  // Reads CC_REVIEW_LOG_SOURCES exactly once, from the supplied env (default process.env).
+  assert.match(source, /env\.CC_REVIEW_LOG_SOURCES/);
+
   // Workflow resolves the level once at startup and reuses it downstream.
   assert.match(
     source,
     /const logLevelResolution = resolveCcReviewLogLevel\(\{ flag: options\.logLevel, env: process\.env \}\);\s*\n\s*const resolvedLogLevel: CcReviewLogSeverity = logLevelResolution\.level/
   );
+  // Workflow resolves the sources once at startup and reuses it downstream.
+  assert.match(
+    source,
+    /const logSourcesResolution = resolveCcReviewLogSources\(\{ flag: options\.logSources, env: process\.env \}\);\s*\n\s*const resolvedLogSources: string\[\] \| undefined = logSourcesResolution\.sources/
+  );
   // Invalid input emits exactly one warning log entry, NOT a throw.
   assert.match(
     source,
     /if \(logLevelResolution\.invalidInput\) \{[\s\S]*?log\(\{[\s\S]*?severity: "warning",[\s\S]*?\}\);[\s\S]*?\}/
+  );
+  // Invalid logSources input emits exactly one warning log entry, NOT a throw.
+  assert.match(
+    source,
+    /if \(logSourcesResolution\.invalidInput\) \{[\s\S]*?log\(\{[\s\S]*?severity: "warning",[\s\S]*?\}\);[\s\S]*?\}/
   );
 
   // Slash command parser strips --log-level <value> and --log-level=<value>.
@@ -616,19 +642,31 @@ test("log-level resolver is exported with the documented signature and wired thr
   assert.match(source, /token\.match\(\/\^--log-level=\(\.\*\)\$\/\)/);
   assert.match(source, /if \(token === "--log-level"\)/);
 
-  // Tool schema and propagation paths expose logLevel.
+  // Slash command parser strips --log-sources <value> and --log-sources=<value>.
+  assert.match(source, /const hasLogSourcesFlag = \/\(\?:\^\|\\s\)--log-sources\(\?:=\|\\s\|\$\)\//);
+  assert.match(source, /token\.match\(\/\^--log-sources=\(\.\*\)\$\/\)/);
+  assert.match(source, /if \(token === "--log-sources"\)/);
+
+  // Tool schema and propagation paths expose logLevel and logSources.
   assert.match(source, /logLevel:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional minimum log severity/);
+  assert.match(source, /logSources:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional comma-separated list of compact-surface log sources/);
   assert.match(
     source,
     /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?\}/
   );
   assert.match(
     source,
-    /interface RunCcReviewWorkflowOptions \{[\s\S]*?reviewProvider\?: string;[\s\S]*?logLevel\?: string;[\s\S]*?reviewMode\?: string;[\s\S]*?validationCommands\?:/
+    /interface RunCcReviewWorkflowOptions \{[\s\S]*?reviewProvider\?: string;[\s\S]*?logLevel\?: string;[\s\S]*?logSources\?: string;[\s\S]*?reviewMode\?: string;[\s\S]*?validationCommands\?:/
   );
   assert.match(source, /logLevel: params\.logLevel/);
   assert.match(source, /logLevel: parsedArgs\.logLevel/);
+  assert.match(source, /logSources: params\.logSources/);
+  assert.match(source, /logSources: parsedArgs\.logSources/);
 
+  assert.match(
+    source,
+    /const passesLogSources = resolvedLogSources === undefined \|\| resolvedLogSources\.includes\(entry\.source\);/
+  );
   // Persisted writes happen BEFORE the onUpdate filter gate so workflow-logs.jsonl is unfiltered.
   assert.match(
     source,
@@ -919,9 +957,33 @@ test("README documents log display controls and compact widget affordances", () 
     "workflow-logs.jsonl",
     "never filtered",
     "warn` maps to `warning",
+    "Log sources (`--log-sources` / `CC_REVIEW_LOG_SOURCES`)",
+    "planner",
+    "subagent",
+    "reviewer",
+    "cc-review",
+    "The tool parameter is `logSources`",
+    "Explicit values override the environment",
+    "invalid values show all sources with one warning",
+    "persisted logs remain unfiltered",
   ]) {
     assert.match(readme, new RegExp(requiredTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
+});
+
+test("user-facing slash-command and tool help contain detailed log-source controls documentation", () => {
+  assert.match(source, /registerCommand\("cc-review"/);
+  assert.match(source, /--log-sources/);
+  assert.match(source, /CC_REVIEW_LOG_SOURCES/);
+  assert.match(source, /planner,subagent,reviewer,cc-review/);
+  assert.match(source, /Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered/);
+
+  assert.match(source, /registerTool\(\{/);
+  assert.match(source, /logSources/);
+  assert.match(source, /CC_REVIEW_LOG_SOURCES/);
+  assert.match(source, /Explicit logSources override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered/);
+
+  assert.match(source, /logSources:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional comma-separated list of compact-surface log sources to keep \(planner, subagent, reviewer, cc-review\)\. Omit to use CC_REVIEW_LOG_SOURCES or show all\. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered\."/);
 });
 
 test("cc-review-summary message renderer is registered behind capability guards", () => {

@@ -988,9 +988,9 @@ describe("resolvePlannerTimeoutMs / resolveReviewerTimeoutMs (P0-4: phase timeou
 });
 
 describe("resolveMaxReviewRepairRounds (P1-1: repair loop bound)", () => {
-  it("defaults to 0 so re-review is opt-in", () => {
+  it("defaults to one observable repair/re-review round", () => {
     assert.equal(resolveMaxReviewRepairRounds({}), DEFAULT_MAX_REVIEW_REPAIR_ROUNDS);
-    assert.equal(DEFAULT_MAX_REVIEW_REPAIR_ROUNDS, 0);
+    assert.equal(DEFAULT_MAX_REVIEW_REPAIR_ROUNDS, 1);
   });
 
   it("reads CC_REVIEW_MAX_REPAIR_ROUNDS", () => {
@@ -1002,9 +1002,9 @@ describe("resolveMaxReviewRepairRounds (P1-1: repair loop bound)", () => {
   });
 
   it("invalid values fall back to default", () => {
-    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "abc" } }), 0);
-    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "-1" } }), 0);
-    assert.equal(resolveMaxReviewRepairRounds({ flag: 1.5 }), 0);
+    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "abc" } }), 1);
+    assert.equal(resolveMaxReviewRepairRounds({ env: { CC_REVIEW_MAX_REPAIR_ROUNDS: "-1" } }), 1);
+    assert.equal(resolveMaxReviewRepairRounds({ flag: 1.5 }), 1);
   });
 
   it("explicit parameter overrides the environment", () => {
@@ -2550,7 +2550,6 @@ describe("CC Review Behavioral Regression Tests", () => {
       {
         goal: "Build and repair the integrated workflow",
         reviewMode: "after-all",
-        reviewRepairRounds: 2,
       },
       undefined,
       undefined,
@@ -2561,8 +2560,26 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(result.details.status, "completed");
     assert.equal(subagentCalls, 1, "planned task execution should not be repeated");
     assert.equal(reviewPrompts.length, 2, "final review should run again after the repair request");
-    assert.match(reviewPrompts[1], /repair round 1\/2/);
+    assert.match(reviewPrompts[0], /inspection-only review phase/);
+    assert.match(reviewPrompts[0], /Do not modify workspace files or attempt repairs/);
+    assert.match(reviewPrompts[1], /This is a repair phase/);
+    assert.match(reviewPrompts[1], /repair round 1\/1/);
     assert.match(reviewPrompts[1], /\[P1\] src\/integration\.ts:12: repair this integration bug/);
+
+    const lifecycleEvents = fs.readFileSync(
+      path.join(tempTestDir, "workflow-logs.jsonl"),
+      "utf8"
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.details?.event)
+      .map((entry) => entry.details.event);
+    assert.deepEqual(lifecycleEvents, [
+      "review_finding",
+      "repair_started",
+      "repair_completed",
+    ]);
   });
 
   it("after-all repair reruns failed orchestrator validation after the reviewer fixes it", async () => {
@@ -3710,6 +3727,17 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.match(result.content[0].text, /blocked by reviewer/i);
     assert.match(result.details.error, /repair round/);
     assert.equal(reviewCallCount, 3, `expected 3 review calls (1 + 2 repair), got ${reviewCallCount}`);
+    assert.equal(result.details.status, "failed");
+    assert.ok(result.details.meta);
+    assert.deepEqual(result.details.meta.taskOutcomes, {
+      review_blocked: 3,
+      failed: 0,
+      warning: 0,
+      completed: 0,
+      cancelled: 0,
+    });
+    assert.equal(result.details.meta.topBlockers.length, 3);
+    assert.equal(result.details.meta.topBlockers[0].message, "fatal error");
   });
 
   it("P2-1: persisted log is not truncated between runs (history preserved)", async () => {
@@ -3767,6 +3795,104 @@ describe("CC Review Behavioral Regression Tests", () => {
     const allEntries = linesAfterSecond.map((line) => JSON.parse(line));
     const boundaryEntries = allEntries.filter((e: any) => /Workflow run .* started/.test(e.message ?? ""));
     assert.ok(boundaryEntries.length >= 2, "should have ≥2 run-boundary entries");
+  });
+
+  it("failed workflow execution attaches structured metadata details", async () => {
+    // 1) verification plan load failure
+    const validationConfigPath = path.join(tempTestDir, ".cc-review-validation.json");
+    fs.writeFileSync(validationConfigPath, "{ malformed", "utf8");
+    const badPlanResult = await registeredTool.execute(
+      "tool-call-bad-plan",
+      { goal: "Goal with bad verification plan" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+    assert.equal(badPlanResult.isError, true);
+    assert.equal(badPlanResult.details.status, "failed");
+    assert.ok(badPlanResult.details.error);
+    assert.ok(badPlanResult.details.meta);
+    assert.deepEqual(badPlanResult.details.meta.taskOutcomes, {
+      review_blocked: 0,
+      completed: 0,
+      failed: 0,
+      warning: 0,
+      cancelled: 0,
+    });
+
+    // 2) unexpected errors are wrapped and carry accumulated metadata
+    fs.rmSync(validationConfigPath, { force: true });
+    mockSpawnHandler = (command, args) => {
+      throw new Error("Unexpected crash during planning");
+    };
+
+    const crashResult = await registeredTool.execute(
+      "tool-call-unexpected-crash",
+      { goal: "Always crashes" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+    assert.equal(crashResult.isError, true);
+    assert.equal(crashResult.details.status, "failed");
+    assert.match(crashResult.details.error, /Unexpected crash during planning/);
+    assert.ok(crashResult.details.meta);
+    assert.deepEqual(crashResult.details.meta.taskOutcomes, {
+      review_blocked: 0,
+      completed: 0,
+      failed: 0,
+      warning: 0,
+      cancelled: 0,
+    });
+  });
+
+  it("transitions state and phase to failed on unrecoverable errors", async () => {
+    const statusSnapshots: string[] = [];
+    const widgetSnapshots: string[][] = [];
+    let widgetCleared = false;
+    let statusCleared = false;
+    const uiThemeMock = {
+      fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+    };
+
+    const captureCtx = {
+      cwd: tempTestDir,
+      ui: {
+        theme: uiThemeMock,
+        setWidget: (_id: string, content: any) => {
+          if (content === undefined) widgetCleared = true;
+          const lines = captureWidgetLines(content);
+          if (lines) widgetSnapshots.push(lines);
+        },
+        setStatus: (_id: string, value: string | undefined) => {
+          if (value === undefined) statusCleared = true;
+          if (value) statusSnapshots.push(value);
+        },
+      },
+    };
+
+    // 1) verification plan load failure
+    fs.writeFileSync(path.join(tempTestDir, ".cc-review-validation.json"), "{ malformed", "utf8");
+    await registeredTool.execute(
+      "tool-call-bad-plan-capture",
+      { goal: "Goal with bad verification plan" },
+      undefined,
+      undefined,
+      captureCtx
+    );
+
+    // Verify that the status bar was updated with error-colored failed status text
+    const failedStatus = statusSnapshots.find((s) => s.includes("[error]") && s.includes("Failed"));
+    assert.ok(failedStatus, "Should find error-colored failed status");
+    assert.match(failedStatus, /\[error\]\[CC Review\] Failed/);
+
+    // Verify that the widget included 'Workflow failed'
+    const hasWorkflowFailed = widgetSnapshots.some((lines) =>
+      lines.some((line) => line.includes("Workflow failed"))
+    );
+    assert.ok(hasWorkflowFailed, "Should find 'Workflow failed' in widget lines");
+    assert.equal(widgetCleared, true, "Failed workflow should clear its widget");
+    assert.equal(statusCleared, true, "Failed workflow should clear its status");
   });
 });
 

@@ -14,6 +14,7 @@ import {
   validateStructuredSubagentReport,
   writeTaskArtifact,
   WORKFLOW_ARTIFACT_DIR,
+  buildSummaryMeta,
 } from "../.pi/extensions/cc-review/structured.ts";
 
 test("parseSubagentStructuredReport accepts completed JSON at end of text", () => {
@@ -176,4 +177,42 @@ test("extractBalancedJsonObject returns undefined for unbalanced or empty input"
   assert.equal(extractBalancedJsonObject("no braces here", "first"), undefined);
   // Opening brace with no matching close should not produce a candidate.
   assert.equal(extractBalancedJsonObject('prefix {"unterminated":[1, 2', "first"), undefined);
+});
+
+test("buildSummaryMeta aggregates cancelled results without incrementing failed", () => {
+  const taskResults = [
+    { status: "cancelled" as const }
+  ];
+  const meta = buildSummaryMeta(taskResults);
+  assert.equal(meta.taskOutcomes.cancelled, 1);
+  assert.equal(meta.taskOutcomes.failed, 0);
+  assert.equal(meta.taskOutcomes.review_blocked, 0);
+  assert.equal(meta.taskOutcomes.warning, 0);
+  assert.equal(meta.taskOutcomes.completed, 0);
+});
+
+test("buildSummaryMeta aggregates failed and validation_failed results into failed", () => {
+  const taskResults = [
+    { status: "failed" as const },
+    { status: "validation_failed" as const }
+  ];
+  const meta = buildSummaryMeta(taskResults);
+  assert.equal(meta.taskOutcomes.failed, 2);
+  assert.equal(meta.taskOutcomes.cancelled, 0);
+});
+
+test("buildSummaryMeta handles mixed-outcome aggregation correctly", () => {
+  const taskResults = [
+    { status: "completed" as const },
+    { status: "completed_with_warnings" as const },
+    { status: "failed" as const },
+    { status: "cancelled" as const },
+    { status: "review_blocked" as const }
+  ];
+  const meta = buildSummaryMeta(taskResults);
+  assert.equal(meta.taskOutcomes.completed, 1);
+  assert.equal(meta.taskOutcomes.warning, 1);
+  assert.equal(meta.taskOutcomes.failed, 1);
+  assert.equal(meta.taskOutcomes.cancelled, 1);
+  assert.equal(meta.taskOutcomes.review_blocked, 1);
 });

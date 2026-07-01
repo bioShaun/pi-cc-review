@@ -213,7 +213,7 @@ Optionally restrict compact widget and `onUpdate` logs to a comma-separated allo
 CC_REVIEW_LOG_SOURCES=reviewer,cc-review pi --mode json -p "Use cc_review to implement: <goal>"
 ```
 
-The tool parameter is `logSources`. Explicit tool/slash values take precedence over the environment. Invalid sources fall back to showing all sources and produce one warning; persisted `workflow-logs.jsonl` remains unfiltered.
+The tool parameter is `logSources`. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered (the persisted `workflow-logs.jsonl` is never filtered).
 
 #### Compact widget affordances
 
@@ -246,11 +246,11 @@ CC_REVIEW_TASK_TIMEOUT_MS=0 pi --mode json -p "Use the cc_review tool to impleme
 
 #### Reviewer repair loop (`reviewRepairRounds`)
 
-By default, review runs once: the reviewer inspects the workspace, fixes findings directly, and validates those fixes in the same invocation. Automatic re-review is opt-in. When enabled, a per-task `block` re-dispatches the generator before review runs again; in `after-all` mode, CC Review re-dispatches the final reviewer with findings and failed verification diagnostics.
+By default, `after-all` review uses two explicit phases. The first reviewer invocation is inspection-only and emits each actionable issue as `[Review Finding]`. When findings exist, CC Review emits `[Repair Started]`, re-dispatches the reviewer with the structured findings, runs repository verification, and emits `[Repair Completed]` only after validation passes. A failed or still-blocked repair emits `[Repair Failed]`.
 
 Reviewer file changes require a repository-owned `.cc-review-validation.json`. This repository includes one that runs the static, structured, UI, and behavioral suites; failed commands are included in the next repair prompt and rerun after the fix.
 
-The default is `0`, which performs no re-review and hard-fails if the initial review remains blocked. Configure it through any interface:
+The default is `1`, allowing one repair/re-review round after inspection. Set it to `0` to disable repair and hard-fail if the initial review remains blocked. Configure it through any interface:
 
 ```bash
 # Slash command

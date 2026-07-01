@@ -561,6 +561,57 @@ describe("CC Review UI Regression Tests", () => {
     });
   });
 
+  // 6b. Failed, Cancelled, and Timeout Widget State Rendering
+  describe("Failed, Cancelled, and Timeout Widget State Rendering", () => {
+    it("renders Failed state with 'Workflow failed' in theme error color", () => {
+      const state = createBaseState({
+        displayState: "failed",
+      });
+      const themeMock = {
+        fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+      };
+      const lines = buildCcReviewWidgetLines(state, {
+        width: 120,
+        theme: themeMock,
+      });
+      const failedLine = lines.find((l) => l.includes("Workflow failed"));
+      assert.ok(failedLine, "Should find 'Workflow failed' line");
+      assert.match(failedLine, /\[error\].*Workflow failed.*\[\/error\]/);
+    });
+
+    it("renders Cancelled state with 'Cancelled by user' in theme error color", () => {
+      const state = createBaseState({
+        displayState: "cancelled",
+      });
+      const themeMock = {
+        fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+      };
+      const lines = buildCcReviewWidgetLines(state, {
+        width: 120,
+        theme: themeMock,
+      });
+      const cancelledLine = lines.find((l) => l.includes("Cancelled by user"));
+      assert.ok(cancelledLine, "Should find 'Cancelled by user' line");
+      assert.match(cancelledLine, /\[error\].*Cancelled by user.*\[\/error\]/);
+    });
+
+    it("renders Timeout state with 'Timed out' in theme error color", () => {
+      const state = createBaseState({
+        displayState: "timeout",
+      });
+      const themeMock = {
+        fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+      };
+      const lines = buildCcReviewWidgetLines(state, {
+        width: 120,
+        theme: themeMock,
+      });
+      const timeoutLine = lines.find((l) => l.includes("Timed out"));
+      assert.ok(timeoutLine, "Should find 'Timed out' line");
+      assert.match(timeoutLine, /\[error\].*Timed out.*\[\/error\]/);
+    });
+  });
+
   // 7. Log Filtering and Hidden Hints Tests
   describe("Log Filtering and Hidden Hints", () => {
     it("displays '1 log hidden' when exactly one log is filtered out", () => {
@@ -1059,6 +1110,48 @@ describe("CC Review UI Regression Tests", () => {
       assert.match(compExpanded.text, /complete markdown report/);
     });
 
+    it("DOD-2 & DOD-3: renderResult extracts non-default provider and mode values from result.details, defaulting safely when details are absent", () => {
+      // 1) Non-default values (claude and per-task)
+      const resultClaude = {
+        content: [{ type: "text", text: "Summary report" }],
+        details: {
+          goal: "Specific Goal",
+          reviewProvider: "claude",
+          reviewMode: "per-task",
+          meta: {
+            taskOutcomes: { completed: 1, warning: 0, failed: 0 }
+          }
+        }
+      };
+      const compClaude = registeredTool.renderResult(resultClaude, { expanded: false }, mockTheme);
+      assert.match(compClaude.text, /provider: claude/);
+      assert.match(compClaude.text, /mode: per-task/);
+
+      // 2) Partial mode non-default values
+      const compClaudePartial = registeredTool.renderResult(resultClaude, { isPartial: true }, mockTheme);
+      assert.match(compClaudePartial.text, /provider: claude/);
+      assert.match(compClaudePartial.text, /mode: per-task/);
+
+      // 3) Default values when details is completely absent (undefined)
+      const resultNoDetails = {
+        content: [{ type: "text", text: "Summary report" }]
+      };
+      const compNoDetails = registeredTool.renderResult(resultNoDetails, { expanded: false }, mockTheme);
+      assert.match(compNoDetails.text, /provider: codex/);
+      assert.match(compNoDetails.text, /mode: after-all/);
+
+      // 4) Default values when details properties are missing
+      const resultMissingProps = {
+        content: [{ type: "text", text: "Summary report" }],
+        details: {
+          goal: "Empty properties goal"
+        }
+      };
+      const compMissingProps = registeredTool.renderResult(resultMissingProps, { expanded: false }, mockTheme);
+      assert.match(compMissingProps.text, /provider: codex/);
+      assert.match(compMissingProps.text, /mode: after-all/);
+    });
+
     it("DOD-3: handles headless environments safely by returning undefined when pi-tui cannot load", async () => {
       const { createRequire } = await import("node:module");
       const require = createRequire(import.meta.url);
@@ -1075,7 +1168,7 @@ describe("CC Review UI Regression Tests", () => {
         const resCall = registeredTool.renderCall({}, mockTheme, {});
         assert.equal(resCall, undefined, "renderCall should return undefined in headless");
 
-        const resResult = registeredTool.renderResult({}, {}, mockTheme, {});
+        const resResult = registeredTool.renderResult({}, {}, mockTheme);
         assert.equal(resResult, undefined, "renderResult should return undefined in headless");
       } finally {
         Module.prototype.require = originalRequire;

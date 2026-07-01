@@ -16,6 +16,7 @@ import {
   type TaskArtifact,
   type TaskStatus,
   type VerificationCommand,
+  type VerificationPlan,
   buildFindingsPayload,
   buildSummaryMeta,
   deriveEffectiveVerdict,
@@ -181,7 +182,7 @@ const CcReviewParams = {
     },
     logSources: {
       type: "string",
-      description: "Optional comma-separated list of compact-surface log sources to keep (planner, subagent, reviewer, cc-review). Omit to use CC_REVIEW_LOG_SOURCES or show all.",
+      description: "Optional comma-separated list of compact-surface log sources to keep (planner, subagent, reviewer, cc-review). Omit to use CC_REVIEW_LOG_SOURCES or show all. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered.",
     },
     reviewMode: {
       type: "string",
@@ -190,7 +191,7 @@ const CcReviewParams = {
     reviewRepairRounds: {
       type: "integer",
       minimum: 0,
-      description: "Optional number of repair/re-review rounds after an initial block. 0 disables re-review. Omit to use CC_REVIEW_MAX_REPAIR_ROUNDS or the default 0.",
+      description: "Optional number of repair/re-review rounds after initial inspection. 0 disables repair. Omit to use CC_REVIEW_MAX_REPAIR_ROUNDS or the default 1.",
     },
     taskTimeoutMs: {
       type: "number",
@@ -1064,11 +1065,11 @@ function resolvePhaseTimeoutFromEnv(env: NodeJS.ProcessEnv, key: string, fallbac
 // to this many rounds before hard-failing.
 //
 // Precedence: explicit `flag` (tool param / slash flag
-// `--review-repair-rounds`) > `env.CC_REVIEW_MAX_REPAIR_ROUNDS` > default 0.
-// Re-review is opt-in; the reviewer still fixes findings and validates within
-// its initial review invocation.
+// `--review-repair-rounds`) > `env.CC_REVIEW_MAX_REPAIR_ROUNDS` > default 1.
+// One repair round is enabled by default so after-all review can inspect first,
+// then expose a separate, observable repair lifecycle.
 // ---------------------------------------------------------------------------
-export const DEFAULT_MAX_REVIEW_REPAIR_ROUNDS = 0;
+export const DEFAULT_MAX_REVIEW_REPAIR_ROUNDS = 1;
 
 export interface ResolveMaxReviewRepairRoundsOptions {
   flag?: string | number;
@@ -2224,6 +2225,7 @@ type ReviewModeSource = "reviewMode" | "CC_REVIEW_MODE";
 
 interface ReviewPromptContext {
   task: Task;
+  intent?: "inspect" | "repair";
 }
 
 interface ReviewProviderConfig {
@@ -2246,13 +2248,24 @@ interface ReviewBackendFactory {
 
 const SUPPORTED_REVIEW_PROVIDERS: readonly ReviewProvider[] = ["codex", "claude"];
 
-function buildReviewPrompt(task: Task): string {
+function buildReviewPrompt(task: Task, intent: "inspect" | "repair" = "repair"): string {
+  const intentInstructions = intent === "inspect"
+    ? [
+        "This is an inspection-only review phase.",
+        "Do not modify workspace files or attempt repairs.",
+        "Report every actionable issue with status unfixed so the orchestrator can start a separate repair phase.",
+        "Do not include postFixValidation.",
+      ]
+    : [
+        "This is a repair phase.",
+        "Fix the supplied review findings directly in-place in the workspace files and verify your fixes.",
+        "Include postFixValidation with status passed or failed and brief evidence when fixes are applied.",
+      ];
   return [
     `Review the changes in the workspace for task: '${task.title}'.`,
     `Task description: '${task.description}'.`,
     "Identify bugs, compile/syntax errors, incomplete features, or logical flaws.",
-    "If issues are found, fix them directly in-place in the workspace files and verify your fixes.",
-    "If you applied fixes, include postFixValidation with status passed or failed and brief evidence.",
+    ...intentInstructions,
     "End your final response with one JSON object (prose allowed above it) using this shape:",
     '{"verdict":"ship|ship_with_warnings|block","summary":"...","findings":[{"priority":"P0|P1|P2|P3","confidence":0.0,"file":"optional/path","line":1,"message":"...","status":"fixed|unfixed|not_applicable"}],"postFixValidation":{"status":"passed|failed","evidence":"..."}}',
     "postFixValidation is required when any finding has status fixed.",
@@ -2275,7 +2288,7 @@ const REVIEW_BACKEND_FACTORIES: Record<ReviewProvider, ReviewBackendFactory> = {
         warningName: "codex review",
         credentialEnvKeys,
         modelEnvKey: "CODEX_MODEL",
-        buildArgs: ({ task }) => buildCodexReviewArgs(task, env),
+        buildArgs: ({ task, intent }) => buildCodexReviewArgs(task, env, intent),
       };
     },
   },
@@ -2294,7 +2307,7 @@ const REVIEW_BACKEND_FACTORIES: Record<ReviewProvider, ReviewBackendFactory> = {
         warningName: "claude review",
         credentialEnvKeys,
         modelEnvKey: "CLAUDE_MODEL",
-        buildArgs: ({ task }) => buildClaudeReviewArgs(task, env),
+        buildArgs: ({ task, intent }) => buildClaudeReviewArgs(task, env, intent),
       };
     },
   },
@@ -2307,7 +2320,11 @@ function readTrimmedEnv(env: NodeJS.ProcessEnv, key: string): string | undefined
   return trimmed ? trimmed : undefined;
 }
 
-function buildCodexReviewArgs(task: Task, env: NodeJS.ProcessEnv = process.env): string[] {
+function buildCodexReviewArgs(
+  task: Task,
+  env: NodeJS.ProcessEnv = process.env,
+  intent: "inspect" | "repair" = "repair"
+): string[] {
   const args = [
     "exec",
     "--skip-git-repo-check",
@@ -2322,11 +2339,15 @@ function buildCodexReviewArgs(task: Task, env: NodeJS.ProcessEnv = process.env):
   if (model) {
     args.push("--model", model);
   }
-  args.push(buildReviewPrompt(task));
+  args.push(buildReviewPrompt(task, intent));
   return args;
 }
 
-function buildClaudeReviewArgs(task: Task, env: NodeJS.ProcessEnv = process.env): string[] {
+function buildClaudeReviewArgs(
+  task: Task,
+  env: NodeJS.ProcessEnv = process.env,
+  intent: "inspect" | "repair" = "repair"
+): string[] {
   const args = [
     "-p",
     "--dangerously-skip-permissions",
@@ -2342,7 +2363,7 @@ function buildClaudeReviewArgs(task: Task, env: NodeJS.ProcessEnv = process.env)
   if (model) {
     args.push("--model", model);
   }
-  args.push(buildReviewPrompt(task));
+  args.push(buildReviewPrompt(task, intent));
   return args;
 }
 
@@ -2634,7 +2655,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to opt into repair/re-review rounds (default 0; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to bound repair/re-review rounds (default 1; 0 disables; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -2698,7 +2719,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to opt into repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 0. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
+    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to bound repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 1; 0 disables repair. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Explicit logSources override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
       const renderDetails = {
@@ -2730,7 +2751,12 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
         const summary = err.summary || `Workflow failed: ${err.message}`;
         return {
           content: [{ type: "text", text: summary }],
-          details: { ...renderDetails, status: "failed", error: err.message, meta: err.meta },
+          details: {
+            ...renderDetails,
+            status: "failed",
+            error: err.message,
+            meta: err.meta ?? buildCcReviewSummaryMeta([]),
+          },
           isError: true,
         };
       }
@@ -3148,7 +3174,12 @@ export function buildRepairFeedback(
   }
 ): string {
   const parts: string[] = [];
-  parts.push(`Reviewer verdict: block (${blockReason ?? "explicit_block"})`);
+  const verdict = reviewResult?.verdict ?? "block";
+  parts.push(
+    verdict === "block"
+      ? `Reviewer verdict: block (${blockReason ?? "explicit_block"})`
+      : `Reviewer verdict: ${verdict}`
+  );
   if (reviewResult?.summary) {
     parts.push(`Reviewer summary: ${reviewResult.summary}`);
   }
@@ -4209,11 +4240,7 @@ async function runCcReviewWorkflow(
   // separable in the accumulated file.
 
   const workflowRunId = generateWorkflowRunId();
-  const verificationPlanLoad = loadVerificationPlan(workflowCwd, options.validationCommands);
-  if (verificationPlanLoad.error) {
-    throw new WorkflowError(verificationPlanLoad.error, verificationPlanLoad.error);
-  }
-  const verificationPlan = verificationPlanLoad.plan;
+  let verificationPlan: VerificationPlan | null = null;
   let findingsRollup = emptyFindingsRollup();
   const taskStatuses: Array<TaskStatus | undefined> = [];
   const collectedTaskFindings: ReviewFinding[][] = [];
@@ -4823,6 +4850,23 @@ async function runCcReviewWorkflow(
   };
 
   try {
+    const verificationPlanLoad = loadVerificationPlan(workflowCwd, options.validationCommands);
+    if (verificationPlanLoad.error) {
+      displayState = "failed";
+      currentPhase = "failed";
+      log({
+        severity: "error",
+        source: "cc-review",
+        message: `Failed to load verification plan: ${verificationPlanLoad.error}`,
+      });
+      throw new WorkflowError(
+        verificationPlanLoad.error,
+        verificationPlanLoad.error,
+        buildCcReviewSummaryMeta(taskResults)
+      );
+    }
+    verificationPlan = verificationPlanLoad.plan;
+
     throwIfAborted();
 
     // Write out the task breakdown schema
@@ -5558,7 +5602,11 @@ async function runCcReviewWorkflow(
             buildSummaryReport(goal, taskResults, tasks),
             persistedLogState.filePath
           );
-          throw new WorkflowError(`Blocked by reviewer on: "${task.title}" (after ${maxReviewRepairRounds} repair round(s))`, summary);
+          throw new WorkflowError(
+            `Blocked by reviewer on: "${task.title}" (after ${maxReviewRepairRounds} repair round(s))`,
+            summary,
+            buildCcReviewSummaryMeta(taskResults)
+          );
         }
         // Build repair feedback from the reviewer's findings and re-execute +
         // re-review (P1-1). The generator gets the concrete findings so it can
@@ -5589,15 +5637,29 @@ async function runCcReviewWorkflow(
               `Description: ${plannedTask.description}\n` +
               `Acceptance criteria: ${plannedTask.acceptanceCriteria}`
           ),
-          "Review integration issues across task boundaries, fix problems directly, and verify the workflow as a whole.",
+          "Review integration issues across task boundaries and report structured findings without modifying the workspace.",
         ].join("\n\n"),
         acceptanceCriteria: "The complete workflow satisfies every planned task's acceptance criteria.",
       };
       let batchRepairFeedback: string | undefined;
       let batchRepairRequiresPostReviewValidation = false;
+      let activeRepairFindingCount = 0;
 
       BATCH_REPAIR_LOOP: for (let repairRound = 0; ; repairRound++) {
       transitionToBatchReviewing();
+      if (repairRound > 0) {
+        log({
+          severity: "info",
+          source: "cc-review",
+          message: `[Repair Started] Round ${repairRound}/${maxReviewRepairRounds}; addressing ${activeRepairFindingCount} review finding(s).`,
+          details: {
+            event: "repair_started",
+            round: repairRound,
+            maxRounds: maxReviewRepairRounds,
+            findingCount: activeRepairFindingCount,
+          },
+        });
+      }
       emitTrace(ctx, "subagent_assignment", {
         role: "reviewer",
         agent: reviewProviderConfig.provider,
@@ -5617,7 +5679,10 @@ async function runCcReviewWorkflow(
             ].join("\n\n"),
           }
         : batchReviewTask;
-      const reviewArgs = reviewProviderConfig.buildArgs({ task: reviewTask });
+      const reviewArgs = reviewProviderConfig.buildArgs({
+        task: reviewTask,
+        intent: repairRound === 0 ? "inspect" : "repair",
+      });
       const workspaceBeforeReview = snapshotWorkspace(workflowCwd);
       const reviewProcessResult = await runReviewerProcess(
         reviewProviderConfig.label,
@@ -5632,7 +5697,27 @@ async function runCcReviewWorkflow(
       const reviewText = extractAssistantTextFromStream(reviewProcessResult.combinedOutput);
       const parsedReview = parseReviewResult(reviewText);
       const reviewResultObject = parsedReview.result;
-      const findings = reviewResultObject?.findings ?? [];
+      const findings = (reviewResultObject?.findings ?? []).map((finding) =>
+        repairRound === 0 && finding.status === "fixed"
+          ? { ...finding, status: "unfixed" as const }
+          : finding
+      );
+      const actionableFindings = findings.filter((finding) => finding.status === "unfixed");
+      for (const finding of actionableFindings) {
+        const location = finding.file
+          ? `${finding.file}${finding.line ? `:${finding.line}` : ""}`
+          : "workspace";
+        log({
+          severity: finding.priority === "P0" || finding.priority === "P1" ? "warning" : "info",
+          source: "reviewer",
+          message: `[Review Finding] [${finding.priority}] ${location} — ${finding.message}`,
+          details: {
+            event: "review_finding",
+            round: repairRound,
+            finding,
+          },
+        });
+      }
       const reportedVerdict = reviewResultObject?.verdict ?? null;
       const rerunValidations = batchTaskExecutions.map((execution) =>
         validateSubagentOutput(execution.cachedSubagentResult, execution.task)
@@ -5655,7 +5740,8 @@ async function runCcReviewWorkflow(
       const effectiveVerdict = derived.effectiveVerdict;
       const batchStatus = mapEffectiveVerdictToTaskStatus(effectiveVerdict);
 
-      if (effectiveVerdict === "block" && repairRound < maxReviewRepairRounds) {
+      const repairRequired = effectiveVerdict === "block" || actionableFindings.length > 0;
+      if (repairRequired && repairRound < maxReviewRepairRounds) {
         batchRepairFeedback = buildRepairFeedback(
           reviewResultObject ?? null,
           derived.blockReason,
@@ -5663,12 +5749,35 @@ async function runCcReviewWorkflow(
           postReview
         );
         batchRepairRequiresPostReviewValidation ||= derived.blockReason === "post_review_validation_failed";
-        log({
-          severity: "warning",
-          source: "reviewer",
-          message: `[Repair] Final workflow review blocked completion. Re-dispatching the reviewer to fix findings and validation failures (repair round ${repairRound + 1}/${maxReviewRepairRounds})...`,
-        });
+        activeRepairFindingCount = Math.max(actionableFindings.length, 1);
         continue BATCH_REPAIR_LOOP;
+      }
+
+      if (repairRound > 0 && effectiveVerdict !== "block" && postReview.passed) {
+        log({
+          severity: "info",
+          source: "cc-review",
+          message: `[Repair Completed] Round ${repairRound}/${maxReviewRepairRounds}; fixed ${activeRepairFindingCount} finding(s); post-repair validation passed.`,
+          details: {
+            event: "repair_completed",
+            round: repairRound,
+            maxRounds: maxReviewRepairRounds,
+            fixedCount: activeRepairFindingCount,
+            validationPassed: true,
+          },
+        });
+      } else if (repairRound > 0 && repairRequired) {
+        log({
+          severity: "error",
+          source: "cc-review",
+          message: `[Repair Failed] Round ${repairRound}/${maxReviewRepairRounds}; review remains blocked.`,
+          details: {
+            event: "repair_failed",
+            round: repairRound,
+            maxRounds: maxReviewRepairRounds,
+            error: postReview.error ?? derived.blockReason ?? "review remains blocked",
+          },
+        });
       }
 
       let reviewerExitDiagnostic: string | undefined;
@@ -5777,7 +5886,8 @@ async function runCcReviewWorkflow(
         );
         throw new WorkflowError(
           `Blocked by final workflow review (after ${maxReviewRepairRounds} repair round(s))`,
-          summary
+          summary,
+          buildCcReviewSummaryMeta(taskResults)
         );
       }
       break BATCH_REPAIR_LOOP;
@@ -5871,7 +5981,7 @@ async function runCcReviewWorkflow(
 
     if (err instanceof WorkflowError) {
       displayState = "failed";
-      currentPhase = "Failed";
+      currentPhase = "failed";
       err.meta ??= buildCcReviewSummaryMeta(taskResults);
       refreshWorkflowUi();
       throw err;
@@ -5882,7 +5992,7 @@ async function runCcReviewWorkflow(
       displayState = isTimeout ? "timeout" : "cancelled";
     } else {
       displayState = "failed";
-      currentPhase = "Failed";
+      currentPhase = "failed";
     }
     if (isCancelled && currentTaskIndex >= 0 && currentTaskIndex < tasks.length) {
       if (taskResults.length === currentTaskIndex) {
