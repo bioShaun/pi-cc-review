@@ -612,6 +612,40 @@ describe("CC Review UI Regression Tests", () => {
     });
   });
 
+  // 6c. Subagent Model Display in TUI Widget Checklist
+  describe("Subagent Model Display in TUI Widget Checklist", () => {
+    it("renders model name when present and fallback to 'Unknown model' when absent for non-pending tasks", () => {
+      const state = createBaseState({
+        tasks: [
+          { title: "Task with explicit model", status: "completed", model: "anthropic/claude-3-5" },
+          { title: "Task with missing model", status: "completed" },
+          { title: "Task in pending status", status: "pending" },
+        ],
+        taskStatuses: ["completed", "completed", undefined],
+        currentTaskIndex: 2,
+      });
+
+      const themeMock = {
+        fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+      };
+
+      const lines = buildCcReviewWidgetLines(state, {
+        width: 120,
+        theme: themeMock,
+      });
+
+      const taskLines = lines.filter((line) => line.includes("[Task "));
+      assert.equal(taskLines.length, 3);
+
+      // Task 1: Completed with model -> displays the model name
+      assert.match(taskLines[0], /\[muted\]\[anthropic\/claude-3-5\]\[\/muted\]/);
+      // Task 2: Completed with missing model -> displays 'Unknown model' fallback
+      assert.match(taskLines[1], /\[muted\]\[Unknown model\]\[\/muted\]/);
+      // Task 3: Pending task -> does not show model display at all
+      assert.doesNotMatch(taskLines[2], /Unknown model/);
+    });
+  });
+
   // 7. Log Filtering and Hidden Hints Tests
   describe("Log Filtering and Hidden Hints", () => {
     it("displays '1 log hidden' when exactly one log is filtered out", () => {
@@ -770,6 +804,25 @@ describe("CC Review UI Regression Tests", () => {
       assert.match(
         parseCcReviewCommandArgs("Run --review-repair-rounds=1.5").error ?? "",
         /Expected a non-negative integer/
+      );
+    });
+
+    it("parses and validates --concurrency aliases", () => {
+      const spaced = parseCcReviewCommandArgs("Run some goal --concurrency 3");
+      assert.strictEqual(spaced.goal, "Run some goal");
+      assert.strictEqual(spaced.concurrency, 3);
+
+      const equals = parseCcReviewCommandArgs("--concurrency-limit=2 Run in parallel");
+      assert.strictEqual(equals.goal, "Run in parallel");
+      assert.strictEqual(equals.concurrency, 2);
+
+      assert.match(
+        parseCcReviewCommandArgs("Run --concurrency 0").error ?? "",
+        /Expected a positive integer/
+      );
+      assert.match(
+        parseCcReviewCommandArgs("Run --concurrency-limit=1.5").error ?? "",
+        /Expected a positive integer/
       );
     });
 

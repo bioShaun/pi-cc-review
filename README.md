@@ -24,7 +24,7 @@ Active user-facing entry points:
 - Tool name for API/tool calls: `cc_review`
 - Display label: `CC Review`
 
-To install or update the plugin in a Pi workspace, place the current `.pi/extensions/cc-review.ts` file in that workspace's `.pi/extensions/` directory, replacing any older copy of the same file, then restart or reload Pi so extension registration is refreshed. This repository does not include a package manifest or registry release flow; the extension file is the installation artifact.
+To install or update the plugin in a Pi workspace, place the current `.pi/extensions/cc-review.ts` file in that workspace's `.pi/extensions/` directory, replacing any older copy of the same file, then restart or reload Pi so extension registration is refreshed. The package manifest is only for development tooling; there is no registry release flow, and the extension file remains the installation artifact.
 
 To guarantee code quality and prevent regression, developers must run the verification suites and TypeScript compiler checks after any changes.
 
@@ -146,18 +146,11 @@ In `after-all` mode, an unrecoverable task execution or output-validation failur
 
 The extension `.pi/extensions/cc-review.ts` must maintain **100% strict type safety**. It should compile with zero TypeScript diagnostics under Node's standard type configuration.
 
-Since this workspace sits inside the Pi test environment, you can type-check the extension using the compiler and type definitions from the adjacent `adversarial` workspace:
+Install the pinned development dependencies once, then run the repository-local type-check script:
 
 ```bash
-# Run strict compilation and type check from the workspace root
-../adversarial/node_modules/.bin/tsc --noEmit \
-  --target es2022 \
-  --moduleResolution bundler \
-  --allowImportingTsExtensions \
-  --typeRoots ../adversarial/node_modules/@types \
-  --types node \
-  --strict true \
-  .pi/extensions/cc-review.ts
+npm install
+npm run typecheck
 ```
 
 *Note: Clean strict type-checking must always return `exit code 0` with absolutely no output/errors.*

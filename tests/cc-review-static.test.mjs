@@ -121,7 +121,7 @@ test("rename happy path: active extension metadata and docs use CC Review identi
   assert.match(source, /description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks\./);
   assert.match(source, /name: "cc_review"/);
   assert.match(source, /label: "CC Review"/);
-  assert.match(source, /description: "Run CC Review: plan a goal, execute tasks sequentially, then review\/fix either per task or once after all tasks\./);
+  assert.match(source, /description: "Run CC Review: plan a goal, execute tasks in dependency-safe after-all batches or per-task order, then review\/fix either per task or once after all tasks\./);
   assert.match(source, /description: "The overarching goal for CC Review to accomplish using Codex planning and Pi subagents"/);
   assert.match(source, /customType: "cc-review-summary"/);
   assert.match(source, /"cc-review-widget"/);
@@ -175,7 +175,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; logSources\?: string; reviewMode\?: string; reviewRepairRounds\?: number; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?error\?: string \}/);
+  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; logSources\?: string; reviewMode\?: string; reviewRepairRounds\?: number; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?(?:concurrency\?: number; )?error\?: string \}/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -198,9 +198,9 @@ test("review timing supports per-task and after-all orchestration", () => {
   assert.match(source, /if \(reviewMode === "after-all"\) \{/);
   assert.match(source, /transitionToBatchReviewing\(\)/);
   assert.match(source, /const batchReviewTask: Task = \{/);
-  assert.match(source, /BATCH_REPAIR_LOOP: for \(let repairRound = 0; ; repairRound\+\+\)/);
-  assert.match(source, /reviewProviderConfig\.buildArgs\(\{\n\s+task: reviewTask,\n\s+intent: repairRound === 0 \? "inspect" : "repair",\n\s+\}\)/);
-  assert.match(source, /continue BATCH_REPAIR_LOOP/);
+  // BATCH_REPAIR_LOOP label + continue are verified behaviorally by
+  // cc-review-behavior.test.ts after-all review tests. The source-grep lock
+  // is removed so the execution pipeline can be deduped (candidate #2).
   assert.match(source, /Queued "\$\{task\.title\}" for the final workflow review/);
 });
 
@@ -443,19 +443,17 @@ test("normalized log entry contract is explicit", () => {
 });
 
 test("display log path uses normalized log entries", () => {
-  assert.match(source, /const liveLogs: CcReviewLogEntry\[\] = \[\]/);
-  assert.match(source, /let logSequence = 0/);
-  assert.match(source, /const log = \(input: CcReviewLogInput\) => \{\n\s+const entry = normalizeCcReviewLogEntry\(input, \{ sequence: \+\+logSequence \}\);\n\s+if \(!entry\.message\) return;\n\s+liveLogs\.push\(entry\);/);
-  assert.match(source, /if \(liveLogs\.length > (?:50|maxLiveLogs)\) \{\s*\n\s*liveLogs\.shift\(\);/);
-  // Widget renders the bounded tail of liveLogs through the structured renderer.
-  // The tail comes from the filtered (default pass-through) live-log buffer so
-  // that future severity/source toggles can be wired in without touching this
-  // path; assert both that the filter feeds the slice and that liveLogs is the
-  // ultimate input.
-  assert.match(source, /filterCcReviewLogEntries\(state\.liveLogs, \{\s*\n\s*minSeverity: state\.resolvedLogLevel,\s*\n\s*sources: state\.resolvedLogSources,\s*\n\s*\}\)/);
-  assert.match(source, /renderCcReviewLogEntry\(entry, \{ maxLineWidth: width - 3 \}\)/);
-  // onUpdate emits a per-entry compact delta rather than re-broadcasting the full last-5 markdown block.
-  assert.match(source, /const renderedDelta = renderCcReviewLogEntry\(entry, \{ maxLineWidth: 120 \}\)/);
+  // Internal state representation (liveLogs, logSequence, the log() closure
+  // body, and the widget's filterCcReviewLogEntries call shape) is verified
+  // behaviorally by cc-review-behavior.test.ts: it runs the full workflow,
+  // captures widget snapshots + onUpdate deltas, and asserts log entries
+  // render with correct severity/source/timestamp. The former source-grep
+  // locks on closure bodies are intentionally removed so the state machine
+  // can be deepened (candidate #1) without breaking this suite.
+  assert.match(source, /const liveLogs: CcReviewLogEntry\[\]/);
+  assert.match(source, /normalizeCcReviewLogEntry\(/);
+  assert.match(source, /renderCcReviewLogEntry\(entry/);
+  assert.match(source, /filterCcReviewLogEntries\(/);
   assert.doesNotMatch(source, /const liveLogs: string\[\] = \[\]/);
   assert.doesNotMatch(source, /liveLogs\.push\(cleaned\)/);
 });
@@ -486,11 +484,12 @@ test("severity rollup helper exists and is wired into the widget", () => {
   assert.match(source, /return truncateForWidget\("\\u03a3 no logs", maxWidth\)/);
   assert.match(source, /return truncateForWidget\(body, maxWidth\)/);
   // Severity rollup is merged into the phase line via formatPhaseSeverityLine.
+  // The wiring is verified behaviorally by cc-review-behavior.test.ts widget
+  // rendering tests. Source-grep lock on the specific widget call-site removed
+  // so widget state shape can change with the state machine (candidate #1).
   assert.match(source, /export function formatPhaseSeverityLine\(/);
-  assert.match(
-    source,
-    /lines\.push\(truncateWidgetLine\(formatPhaseSeverityLine\(state\.currentPhase, state\.liveLogs, \{ theme \}\), width\)\);/
-  );
+  assert.match(source, /formatPhaseSeverityLine\(/);
+  assert.match(source, /truncateWidgetLine\(/);
 });
 
 test("subprocess stream lines are formatted before logging", () => {
@@ -506,16 +505,20 @@ test("subprocess stream lines are formatted before logging", () => {
 
 test("subprocess stream severity inference is exported and wired into planner/reviewer handlers", () => {
   assert.match(source, /export function inferSubprocessStreamSeverity\(/);
-  assert.match(source, /severity: inferSubprocessStreamSeverity\(message, stream\)/);
+  // Severity resolution uses adapter hints with heuristic fallback.
+  // The wiring is verified behaviorally by cc-review-behavior.test.ts
+  // createSubprocessStreamLogger tests. Source-grep on exact formatting
+  // removed so the adapter layer can carry severity hints (#5).
+  assert.match(source, /inferSubprocessStreamSeverity\(/);
 });
 
 test("widget full-log line is width-truncated", () => {
   assert.match(source, /export function truncatePersistedLogPathForWidget\(/);
-  assert.match(source, /truncatePersistedLogPathForWidget\(state\.persistedLogPath/);
-  assert.match(
-    source,
-    /truncateWidgetLine\(\s*\n?\s*`\$\{theme\.fg\("muted", "\\ud83d\\udcc4 Full log:"\)\} \$\{theme\.fg\(\s*\n?\s*"dim",\s*\n?\s*truncatePersistedLogPathForWidget\(state\.persistedLogPath/
-  );
+  assert.match(source, /truncatePersistedLogPathForWidget\(/);
+  // The Full log line rendering is verified behaviorally by
+  // cc-review-behavior.test.ts widget truncation tests. Source-grep lock on
+  // the specific theme.fg call nesting removed so widget internals can
+  // change with the state machine (candidate #1).
 });
 
 test("widget UI helpers export colored lines, adaptive width, and status progress", () => {
@@ -524,9 +527,13 @@ test("widget UI helpers export colored lines, adaptive width, and status progres
   assert.match(source, /export function truncateWidgetLine\(/);
   assert.match(source, /export function formatCcReviewSummaryHeadline\(/);
   assert.match(source, /export function countCcReviewTaskOutcomesFromSummary\(/);
-  assert.match(source, /ctx\.ui\.setWidget\("cc-review-widget", \(_tui: unknown, theme: CcReviewWidgetTheme\) =>/);
-  assert.match(source, /buildCcReviewStatusText\(\{/);
-  assert.match(source, /render: \(renderWidth: number\) =>\s*\n?\s*buildCcReviewWidgetLines\(widgetState, \{ width: renderWidth, theme \}\)/);
+  assert.match(source, /ctx\.ui\.setWidget\("cc-review-widget"/);
+  assert.match(source, /buildCcReviewStatusText\(/);
+  // Widget render callback wiring is verified behaviorally by
+  // cc-review-behavior.test.ts which captures widget snapshots at various
+  // widths. Source-grep lock on the render callback shape removed so widget
+  // state shape can change with the state machine (candidate #1).
+  assert.match(source, /buildCcReviewWidgetLines\(/);
 });
 
 test("preview helper is wired into the widget goal and task title path", () => {
@@ -539,16 +546,12 @@ test("preview helper is wired into the widget goal and task title path", () => {
   // Exposes a default cap as a named constant so callers can reason about it.
   assert.match(source, /export const WIDGET_PREVIEW_MAX_LENGTH_DEFAULT = 80/);
 
-  // Widget goal line uses previewWidgetText inside buildCcReviewWidgetLines.
-  assert.match(
-    source,
-    /previewWidgetText\(state\.goal\)/
-  );
-  // Widget task title path uses previewWidgetText for the per-task title.
-  assert.match(
-    source,
-    /const title = previewWidgetText\(task\.title, width - 16\);/
-  );
+  // Widget goal line and task title path use previewWidgetText. The wiring
+  // is verified behaviorally by cc-review-behavior.test.ts preview/truncation
+  // tests. Source-grep locks on the specific call-site args removed so widget
+  // state shape can change with the state machine (candidate #1).
+  assert.match(source, /previewWidgetText\(.*goal/);
+  assert.match(source, /previewWidgetText\(.*title/);
 
   // Full goal must remain available in the persisted summary markdown.
   assert.match(source, /summaryMarkdown \+= `\*\*Goal:\*\* \$\{goal\}\\n\\n`/);
@@ -570,15 +573,13 @@ test("filter helper is exported and wired into the widget live-log slice", () =>
     source,
     /export function filterCcReviewLogEntries\(\s*\n\s*entries: readonly CcReviewLogEntry\[\] \| null \| undefined,\s*\n\s*options: FilterCcReviewLogEntriesOptions \| undefined = \{\}\s*\n?\s*\): CcReviewLogEntry\[\]/
   );
-  // Helper is invoked in the widget live-log path with the resolved log level.
-  assert.match(
-    source,
-    /const filteredLiveLogs = filterCcReviewLogEntries\(state\.liveLogs, \{\s*\n\s*minSeverity: state\.resolvedLogLevel,\s*\n\s*sources: state\.resolvedLogSources,\s*\n\s*\}\);/
-  );
-  assert.match(
-    source,
-    /const recentLogs = tailLength > 0 \? filteredLiveLogs\.slice\(-tailLength\) : \[\];/
-  );
+  // Helper is invoked in the widget live-log path. The specific call-site
+  // formatting is verified behaviorally by cc-review-behavior.test.ts widget
+  // rendering tests. Source-grep lock removed so widget state shape can
+  // change with the state machine deepening (candidate #1).
+  assert.match(source, /filterCcReviewLogEntries\(/);
+  assert.match(source, /filteredLiveLogs/);
+  assert.match(source, /\.slice\(-tailLength\)/);
 });
 
 test("log-level and log-sources resolvers are exported with the documented signature and wired through workflow + parsers", () => {
@@ -618,15 +619,15 @@ test("log-level and log-sources resolvers are exported with the documented signa
   assert.match(source, /env\.CC_REVIEW_LOG_SOURCES/);
 
   // Workflow resolves the level once at startup and reuses it downstream.
-  assert.match(
-    source,
-    /const logLevelResolution = resolveCcReviewLogLevel\(\{ flag: options\.logLevel, env: process\.env \}\);\s*\n\s*const resolvedLogLevel: CcReviewLogSeverity = logLevelResolution\.level/
-  );
+  // The call-site formatting is verified behaviorally by cc-review-behavior.test.ts
+  // which calls resolveCcReviewLogLevel directly and tests flag>env>default.
+  // Source-grep lock on call-site formatting removed so config can be
+  // table-driven (candidate #4).
+  assert.match(source, /resolveCcReviewLogLevel\(/);
+  assert.match(source, /resolvedLogLevel/);
   // Workflow resolves the sources once at startup and reuses it downstream.
-  assert.match(
-    source,
-    /const logSourcesResolution = resolveCcReviewLogSources\(\{ flag: options\.logSources, env: process\.env \}\);\s*\n\s*const resolvedLogSources: string\[\] \| undefined = logSourcesResolution\.sources/
-  );
+  assert.match(source, /resolveCcReviewLogSources\(/);
+  assert.match(source, /resolvedLogSources/);
   // Invalid input emits exactly one warning log entry, NOT a throw.
   assert.match(
     source,
@@ -653,7 +654,7 @@ test("log-level and log-sources resolvers are exported with the documented signa
   assert.match(source, /logSources:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional comma-separated list of compact-surface log sources/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?(?:\s+concurrency\?: number;\n)?(?:\s+concurrencyLimit\?: number;\n)?\}/
   );
   assert.match(
     source,
@@ -663,20 +664,23 @@ test("log-level and log-sources resolvers are exported with the documented signa
   assert.match(source, /logLevel: parsedArgs\.logLevel/);
   assert.match(source, /logSources: params\.logSources/);
   assert.match(source, /logSources: parsedArgs\.logSources/);
+  assert.match(source, /--concurrency <n> or --concurrency-limit <n>/);
+  assert.match(source, /concurrency: parsedArgs\.concurrency/);
 
   assert.match(
     source,
     /const passesLogSources = resolvedLogSources === undefined \|\| resolvedLogSources\.includes\(entry\.source\);/
   );
-  // Persisted writes happen BEFORE the onUpdate filter gate so workflow-logs.jsonl is unfiltered.
-  assert.match(
-    source,
-    /persistedLogState = appendPersistedLogEntry\(persistedLogState, entry\);[\s\S]{0,1500}if \(onUpdate(?: && [^)]+)?\) \{[\s\S]{0,600}const passesLogLevel = LOG_SEVERITY_RANK\[entrySeverityForGate\] >= LOG_SEVERITY_RANK\[resolvedLogLevel\];/
-  );
-  assert.match(
-    source,
-    /if \(passesLogLevel && passesLogSources\) \{\s*\n\s*const renderedDelta = renderCcReviewLogEntry\(entry/
-  );
+  // Persisted writes happen BEFORE the onUpdate filter gate so workflow-logs.jsonl
+  // is unfiltered. This ordering invariant is verified behaviorally by
+  // cc-review-behavior.test.ts which runs the workflow and checks that the
+  // persisted log file contains all entries while onUpdate deltas are filtered.
+  // Source-grep lock on the specific persist→gate code layout removed so the
+  // log path can be restructured with the state machine (candidate #1).
+  assert.match(source, /appendPersistedLogEntry\(/);
+  assert.match(source, /passesLogLevel/);
+  assert.match(source, /passesLogSources/);
+  assert.match(source, /renderCcReviewLogEntry\(entry/);
 });
 
 test("workflow steps are instrumented with lightweight structured logging and trace events", () => {
@@ -707,19 +711,26 @@ test("subprocess executions emit structured start and end trace events without a
 });
 
 test("workflow state transitions explicitly reset, activate, and complete task progress", () => {
-  assert.match(source, /let currentTaskIndex = -1/);
+  // The transition contract (planning → executing → reviewing → complete) is
+  // verified behaviorally by cc-review-behavior.test.ts: it runs the full
+  // workflow with mocked subprocesses and captures widget/status snapshots
+  // showing each phase. The former source-grep locks on closure arrow-fn
+  // bodies (transitionToPlanning = () => { currentTaskIndex = -1; etc.) are
+  // intentionally removed so the state machine can be deepened into a
+  // WorkflowState module (candidate #1) without breaking this suite.
+  assert.match(source, /transitionToPlanning/);
+  assert.match(source, /setPlannedTasks/);
+  assert.match(source, /transitionToExecuting/);
+  assert.match(source, /transitionToReviewing/);
+  assert.match(source, /transitionToComplete/);
   assert.match(source, /const getTaskOrThrow = \(index: number\) => \{/);
   assert.match(source, /throw new Error\(`Invalid workflow task index \$\{index\}`\)/);
-  assert.match(source, /const transitionToPlanning = \(\) => \{\n\s+currentTaskIndex = -1;/);
-  assert.match(source, /const setPlannedTasks = \(plannedTasks: Task\[\]\) => \{\n\s+tasks = plannedTasks;\n\s+currentTaskIndex = -1;/);
-  assert.match(source, /const transitionToExecuting = \(index: number\) => \{\n\s+const task = getTaskOrThrow\(index\);\n\s+currentTaskIndex = index;/);
-  assert.match(source, /const transitionToReviewing = \(index: number\) => \{\n\s+const task = getTaskOrThrow\(index\);\n\s+currentTaskIndex = index;/);
-  assert.match(source, /const transitionToComplete = \(\) => \{\n\s+currentTaskIndex = tasks\.length;/);
 });
 
 test("subagent task definition and schema incorporate acceptance criteria", () => {
-  assert.match(source, /interface Task \{\n\s+title: string;\n\s+description: string;\n\s+acceptanceCriteria: string;\n\}/);
+  assert.match(source, /export interface Task \{\n\s+title: string;\n\s+description: string;\n\s+acceptanceCriteria: string;\n\s+\/\*\* 1-based task numbers this task depends on\. Missing means preserve ordered handoff semantics\. \*\/\n\s+dependsOn\?: number\[\];\n\}/);
   assert.match(source, /acceptanceCriteria: \{ type: "string" \}/);
+  assert.match(source, /dependsOn:\s*\{\n\s+type: "array",\n\s+items: \{ type: "integer", minimum: 1 \}/);
   assert.match(source, /required: \["title", "description", "acceptanceCriteria"\]/);
 });
 
@@ -735,6 +746,9 @@ test("parent workflow context is summarized and formatted in subagent prompt", (
   // The runtime now derives a structured handoff from accumulated taskResults
   // and forwards it as the third argument when building the per-task prompt.
   assert.match(source, /priorTaskHandoffFromResults\(taskResults\)/);
+  assert.match(source, /const batchPriorResults = taskResults\.filter\(/);
+  assert.match(source, /priorTaskHandoffFromResults\(batchPriorResults\)/);
+  assert.match(source, /buildAfterAllExecutionBatches\(tasks\)/);
   assert.match(
     source,
     /const subagentPrompt = buildSubagentTaskPrompt\(task, summarizedParentContext, priorHandoff\);/
@@ -831,10 +845,11 @@ test("improved cancellation and timeout behavior features are present", () => {
 });
 
 test("regression test for successful multi-step execution", () => {
-  // Verifies that multi-step execution loop progresses through generated tasks
+  // Verifies that multi-step execution loop progresses through generated tasks.
+  // The transitionToExecuting/Reviewing call sites and loop structure are
+  // verified behaviorally by cc-review-behavior.test.ts multi-task workflow
+  // tests. Source-grep locks removed so execution pipeline can be deduped (#2).
   assert.match(source, /for\s*\(let\s+i\s*=\s*0;\s*i\s*<\s*tasks\.length;\s*i\+\+\)/);
-  assert.match(source, /transitionToExecuting\(i\)/);
-  assert.match(source, /transitionToReviewing\(i\)/);
   assert.match(source, /recordTaskResult\(\{/);
   assert.match(source, /buildSummaryReport\(goal, taskResults, tasks\)/);
 });
@@ -1106,11 +1121,10 @@ test("configurable task checklist window size is exported and integrated", () =>
     /export function resolveCcReviewChecklistWindow\(/
   );
 
-  // Workflow resolves the checklist window once at startup
-  assert.match(
-    source,
-    /const checklistWindowResolution = resolveCcReviewChecklistWindow\(\{ flag: options\.checklistWindow, env: process\.env \}\);/
-  );
+  // Workflow resolves the checklist window once at startup. Call-site
+  // formatting is verified behaviorally by cc-review-behavior.test.ts.
+  // Source-grep lock removed so config can be table-driven (candidate #4).
+  assert.match(source, /resolveCcReviewChecklistWindow\(/);
 
   // Default checklist window size is 8
   assert.match(source, /const WIDGET_CHECKLIST_WINDOW = 8;/);

@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events";
 
 import ccReviewExtension, {
   appendPersistedLogEntry,
+  buildAfterAllExecutionBatches,
   buildBuiltinWorkerAgent,
   buildCcReviewStatusText,
   buildCcReviewWidgetLines,
@@ -33,6 +34,7 @@ import ccReviewExtension, {
   previewWidgetText,
   renderCcReviewLogEntry,
   resolveCcReviewLogLevel,
+  resolveCcReviewConcurrency,
   resolveMaxReviewRepairRounds,
   resolvePlannerTimeoutMs,
   resolveReviewMode,
@@ -734,6 +736,83 @@ describe("resolveReviewMode selects review timing", () => {
     assert.throws(
       () => resolveReviewMode(undefined, { CC_REVIEW_MODE: "later" } as NodeJS.ProcessEnv),
       /Invalid CC_REVIEW_MODE value "later"/
+    );
+  });
+});
+
+describe("resolveCcReviewConcurrency selects the subagent concurrency limit", () => {
+  it("uses explicit value, environment fallback, and the default limit of 4", () => {
+    assert.deepEqual(resolveCcReviewConcurrency({ flag: "2" }), { concurrency: 2, source: "flag" });
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "3" } as NodeJS.ProcessEnv }),
+      { concurrency: 3, source: "env" }
+    );
+    assert.deepEqual(resolveCcReviewConcurrency({ env: {} as NodeJS.ProcessEnv }), {
+      concurrency: 4,
+      source: "default",
+    });
+  });
+
+  it("falls back to the default for invalid values", () => {
+    assert.deepEqual(resolveCcReviewConcurrency({ flag: "0" }), {
+      concurrency: 4,
+      source: "default",
+      invalidInput: { source: "flag", raw: "0" },
+    });
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "many" } as NodeJS.ProcessEnv }),
+      {
+        concurrency: 4,
+        source: "default",
+        invalidInput: { source: "env", raw: "many" },
+      }
+    );
+  });
+});
+
+describe("buildAfterAllExecutionBatches preserves handoff dependencies", () => {
+  it("keeps legacy plans serial when dependency metadata is missing", () => {
+    const batches = buildAfterAllExecutionBatches([
+      { title: "Foundation", description: "Build foundation", acceptanceCriteria: "Foundation works" },
+      { title: "Integration", description: "Integrate foundation", acceptanceCriteria: "Integration works" },
+      { title: "Verify", description: "Verify integration", acceptanceCriteria: "Verification works" },
+    ]);
+
+    assert.deepEqual(
+      batches.map((batch) => batch.map(({ index }) => index)),
+      [[0], [1], [2]]
+    );
+  });
+
+  it("runs explicitly independent tasks in the same batch", () => {
+    const batches = buildAfterAllExecutionBatches([
+      { title: "A", description: "Build A", acceptanceCriteria: "A works", dependsOn: [] },
+      { title: "B", description: "Build B", acceptanceCriteria: "B works", dependsOn: [] },
+      { title: "C", description: "Integrate", acceptanceCriteria: "C works", dependsOn: [1, 2] },
+    ]);
+
+    assert.deepEqual(
+      batches.map((batch) => batch.map(({ index }) => index)),
+      [[0, 1], [2]]
+    );
+  });
+
+  it("rejects cyclic dependency graphs instead of violating their prerequisites", () => {
+    assert.throws(
+      () => buildAfterAllExecutionBatches([
+        { title: "A", description: "Build A", acceptanceCriteria: "A works", dependsOn: [2] },
+        { title: "B", description: "Build B", acceptanceCriteria: "B works", dependsOn: [1] },
+      ]),
+      /cycle detected.*1, 2/i
+    );
+  });
+
+  it("rejects a task that depends on itself", () => {
+    assert.throws(
+      () => buildAfterAllExecutionBatches([
+        { title: "A", description: "Build A", acceptanceCriteria: "A works", dependsOn: [1] },
+      ]),
+      /cycle detected.*1/i
     );
   });
 });
@@ -2499,6 +2578,143 @@ describe("CC Review Behavioral Regression Tests", () => {
     }
   });
 
+  it("after-all mode preserves serial handoff for legacy plans without dependency metadata", async () => {
+    const mockTasks = [
+      { title: "Foundation", description: "Implement foundation", acceptanceCriteria: "Foundation works" },
+      { title: "Integration", description: "Integrate feature", acceptanceCriteria: "Integration works" }
+    ];
+    const subagentPrompts: string[] = [];
+    const activeCalls: number[] = [];
+    let maxConcurrencyObserved = 0;
+
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      process.nextTick(() => {
+        if (args.includes("-o")) {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+        } else {
+          emitMockReviewStdout(mockProc);
+        }
+        mockProc.emit("close", 0, null);
+      });
+      return mockProc;
+    };
+
+    mockSubagentHandler = async (_toolName, params) => {
+      activeCalls.push(1);
+      maxConcurrencyObserved = Math.max(maxConcurrencyObserved, activeCalls.length);
+      subagentPrompts.push(String(params.task));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      activeCalls.pop();
+
+      const isFoundation = String(params.task).includes("Foundation");
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            status: "completed",
+            summary: isFoundation ? "Foundation summary for handoff" : "Integration summary",
+            filesChanged: isFoundation ? ["src/foundation.ts"] : ["src/integration.ts"],
+            unresolvedItems: [],
+            acceptanceCriteria: [{
+              criterion: isFoundation ? "Foundation works" : "Integration works",
+              status: "met",
+              evidence: "Mocked verification passed",
+            }],
+          }),
+        }],
+        details: { results: [{ exitCode: 0 }] },
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-after-all-legacy-handoff",
+      { goal: "Build a dependent workflow", reviewMode: "after-all", concurrencyLimit: 2 },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.equal(maxConcurrencyObserved, 1, "Legacy tasks without dependsOn should preserve serial execution");
+
+    const integrationPrompt = subagentPrompts.find((prompt) => prompt.includes("Task: Integration")) ?? "";
+    assert.match(integrationPrompt, /Prior Tasks \(Handoff\):/);
+    assert.match(integrationPrompt, /Foundation summary for handoff/);
+  });
+
+  it("includes a completed forward dependency in the dependent task handoff", async () => {
+    const mockTasks = [
+      {
+        title: "Consumer",
+        description: "Consume the provider output",
+        acceptanceCriteria: "Consumer works",
+        dependsOn: [2],
+      },
+      {
+        title: "Provider",
+        description: "Produce the required output",
+        acceptanceCriteria: "Provider works",
+        dependsOn: [],
+      },
+    ];
+    const executionOrder: string[] = [];
+    const subagentPrompts: string[] = [];
+
+    mockSpawnHandler = (command, args) => {
+      if (command !== "codex") return null;
+      const mockProc = new MockChildProcess();
+      process.nextTick(() => {
+        if (args.includes("-o")) {
+          fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+        } else {
+          emitMockReviewStdout(mockProc);
+        }
+        mockProc.emit("close", 0, null);
+      });
+      return mockProc;
+    };
+
+    mockSubagentHandler = async (_toolName, params) => {
+      const prompt = String(params.task);
+      const isProvider = prompt.includes("Task: Provider");
+      executionOrder.push(isProvider ? "Provider" : "Consumer");
+      subagentPrompts.push(prompt);
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            status: "completed",
+            summary: isProvider ? "Provider summary for forward handoff" : "Consumer summary",
+            filesChanged: [],
+            unresolvedItems: [],
+            acceptanceCriteria: [{
+              criterion: isProvider ? "Provider works" : "Consumer works",
+              status: "met",
+              evidence: "Mocked verification passed",
+            }],
+          }),
+        }],
+        details: { results: [{ exitCode: 0 }] },
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-after-all-forward-handoff",
+      { goal: "Build a forward-dependent workflow", reviewMode: "after-all", concurrencyLimit: 2 },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(executionOrder, ["Provider", "Consumer"]);
+    const consumerPrompt = subagentPrompts.find((prompt) => prompt.includes("Task: Consumer")) ?? "";
+    assert.match(consumerPrompt, /Prior Tasks \(Handoff\):/);
+    assert.match(consumerPrompt, /Provider summary for forward handoff/);
+  });
+
   it("after-all review mode asks the reviewer to repair a block and then re-reviews", async () => {
     const mockTasks = [
       { title: "Integrated task", description: "Implement feature", acceptanceCriteria: "Feature works" }
@@ -4008,6 +4224,38 @@ System prompt override`
           summaryText.includes("Model:* `anthropic/claude-3-5-sonnet-actual`"),
           "Summary report should list the actual used subagent model"
         );
+
+        // Verify workflow trace includes model name at start and end
+        const tracePath = path.join(tempTestDir, "workflow-trace.jsonl");
+        const traceLines = fs.readFileSync(tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+
+        const assignmentEvent = traceLines.find(
+          (entry) => entry.event === "subagent_assignment" && entry.role === "executor"
+        );
+        assert.ok(assignmentEvent, "Should emit subagent_assignment event for executor");
+        assert.strictEqual(assignmentEvent.model, "configured-worker-model", "Assignment event should include the configured worker model at launch time");
+
+        const startEvent = traceLines.find(
+          (entry) => entry.event === "tool_execution_start" && entry.toolName === "subagent"
+        );
+        assert.ok(startEvent, "Should emit tool_execution_start event for subagent");
+        assert.strictEqual(startEvent.model, "configured-worker-model", "Start event should include the resolved/configured worker model");
+
+        const endEvent = traceLines.find(
+          (entry) => entry.event === "tool_execution_end" && entry.toolName === "subagent"
+        );
+        assert.ok(endEvent, "Should emit tool_execution_end event for subagent");
+        assert.strictEqual(endEvent.model, "anthropic/claude-3-5-sonnet-actual", "End event should include the actual streamed model");
+
+        // Extract task artifact path from summary text
+        const artifactMatch = summaryText.match(/\*Artifact:\*\s*`([^`]+)`/);
+        assert.ok(artifactMatch, "Should find artifact path in summary text");
+        const artifactPath = artifactMatch[1];
+        assert.ok(artifactPath && fs.existsSync(artifactPath), "Artifact path should exist");
+
+        // Verify task artifact contains execution.model name
+        const artifactData = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+        assert.strictEqual(artifactData.execution.model, "anthropic/claude-3-5-sonnet-actual", "Artifact should contain the actual streamed model name");
       } finally {
         piMock.toolManager = originalToolManager;
         process.env.HOME = originalHome;
@@ -4075,6 +4323,296 @@ System prompt override`
         process.env.USERPROFILE = originalUserProfile;
       }
     });
+  });
+
+  it("demonstrates concurrent subagent execution and result order preservation", async () => {
+    const mockTasks = [
+      { title: "Parallel Task 1", description: "First job", acceptanceCriteria: "A is verified", dependsOn: [] },
+      { title: "Parallel Task 2", description: "Second job", acceptanceCriteria: "B is verified", dependsOn: [] }
+    ];
+
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("-o")) {
+            const oIndex = args.indexOf("-o");
+            const outputPath = args[oIndex + 1];
+            fs.writeFileSync(outputPath, JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    const activeCalls: number[] = [];
+    let maxConcurrencyObserved = 0;
+
+    mockSubagentHandler = async (toolName, params) => {
+      activeCalls.push(1);
+      maxConcurrencyObserved = Math.max(maxConcurrencyObserved, activeCalls.length);
+
+      // Controlled delay to simulate work and allow the other task to start concurrently
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      activeCalls.pop();
+      return {
+        content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+        details: { results: [{ exitCode: 0, model: "test-parallel-model" }] }
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-parallel",
+      { goal: "Test parallel run", concurrencyLimit: 2, reviewMode: "after-all" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+    assert.equal(maxConcurrencyObserved, 2, "Both tasks should run concurrently");
+
+    const reportText = result.content[0].text;
+    assert.match(reportText, /Parallel Task 1/);
+    assert.match(reportText, /Parallel Task 2/);
+  });
+
+  it("verifies parallel-safe subagent logs and status updates with stable run/subagent IDs", async () => {
+    const mockTasks = [
+      { title: "Parallel Task 1", description: "First job", acceptanceCriteria: "A is verified", dependsOn: [] },
+      { title: "Parallel Task 2", description: "Second job", acceptanceCriteria: "B is verified", dependsOn: [] }
+    ];
+
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("-o")) {
+            const oIndex = args.indexOf("-o");
+            const outputPath = args[oIndex + 1];
+            fs.writeFileSync(outputPath, JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    const emittedEvents: any[] = [];
+    const customOnUpdate = (update: any) => {
+      emittedEvents.push(update);
+    };
+
+    mockSubagentHandler = async (toolName, params, signal, onUpdate) => {
+      if (params.task.includes("Parallel Task 1")) {
+        // Emit interleaved stream chunks
+        onUpdate({ content: [{ type: "text", text: "Task 1 chunk A" }] });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        onUpdate({ content: [{ type: "text", text: "Task 1 chunk B" }] });
+      } else if (params.task.includes("Parallel Task 2")) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        onUpdate({ content: [{ type: "text", text: "Task 2 chunk A" }] });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        onUpdate({ content: [{ type: "text", text: "Task 2 chunk B" }] });
+      }
+
+      return {
+        content: [{ type: "text", text: "Successfully completed task." }],
+        details: { results: [{ exitCode: 0, model: "test-parallel-model" }] }
+      };
+    };
+
+    const result = await registeredTool.execute(
+      "tool-call-parallel-safety",
+      { goal: "Test parallel run safety", concurrencyLimit: 2, reviewMode: "after-all" },
+      undefined,
+      customOnUpdate,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(result.isError, undefined);
+
+    // Verify that every chunk event passed through onUpdate has the stable run/subagent ID and task index
+    const task1Updates = emittedEvents.filter(e => e.content?.[0]?.text?.includes("Task 1 chunk"));
+    const task2Updates = emittedEvents.filter(e => e.content?.[0]?.text?.includes("Task 2 chunk"));
+
+    assert.ok(task1Updates.length >= 2, "Task 1 updates should be captured");
+    assert.ok(task2Updates.length >= 2, "Task 2 updates should be captured");
+
+    // All Task 1 updates should share the same stable subagentRunId and have taskIndex: 0
+    const t1RunId = task1Updates[0]?.details?.subagentRunId;
+    assert.ok(t1RunId, "Task 1 updates must have a stable subagentRunId");
+    for (const update of task1Updates) {
+      assert.strictEqual(update.details?.subagentRunId, t1RunId, "Task 1 run ID must be stable across updates");
+      assert.strictEqual(update.details?.taskIndex, 0, "Task 1 updates must carry taskIndex: 0");
+    }
+
+    // All Task 2 updates should share the same stable subagentRunId and have taskIndex: 1
+    const t2RunId = task2Updates[0]?.details?.subagentRunId;
+    assert.ok(t2RunId, "Task 2 updates must have a stable subagentRunId");
+    for (const update of task2Updates) {
+      assert.strictEqual(update.details?.subagentRunId, t2RunId, "Task 2 run ID must be stable across updates");
+      assert.strictEqual(update.details?.taskIndex, 1, "Task 2 updates must carry taskIndex: 1");
+    }
+
+    // Task 1 and Task 2 run IDs must be distinct
+    assert.notStrictEqual(t1RunId, t2RunId, "Task 1 and Task 2 subagentRunIds must be distinct");
+
+    // Now, let's verify the persisted logs in workflow-logs.jsonl
+    const logFilePath = path.join(tempTestDir, "workflow-logs.jsonl");
+    assert.ok(fs.existsSync(logFilePath), "workflow-logs.jsonl file must be persisted");
+    const logLines = fs.readFileSync(logFilePath, "utf8").trim().split("\n");
+
+    const parsedLogs = logLines.map(line => JSON.parse(line));
+    const subagentLogs = parsedLogs.filter(log => log.details?.subagentRunId);
+
+    assert.ok(subagentLogs.length > 0, "There should be logged subagent entries with run IDs");
+
+    const t1Logs = subagentLogs.filter(log => log.details?.taskIndex === 0);
+    const t2Logs = subagentLogs.filter(log => log.details?.taskIndex === 1);
+
+    assert.ok(t1Logs.length > 0, "Task 1 logged entries should exist");
+    assert.ok(t2Logs.length > 0, "Task 2 logged entries should exist");
+
+    for (const log of t1Logs) {
+      assert.strictEqual(log.details?.subagentRunId, t1RunId, "Task 1 log entry must have correct stable subagentRunId");
+    }
+    for (const log of t2Logs) {
+      assert.strictEqual(log.details?.subagentRunId, t2RunId, "Task 2 log entry must have correct stable subagentRunId");
+    }
+  });
+
+  it("verifies end-to-end model display with parallel execution", async () => {
+    // Description of verification scenario:
+    // This integration scenario launches multiple subagents concurrently with distinct, known model names.
+    // It verifies that:
+    // 1. Overlapping concurrent execution is proven through start/end timestamps.
+    // 2. The UI is updated correctly and displays the precise model name for each subagent.
+    // 3. No console/runtime errors occur during parallel status updates.
+
+    const mockTasks = [
+      { title: "Parallel Task 1", description: "First job", acceptanceCriteria: "A is verified", dependsOn: [] },
+      { title: "Parallel Task 2", description: "Second job", acceptanceCriteria: "B is verified", dependsOn: [] }
+    ];
+
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("-o")) {
+            const oIndex = args.indexOf("-o");
+            const outputPath = args[oIndex + 1];
+            fs.writeFileSync(outputPath, JSON.stringify({ tasks: mockTasks }), "utf8");
+          } else {
+            // Reviewer
+            mockProc.stdout.emit("data", Buffer.from(REVIEW_SHIP_OUTPUT));
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    const activeCalls: number[] = [];
+    let maxConcurrencyObserved = 0;
+    const executionTimestamps: Array<{ task: string; event: "start" | "end"; time: number }> = [];
+
+    mockSubagentHandler = async (toolName, params, signal, onUpdate) => {
+      const isTask1 = params.task.includes("Parallel Task 1");
+      const taskTitle = isTask1 ? "Parallel Task 1" : "Parallel Task 2";
+      const model = isTask1 ? "anthropic/claude-3-5-sonnet-parallel-1" : "openai/gpt-4o-parallel-2";
+
+      executionTimestamps.push({ task: taskTitle, event: "start", time: Date.now() });
+      activeCalls.push(1);
+      maxConcurrencyObserved = Math.max(maxConcurrencyObserved, activeCalls.length);
+
+      // Controlled delay to simulate concurrent work overlap
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      if (onUpdate) {
+        onUpdate({
+          content: [{ type: "text", text: `In-progress update for ${taskTitle}` }],
+          details: { results: [{ exitCode: 0, model }] }
+        });
+      }
+
+      activeCalls.pop();
+      executionTimestamps.push({ task: taskTitle, event: "end", time: Date.now() });
+
+      return {
+        content: [{ type: "text", text: `Successfully completed ${taskTitle}` }],
+        details: { results: [{ exitCode: 0, model }] }
+      };
+    };
+
+    // Capture UI widget rendering calls
+    const widgetSnapshots: string[][] = [];
+    const statusSnapshots: string[] = [];
+    const captureCtx = {
+      cwd: tempTestDir,
+      ui: {
+        setWidget: (_id: string, content: any) => {
+          const lines = captureWidgetLines(content);
+          if (lines) widgetSnapshots.push(lines);
+        },
+        setStatus: (_id: string, value: string | undefined) => {
+          if (value) statusSnapshots.push(value);
+        },
+        theme: plainWidgetTheme,
+      },
+    };
+
+    // Execute the cc_review tool with concurrencyLimit=2 and after-all reviewMode
+    const result = await registeredTool.execute(
+      "tool-call-parallel-ui-verify",
+      { goal: "Verify parallel models and concurrency", concurrencyLimit: 2, reviewMode: "after-all" },
+      undefined,
+      undefined,
+      captureCtx
+    );
+
+    // Verify successful execution with no errors
+    assert.equal(result.isError, undefined);
+    assert.equal(maxConcurrencyObserved, 2, "Both tasks must run concurrently");
+
+    // Timing/Overlapping proof
+    const t1Start = executionTimestamps.find(e => e.task === "Parallel Task 1" && e.event === "start")?.time;
+    const t1End = executionTimestamps.find(e => e.task === "Parallel Task 1" && e.event === "end")?.time;
+    const t2Start = executionTimestamps.find(e => e.task === "Parallel Task 2" && e.event === "start")?.time;
+    const t2End = executionTimestamps.find(e => e.task === "Parallel Task 2" && e.event === "end")?.time;
+
+    assert.ok(t1Start && t1End && t2Start && t2End, "All start and end timestamps must be recorded");
+    assert.ok(t2Start < t1End, "Task 2 must start before Task 1 ends, demonstrating parallel overlap");
+    assert.ok(t1Start < t2End, "Task 1 must start before Task 2 ends, demonstrating parallel overlap");
+
+    // Verify model names are captured in final results and summary
+    const summaryText = result.content[0].text;
+    assert.match(summaryText, /anthropic\/claude-3-5-sonnet-parallel-1/, "Summary must show model for Task 1");
+    assert.match(summaryText, /openai\/gpt-4o-parallel-2/, "Summary must show model for Task 2");
+
+    // Verify that the UI displays the correct model name for each subagent
+    // We can search the captured widget snapshots for the exact model names
+    let foundTask1ModelInUI = false;
+    let foundTask2ModelInUI = false;
+
+    for (const lines of widgetSnapshots) {
+      for (const line of lines) {
+        if (line.includes("claude-3-5-sonnet-parallel-1")) {
+          foundTask1ModelInUI = true;
+        }
+        if (line.includes("gpt-4o-parallel-2")) {
+          foundTask2ModelInUI = true;
+        }
+      }
+    }
+
+    assert.ok(foundTask1ModelInUI, "Task 1 model name should be rendered in UI");
+    assert.ok(foundTask2ModelInUI, "Task 2 model name should be rendered in UI");
   });
 });
 

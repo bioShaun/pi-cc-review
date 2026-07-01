@@ -102,6 +102,96 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+async function runWithConcurrencyLimit<T>(
+  concurrencyLimit: number,
+  items: T[],
+  fn: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  const executing = new Set<Promise<void>>();
+  const started: Promise<void>[] = [];
+  let firstError: unknown;
+
+  for (let i = 0; i < items.length; i++) {
+    if (firstError !== undefined) break;
+    const item = items[i];
+    const p = (async () => {
+      await fn(item, i);
+    })();
+    started.push(p);
+    executing.add(p);
+    p.then(
+      () => executing.delete(p),
+      (err) => {
+        executing.delete(p);
+        if (firstError === undefined) firstError = err;
+      }
+    );
+    if (executing.size >= concurrencyLimit) {
+      await Promise.race(executing).catch((err) => {
+        if (firstError === undefined) firstError = err;
+      });
+    }
+  }
+
+  const settled = await Promise.allSettled(started);
+  const rejected = settled.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  );
+  if (firstError !== undefined) throw firstError;
+  if (rejected) throw rejected.reason;
+}
+
+export interface AfterAllExecutionBatchItem {
+  task: Task;
+  index: number;
+}
+
+export function buildAfterAllExecutionBatches(
+  tasks: readonly Task[]
+): AfterAllExecutionBatchItem[][] {
+  const dependencySets = tasks.map((task, index) => {
+    if (!Array.isArray(task.dependsOn)) {
+      return index === 0 ? new Set<number>() : new Set<number>([index - 1]);
+    }
+
+    const normalized = new Set<number>();
+    for (const value of task.dependsOn) {
+      const dependencyNumber = Number(value);
+      if (
+        Number.isInteger(dependencyNumber) &&
+        dependencyNumber >= 1 &&
+        dependencyNumber <= tasks.length
+      ) {
+        normalized.add(dependencyNumber - 1);
+      }
+    }
+    return normalized;
+  });
+
+  const remaining = new Set(tasks.map((_, index) => index));
+  const batches: AfterAllExecutionBatchItem[][] = [];
+
+  while (remaining.size > 0) {
+    const ready = [...remaining]
+      .filter((index) => [...dependencySets[index]].every((dependency) => !remaining.has(dependency)))
+      .sort((a, b) => a - b);
+
+    if (ready.length === 0) {
+      const blockedTaskNumbers = [...remaining].map((index) => index + 1).join(", ");
+      throw new Error(
+        `Invalid task dependency graph: cycle detected among tasks ${blockedTaskNumbers}`
+      );
+    }
+
+    batches.push(ready.map((index) => ({ task: tasks[index], index })));
+    for (const index of ready) {
+      remaining.delete(index);
+    }
+  }
+
+  return batches;
+}
+
 // Emit structured trace event for observability
 //
 // By default we only write traces to the workspace-local `workflow-trace.jsonl`
@@ -205,6 +295,16 @@ const CcReviewParams = {
       type: "number",
       description: "Optional task checklist window size for the compact widget. Omit to use CC_REVIEW_CHECKLIST_WINDOW or the default 8.",
     },
+    concurrency: {
+      type: "integer",
+      minimum: 1,
+      description: "Optional maximum number of concurrent subagent tasks. Omit to use CC_REVIEW_CONCURRENCY or the default 4.",
+    },
+    concurrencyLimit: {
+      type: "integer",
+      minimum: 1,
+      description: "Optional maximum number of concurrent subagent tasks. Omit to use CC_REVIEW_CONCURRENCY or the default 4.",
+    },
   },
   required: ["goal"],
   additionalProperties: false,
@@ -220,12 +320,16 @@ interface CcReviewExecuteParams {
   taskTimeoutMs?: number;
   widgetLogLines?: number;
   checklistWindow?: number;
+  concurrency?: number;
+  concurrencyLimit?: number;
 }
 
-interface Task {
+export interface Task {
   title: string;
   description: string;
   acceptanceCriteria: string;
+  /** 1-based task numbers this task depends on. Missing means preserve ordered handoff semantics. */
+  dependsOn?: number[];
 }
 
 interface ProcessResult {
@@ -235,6 +339,183 @@ interface ProcessResult {
   stderr: string;
   combinedOutput: string;
   output?: string;
+}
+
+interface SubprocessResult {
+  code: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+  combinedOutput: string;
+  timedOut: boolean;
+  aborted: boolean;
+  spawnError: Error | null;
+}
+
+interface RunSubprocessOptions {
+  label: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  traceCtx?: any;
+  onStdoutChunk?: (data: Buffer) => void;
+  onStderrChunk?: (data: Buffer) => void;
+  onStdoutLine?: (line: string) => void;
+  registerProc?: (proc: import("child_process").ChildProcess) => (() => void) | undefined;
+  abortMode?: "external" | "internal";
+}
+
+const SUBPROCESS_KILL_GRACE_MS = 500;
+
+function sendSignalToProcessGroup(
+  proc: import("child_process").ChildProcess,
+  signal: NodeJS.Signals
+): void {
+  if (!proc.pid) return;
+  try {
+    process.kill(-proc.pid, signal);
+  } catch {
+    try {
+      proc.kill(signal);
+    } catch {
+      // already reaped
+    }
+  }
+}
+
+async function killProcessGroup(proc: import("child_process").ChildProcess, graceMs: number = SUBPROCESS_KILL_GRACE_MS): Promise<void> {
+  sendSignalToProcessGroup(proc, "SIGTERM");
+  await new Promise<void>((r) => setTimeout(r, graceMs));
+  sendSignalToProcessGroup(proc, "SIGKILL");
+}
+
+async function runSubprocess(opts: RunSubprocessOptions): Promise<SubprocessResult> {
+  const {
+    label, command, args, cwd, timeoutMs, signal, traceCtx,
+    onStdoutChunk, onStderrChunk, onStdoutLine, registerProc,
+    abortMode = "external",
+  } = opts;
+
+  if (traceCtx) emitTrace(traceCtx, "tool_execution_start", { label, command, source: "subprocess" });
+
+  const proc = childProcess.spawn(command, args, {
+    cwd,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: process.env,
+    detached: true,
+  });
+
+  let unregister: (() => void) | undefined;
+  if (registerProc) unregister = registerProc(proc);
+
+  let stdoutBuf = "";
+  let stderrBuf = "";
+  let combined = "";
+  let stdoutLineRem = "";
+  let settled = false;
+  let timedOut = false;
+  let aborted = false;
+  let spawnError: Error | null = null;
+  let timeoutTimer: NodeJS.Timeout | undefined;
+  let resolvedCode: number | null = null;
+  let resolvedSignal: string | null = null;
+
+  const finalize = (): SubprocessResult => ({
+    code: resolvedCode, signal: resolvedSignal,
+    stdout: stdoutBuf, stderr: stderrBuf, combinedOutput: combined,
+    timedOut, aborted, spawnError,
+  });
+
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    const text = chunk.toString("utf-8");
+    stdoutBuf += text;
+    combined += text;
+    if (onStdoutChunk) { try { onStdoutChunk(chunk); } catch { /* ignore */ } }
+    if (onStdoutLine) {
+      stdoutLineRem += text;
+      let nl: number;
+      while ((nl = stdoutLineRem.indexOf("\n")) !== -1) {
+        const line = stdoutLineRem.slice(0, nl);
+        stdoutLineRem = stdoutLineRem.slice(nl + 1);
+        try { onStdoutLine(line); } catch { /* ignore */ }
+      }
+    }
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    const text = chunk.toString("utf-8");
+    stderrBuf += text;
+    combined += text;
+    if (onStderrChunk) { try { onStderrChunk(chunk); } catch { /* ignore */ } }
+  });
+
+  if (timeoutMs) {
+    timeoutTimer = setTimeout(async () => {
+      if (settled) return;
+      timedOut = true;
+      await killProcessGroup(proc, SUBPROCESS_KILL_GRACE_MS);
+    }, timeoutMs);
+  }
+
+  const onAbortInternal = () => {
+    if (settled) return;
+    aborted = true;
+    killProcessGroup(proc, SUBPROCESS_KILL_GRACE_MS).catch(() => {});
+  };
+  if (abortMode === "internal" && signal) {
+    if (signal.aborted) onAbortInternal();
+    else signal.addEventListener("abort", onAbortInternal, { once: true });
+  }
+
+  return new Promise<SubprocessResult>((resolve) => {
+    proc.on("error", (err: Error) => {
+      if (settled) return;
+      spawnError = err;
+      stderrBuf += `\n[spawn error] ${err.message}`;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (abortMode === "internal" && signal) signal.removeEventListener("abort", onAbortInternal);
+      if (traceCtx) emitTrace(traceCtx, "failure", { phase: "subprocess_start", label, command, error: err.message });
+      settled = true;
+      if (unregister) unregister();
+      resolve(finalize());
+    });
+
+    proc.on("close", (code, closeSignal) => {
+      if (settled) return;
+      resolvedCode = typeof code === "number" ? code : null;
+      resolvedSignal = closeSignal ?? null;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (abortMode === "internal" && signal) signal.removeEventListener("abort", onAbortInternal);
+
+      if (onStdoutLine && stdoutLineRem.length > 0) {
+        try { onStdoutLine(stdoutLineRem); } catch { /* ignore */ }
+        stdoutLineRem = "";
+      }
+
+      if (traceCtx) {
+        emitTrace(traceCtx, "tool_execution_end", {
+          label, command, source: "subprocess",
+          exitCode: resolvedCode ?? (resolvedSignal ? 1 : 0),
+          signal: resolvedSignal ?? undefined,
+        });
+        if ((resolvedCode !== null && resolvedCode !== 0) || resolvedSignal || timedOut) {
+          emitTrace(traceCtx, "failure", {
+            phase: timedOut ? "subprocess_timeout" : "subprocess_exit",
+            label, command,
+            exitCode: resolvedCode ?? (resolvedSignal ? 1 : 0),
+            signal: resolvedSignal ?? undefined,
+            timeoutMs: timedOut ? timeoutMs : undefined,
+          });
+        }
+      }
+
+      settled = true;
+      if (unregister) unregister();
+      resolve(finalize());
+    });
+  });
 }
 
 type CcReviewLogSeverity = "debug" | "info" | "warning" | "error";
@@ -372,7 +653,49 @@ function summarizeToolInput(input: unknown): string {
   return "";
 }
 
-function summarizeCodexItem(eventType: string, item: Record<string, unknown>): string | null {
+type SubprocessProvider = "codex" | "claude";
+
+type AdapterSeverityHint = CcReviewLogSeverity | undefined;
+
+type StreamSummarizerOutcome =
+  | { readonly kind: "terminal"; readonly summary: string | null; readonly severity?: AdapterSeverityHint }
+  | { readonly kind: "redispatch"; readonly rawLine: string };
+
+interface StreamSummarizerContext {
+  readonly provider: SubprocessProvider | undefined;
+  readonly rawLine: string;
+}
+
+interface StreamSummarizer {
+  readonly provider: SubprocessProvider;
+  summarize(payload: unknown, context: StreamSummarizerContext): StreamSummarizerOutcome | null;
+}
+
+const MAX_REDISPATCH_DEPTH = 2;
+
+interface RichStreamSummary {
+  readonly message: string;
+  readonly severity?: AdapterSeverityHint;
+}
+
+function resolveNestedAssistantText(
+  rawText: string | undefined,
+  provider: SubprocessProvider | undefined
+): { readonly summary: string | null } {
+  if (typeof rawText !== "string") return { summary: null };
+  const trimmed = rawText.trim();
+  if (!trimmed) return { summary: null };
+  const nested = formatSubprocessStreamLineRich(rawText, provider);
+  if (nested !== null && nested.message !== trimmed) {
+    return { summary: nested.message };
+  }
+  if (nested === null && /^[\[{]/.test(trimmed)) {
+    return { summary: null };
+  }
+  return { summary: `Assistant: ${structuredTextPreview(rawText, 120)}` };
+}
+
+function codexItemSummary(eventType: string, item: Record<string, unknown>, provider: SubprocessProvider | undefined): string | null {
   const itemType = typeof item.type === "string" ? item.type : "item";
   const isStarted = eventType === "item.started";
   const isCompleted = eventType === "item.completed";
@@ -385,10 +708,7 @@ function summarizeCodexItem(eventType: string, item: Record<string, unknown>): s
 
   if (itemType === "agent_message") {
     if (typeof item.text !== "string" || !item.text.trim()) return null;
-    const nestedSummary = formatSubprocessStreamLine(item.text);
-    if (nestedSummary && nestedSummary !== item.text.trim()) return nestedSummary;
-    if (nestedSummary === null && /^[\[{]/.test(item.text.trim())) return null;
-    return `Assistant: ${structuredTextPreview(item.text, 120)}`;
+    return resolveNestedAssistantText(item.text, provider).summary;
   }
 
   if (itemType === "command_execution") {
@@ -440,12 +760,132 @@ function summarizeCodexItem(eventType: string, item: Record<string, unknown>): s
   return null;
 }
 
-function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
+const codexSummarizer: StreamSummarizer = {
+  provider: "codex",
+  summarize(payload, context) {
+    if (!payload || typeof payload !== "object") return null;
+    const obj = payload as Record<string, unknown>;
+    if (typeof obj.type !== "string") return null;
+
+    if (obj.type === "thread.started" || obj.type === "turn.started") {
+      return { kind: "terminal", summary: null };
+    }
+    if (obj.type === "turn.completed") {
+      return { kind: "terminal", summary: "Codex turn completed" };
+    }
+    if (obj.type === "turn.failed") {
+      const error =
+        structuredTextPreview((obj.error as Record<string, unknown> | undefined)?.message, 100) ||
+        structuredTextPreview(obj.message, 100);
+      return { kind: "terminal", summary: error ? `Codex turn failed: ${error}` : "Codex turn failed", severity: "error" };
+    }
+    if (
+      (obj.type === "item.started" || obj.type === "item.updated" || obj.type === "item.completed") &&
+      obj.item &&
+      typeof obj.item === "object"
+    ) {
+      const item = obj.item as Record<string, unknown>;
+      const itemType = typeof item.type === "string" ? item.type : "item";
+      const exitCode = typeof item.exit_code === "number" ? item.exit_code : undefined;
+      const severity: AdapterSeverityHint =
+        itemType === "command_execution" && exitCode !== undefined && exitCode !== 0 ? "error" : undefined;
+      const summary = codexItemSummary(obj.type, item, context.provider);
+      return { kind: "terminal", summary, severity };
+    }
+    if (obj.type === "item.started" || obj.type === "item.updated" || obj.type === "item.completed") {
+      return { kind: "terminal", summary: null };
+    }
+
+    return null;
+  },
+};
+
+const claudeSummarizer: StreamSummarizer = {
+  provider: "claude",
+  summarize(payload, _context) {
+    if (!payload || typeof payload !== "object") return null;
+    const obj = payload as Record<string, unknown>;
+    if (typeof obj.type !== "string") return null;
+
+    if (obj.type === "system" || obj.type === "user" || obj.type === "stream_event") {
+      return { kind: "terminal", summary: null };
+    }
+    if (obj.type === "assistant") {
+      const message = obj.message && typeof obj.message === "object"
+        ? obj.message as Record<string, unknown>
+        : undefined;
+      const content = Array.isArray(message?.content) ? message.content : [];
+      const summaries: string[] = [];
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        const contentPart = part as Record<string, unknown>;
+        if (contentPart.type === "tool_use") {
+          const name = structuredTextPreview(contentPart.name, 60) || "tool";
+          const hint = summarizeToolInput(contentPart.input);
+          summaries.push(hint ? `Using tool: ${name} — ${hint}` : `Using tool: ${name}`);
+        } else if (contentPart.type === "text") {
+          if (typeof contentPart.text !== "string" || !contentPart.text.trim()) continue;
+          const resolved = resolveNestedAssistantText(contentPart.text, "claude");
+          if (resolved.summary !== null) summaries.push(resolved.summary);
+        }
+      }
+      return { kind: "terminal", summary: summaries.length > 0 ? summaries.slice(0, 2).join(" · ") : null };
+    }
+    if (obj.type === "result") {
+      const failed = obj.is_error === true || obj.subtype === "error";
+      const durationMs = typeof obj.duration_ms === "number" ? obj.duration_ms : undefined;
+      const turns = typeof obj.num_turns === "number" ? obj.num_turns : undefined;
+      const details = [
+        durationMs !== undefined ? `${Math.max(0, durationMs / 1000).toFixed(1)}s` : "",
+        turns !== undefined ? `${turns} turn${turns === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(", ");
+      const resultText = structuredTextPreview(obj.result, 100);
+      if (failed) return { kind: "terminal", summary: resultText ? `Claude failed: ${resultText}` : "Claude run failed", severity: "error" };
+      return { kind: "terminal", summary: `Claude run completed${details ? ` (${details})` : ""}` };
+    }
+    if (obj.type === "tool_progress") {
+      const tool = structuredTextPreview(obj.tool_name ?? obj.name, 60) || "tool";
+      return { kind: "terminal", summary: `${tool} is still running` };
+    }
+    if (obj.type === "rate_limit_event") {
+      return { kind: "terminal", summary: "Rate limited; waiting to retry", severity: "warning" };
+    }
+    if (obj.type === "tool_call" || obj.type === "tool_use" || obj.type === "tool_execution_start") {
+      const name =
+        typeof obj.name === "string"
+          ? obj.name
+          : typeof obj.tool === "string"
+            ? obj.tool
+            : typeof obj.toolName === "string"
+              ? obj.toolName
+              : "tool";
+      return { kind: "terminal", summary: `⚙ ${name}` };
+    }
+    if (obj.type === "message" || obj.type === "message_end") {
+      return { kind: "terminal", summary: null };
+    }
+
+    return null;
+  },
+};
+
+const STREAM_SUMMARIZERS: readonly StreamSummarizer[] = [codexSummarizer, claudeSummarizer];
+
+function selectSummarizers(provider: SubprocessProvider | undefined): readonly StreamSummarizer[] {
+  if (provider === undefined) return STREAM_SUMMARIZERS;
+  return STREAM_SUMMARIZERS.filter((adapter) => adapter.provider === provider);
+}
+
+function summarizeStructuredSubprocessPayload(
+  payload: unknown,
+  provider: SubprocessProvider | undefined,
+  depth: number
+): StreamSummarizerOutcome | null {
   if (!payload || typeof payload !== "object") return null;
   const obj = payload as Record<string, unknown>;
 
   if (obj.type === "workflow_trace" || obj.type === "cc_review_log_rotation") {
-    return null;
+    return { kind: "terminal", summary: null };
   }
 
   if (Array.isArray(obj.tasks)) {
@@ -458,7 +898,7 @@ function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
       .filter(Boolean);
     const preview = titles.slice(0, 3).join("; ");
     const suffix = titles.length > 3 ? ` (+${titles.length - 3} more)` : "";
-    return `Planned ${titles.length} task${titles.length === 1 ? "" : "s"}: ${preview}${suffix}`;
+    return { kind: "terminal", summary: `Planned ${titles.length} task${titles.length === 1 ? "" : "s"}: ${preview}${suffix}` };
   }
 
   if (typeof obj.verdict === "string") {
@@ -475,97 +915,30 @@ function summarizeStructuredSubprocessPayload(payload: unknown): string | null {
     if (findings.length > 0) {
       parts.push(`${findings.length} finding${findings.length === 1 ? "" : "s"} (${unfixed} unfixed)`);
     }
-    return parts.join(" — ");
+    return { kind: "terminal", summary: parts.join(" — ") };
   }
 
-  if (typeof obj.type === "string") {
-    // Codex `exec --json` lifecycle. Session bookkeeping is intentionally
-    // hidden; work items are translated into concrete, scan-friendly actions.
-    if (obj.type === "thread.started" || obj.type === "turn.started") return null;
-    if (obj.type === "turn.completed") return "Codex turn completed";
-    if (obj.type === "turn.failed") {
-      const error =
-        structuredTextPreview((obj.error as Record<string, unknown> | undefined)?.message, 100) ||
-        structuredTextPreview(obj.message, 100);
-      return error ? `Codex turn failed: ${error}` : "Codex turn failed";
-    }
-    if (
-      (obj.type === "item.started" || obj.type === "item.updated" || obj.type === "item.completed") &&
-      obj.item &&
-      typeof obj.item === "object"
-    ) {
-      return summarizeCodexItem(obj.type, obj.item as Record<string, unknown>);
-    }
-
-    // Claude Code `--output-format stream-json` lifecycle.
-    if (obj.type === "system" || obj.type === "user" || obj.type === "stream_event") return null;
-    if (obj.type === "assistant") {
-      const message = obj.message && typeof obj.message === "object"
-        ? obj.message as Record<string, unknown>
-        : undefined;
-      const content = Array.isArray(message?.content) ? message.content : [];
-      const summaries: string[] = [];
-      for (const part of content) {
-        if (!part || typeof part !== "object") continue;
-        const contentPart = part as Record<string, unknown>;
-        if (contentPart.type === "tool_use") {
-          const name = structuredTextPreview(contentPart.name, 60) || "tool";
-          const hint = summarizeToolInput(contentPart.input);
-          summaries.push(hint ? `Using tool: ${name} — ${hint}` : `Using tool: ${name}`);
-        } else if (contentPart.type === "text") {
-          if (typeof contentPart.text !== "string" || !contentPart.text.trim()) continue;
-          const nestedSummary = formatSubprocessStreamLine(contentPart.text);
-          if (nestedSummary && nestedSummary !== contentPart.text.trim()) summaries.push(nestedSummary);
-          else if (!(nestedSummary === null && /^[\[{]/.test(contentPart.text.trim()))) {
-            summaries.push(`Assistant: ${structuredTextPreview(contentPart.text, 120)}`);
-          }
-        }
-      }
-      return summaries.length > 0 ? summaries.slice(0, 2).join(" · ") : null;
-    }
-    if (obj.type === "result") {
-      const failed = obj.is_error === true || obj.subtype === "error";
-      const durationMs = typeof obj.duration_ms === "number" ? obj.duration_ms : undefined;
-      const turns = typeof obj.num_turns === "number" ? obj.num_turns : undefined;
-      const details = [
-        durationMs !== undefined ? `${Math.max(0, durationMs / 1000).toFixed(1)}s` : "",
-        turns !== undefined ? `${turns} turn${turns === 1 ? "" : "s"}` : "",
-      ].filter(Boolean).join(", ");
-      const resultText = structuredTextPreview(obj.result, 100);
-      if (failed) return resultText ? `Claude failed: ${resultText}` : "Claude run failed";
-      return `Claude run completed${details ? ` (${details})` : ""}`;
-    }
-    if (obj.type === "tool_progress") {
-      const tool = structuredTextPreview(obj.tool_name ?? obj.name, 60) || "tool";
-      return `${tool} is still running`;
-    }
-    if (obj.type === "rate_limit_event") return "Rate limited; waiting to retry";
-
-    if (obj.type === "tool_call" || obj.type === "tool_use" || obj.type === "tool_execution_start") {
-      const name =
-        typeof obj.name === "string"
-          ? obj.name
-          : typeof obj.tool === "string"
-            ? obj.tool
-            : typeof obj.toolName === "string"
-              ? obj.toolName
-              : "tool";
-      return `⚙ ${name}`;
-    }
-    if (obj.type === "message" || obj.type === "assistant" || obj.type === "stream_event" || obj.type === "message_end") {
-      return null;
-    }
+  const context: StreamSummarizerContext = { provider, rawLine: "" };
+  for (const adapter of selectSummarizers(provider)) {
+    const outcome = adapter.summarize(obj, context);
+    if (outcome !== null) return outcome;
   }
 
   if (typeof obj.command === "string") {
-    return `exec ${clipSubprocessLogText(obj.command, 80)}`;
+    return { kind: "terminal", summary: `exec ${clipSubprocessLogText(obj.command, 80)}` };
   }
 
   const error = structuredTextPreview(obj.error ?? obj.message, 110);
-  return error ? `Provider message: ${error}` : null;
+  return error
+    ? { kind: "terminal", summary: `Provider message: ${error}` }
+    : { kind: "terminal", summary: null };
 }
 
-export function formatSubprocessStreamLine(rawLine: string): string | null {
+function formatSubprocessStreamLineRich(
+  rawLine: string,
+  provider: SubprocessProvider | undefined,
+  depth = 0
+): RichStreamSummary | null {
   const line = stripAnsi(rawLine).trim();
   if (!line) return null;
 
@@ -576,19 +949,30 @@ export function formatSubprocessStreamLine(rawLine: string): string | null {
   if (line.startsWith("{") || line.startsWith("[")) {
     try {
       const parsed = JSON.parse(line);
-      const summarized = summarizeStructuredSubprocessPayload(parsed);
-      if (summarized !== null) return summarized;
-      return null;
+      const outcome = summarizeStructuredSubprocessPayload(parsed, provider, depth);
+      if (outcome === null) return null;
+      if (outcome.kind === "terminal") {
+        if (outcome.summary === null) return null;
+        return { message: outcome.summary, severity: outcome.severity };
+      }
+      if (depth >= MAX_REDISPATCH_DEPTH) {
+        const fallback = resolveNestedAssistantText(outcome.rawLine, provider);
+        return fallback.summary === null ? null : { message: fallback.summary };
+      }
+      return formatSubprocessStreamLineRich(outcome.rawLine, provider, depth + 1);
     } catch {
-      // A provider JSON event should never leak to the human display merely
-      // because it is malformed or belongs to a newer event schema.
       return null;
     }
   }
 
   if (looksLikeJsonFragment(line)) return null;
 
-  return line;
+  return { message: line };
+}
+
+export function formatSubprocessStreamLine(rawLine: string): string | null {
+  const rich = formatSubprocessStreamLineRich(rawLine, undefined);
+  return rich === null ? null : rich.message;
 }
 
 export interface SubprocessStreamLogger {
@@ -599,19 +983,17 @@ export interface SubprocessStreamLogger {
 export function createSubprocessStreamLogger(
   logFn: (input: CcReviewLogInput) => void,
   stream: "stdout" | "stderr",
-  source: "planner" | "reviewer"
+  source: "planner" | "reviewer",
+  provider?: SubprocessProvider
 ): SubprocessStreamLogger {
   let remainder = "";
   const emitLine = (line: string) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    const message = formatSubprocessStreamLine(trimmed);
-    if (message === null) return;
-    logFn({
-      severity: inferSubprocessStreamSeverity(message, stream),
-      source,
-      message,
-    });
+    const rich = formatSubprocessStreamLineRich(trimmed, provider);
+    if (rich === null) return;
+    const severity = rich.severity ?? inferSubprocessStreamSeverity(rich.message, stream);
+    logFn({ severity, source, message: rich.message });
   };
 
   return {
@@ -1028,6 +1410,55 @@ export function resolveSubagentTaskTimeout(
   }
 
   return { timeoutMs: DEFAULT_TASK_TIMEOUT_MS, source: "default" };
+}
+
+export const DEFAULT_CONCURRENCY = 4;
+
+export interface ResolveCcReviewConcurrencyOptions {
+  flag?: string | number;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ResolveCcReviewConcurrencyResult {
+  concurrency: number;
+  source: "flag" | "env" | "default";
+  invalidInput?: { source: "flag" | "env"; raw: string };
+}
+
+export function resolveCcReviewConcurrency(
+  options: ResolveCcReviewConcurrencyOptions = {}
+): ResolveCcReviewConcurrencyResult {
+  if (options.flag !== undefined && options.flag !== null) {
+    const raw = options.flag;
+    const parsed = typeof raw === "number" ? raw : Number(String(raw).trim());
+    if (Number.isInteger(parsed) && parsed >= 1) {
+      return { concurrency: parsed, source: "flag" };
+    }
+    return {
+      concurrency: DEFAULT_CONCURRENCY,
+      source: "default",
+      invalidInput: {
+        source: "flag",
+        raw: String(options.flag),
+      },
+    };
+  }
+
+  const env = options.env ?? process.env;
+  const rawEnv = env.CC_REVIEW_CONCURRENCY;
+  if (typeof rawEnv === "string" && rawEnv.trim() !== "") {
+    const parsed = Number(rawEnv.trim());
+    if (Number.isInteger(parsed) && parsed >= 1) {
+      return { concurrency: parsed, source: "env" };
+    }
+    return {
+      concurrency: DEFAULT_CONCURRENCY,
+      source: "default",
+      invalidInput: { source: "env", raw: rawEnv },
+    };
+  }
+
+  return { concurrency: DEFAULT_CONCURRENCY, source: "default" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1744,7 +2175,7 @@ export function truncateWidgetLine(text: string, maxWidth: number = WIDGET_MAX_W
 
 export interface CcReviewWidgetState {
   goal: string;
-  tasks: readonly { title: string; status?: TaskStatus }[];
+  tasks: readonly { title: string; status?: TaskStatus | "running"; model?: string }[];
   currentTaskIndex: number;
   displayState: CcReviewDisplayState;
   currentPhase: string;
@@ -1757,7 +2188,8 @@ export interface CcReviewWidgetState {
   resolvedChecklistWindow?: number;
   persistedLogPath: string;
   findingsRollup: CcReviewFindingsRollup;
-  taskStatuses?: readonly (TaskStatus | undefined)[];
+  taskStatuses?: readonly (TaskStatus | "running" | undefined)[];
+  taskModels?: readonly (string | undefined)[];
 }
 
 export interface TaskVisuals {
@@ -1960,7 +2392,12 @@ export function buildCcReviewWidgetLines(
       const title = previewWidgetText(task.title, width - 16);
       const taskLabel = theme.fg("muted", `[Task ${i + 1}/${state.tasks.length}]`);
       const styledTitle = theme.fg(titleColor, title);
-      lines.push(truncateWidgetLine(`  ${marker} ${taskLabel} ${styledTitle}`, width));
+      let modelPart = "";
+      if (status !== "pending") {
+        const modelName = task.model || "Unknown model";
+        modelPart = ` ${theme.fg("muted", `[${modelName}]`)}`;
+      }
+      lines.push(truncateWidgetLine(`  ${marker} ${taskLabel}${modelPart} ${styledTitle}`, width));
     }
     if (!isCompact && window.hiddenAfter > 0) {
       lines.push(
@@ -2410,6 +2847,7 @@ export function resolveReviewMode(
 
 interface SubagentResult {
   code: number;
+  model?: string;
 }
 
 interface TaskResult {
@@ -2491,6 +2929,8 @@ interface RunCcReviewWorkflowOptions {
   widgetLogLines?: number;
   checklistWindow?: number;
   validationCommands?: VerificationCommand[];
+  concurrency?: number;
+  concurrencyLimit?: number;
 }
 
 type SubagentToolExecutor = (
@@ -2658,7 +3098,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to bound repair/re-review rounds (default 1; 0 disables; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to bound repair/re-review rounds (default 1; 0 disables; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout. Use --concurrency <n> or --concurrency-limit <n> (or CC_REVIEW_CONCURRENCY; default 4) to cap dependency-safe parallel subagents.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -2686,6 +3126,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           taskTimeoutMs: parsedArgs.taskTimeoutMs,
           widgetLogLines: parsedArgs.widgetLogLines,
           checklistWindow: parsedArgs.checklistWindow,
+          concurrency: parsedArgs.concurrency,
         });
         ctx?.ui?.notify?.("CC Review completed.", "info");
         
@@ -2722,7 +3163,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: plan a goal, execute tasks sequentially, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to bound repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 1; 0 disables repair. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Explicit logSources override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default.",
+    description: "Run CC Review: plan a goal, execute tasks in dependency-safe after-all batches or per-task order, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to bound repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 1; 0 disables repair. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Explicit logSources override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default. Pass concurrency or concurrencyLimit as a positive integer, or omit to use CC_REVIEW_CONCURRENCY / the default 4.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
       const renderDetails = {
@@ -2745,6 +3186,8 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           taskTimeoutMs: params.taskTimeoutMs,
           widgetLogLines: params.widgetLogLines,
           checklistWindow: params.checklistWindow,
+          concurrency: params.concurrency,
+          concurrencyLimit: params.concurrencyLimit,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
@@ -2908,7 +3351,7 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-export function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; logSources?: string; reviewMode?: string; reviewRepairRounds?: number; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; error?: string } {
+export function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; logSources?: string; reviewMode?: string; reviewRepairRounds?: number; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; concurrency?: number; error?: string } {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
   const hasLogSourcesFlag = /(?:^|\s)--log-sources(?:=|\s|$)/.test(args);
@@ -2917,7 +3360,8 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
   const hasTaskTimeoutFlag = /(?:^|\s)--task-timeout(?:=|\s|$)/.test(args);
   const hasWidgetLogLinesFlag = /(?:^|\s)--widget-log-lines(?:=|\s|$)/.test(args);
   const hasChecklistWindowFlag = /(?:^|\s)--checklist-window(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag && !hasLogSourcesFlag && !hasReviewModeFlag && !hasReviewRepairRoundsFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag) {
+  const hasConcurrencyFlag = /(?:^|\s)--(?:concurrency|concurrency-limit)(?:=|\s|$)/.test(args);
+  if (!hasProviderFlag && !hasLogLevelFlag && !hasLogSourcesFlag && !hasReviewModeFlag && !hasReviewRepairRoundsFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag && !hasConcurrencyFlag) {
     return { goal: args.trim() };
   }
 
@@ -2931,6 +3375,7 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
   let taskTimeoutMs: number | undefined;
   let widgetLogLines: number | undefined;
   let checklistWindow: number | undefined;
+  let concurrency: number | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -3108,6 +3553,31 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
       continue;
     }
 
+    const equalsConcurrencyMatch = token.match(/^--(?:concurrency|concurrency-limit)=(.*)$/);
+    if (equalsConcurrencyMatch) {
+      const raw = equalsConcurrencyMatch[1];
+      const parsed = Number(raw);
+      if (raw === "" || !Number.isInteger(parsed) || parsed < 1) {
+        return { goal: "", error: `Invalid --concurrency value "${raw}". Expected a positive integer.` };
+      }
+      concurrency = parsed;
+      continue;
+    }
+
+    if (token === "--concurrency" || token === "--concurrency-limit") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a positive integer.` };
+      }
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        return { goal: "", error: `Invalid ${token} value "${value}". Expected a positive integer.` };
+      }
+      concurrency = parsed;
+      i++;
+      continue;
+    }
+
     goalTokens.push(token);
   }
 
@@ -3121,6 +3591,7 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
     taskTimeoutMs,
     widgetLogLines,
     checklistWindow,
+    concurrency,
   };
 }
 
@@ -3671,186 +4142,130 @@ async function runPiAgentSubprocess(
   }
   let finalAssistantText = "";
   let currentModel: string | undefined = agent.model;
-  let stderrBuf = "";
-  let wasAborted = false;
-  // Capture the abort reason so we can surface the true cause (timeout vs
-  // user abort) instead of masking it with residual stderr text. Without this,
-  // a harmless stderr warning line gets promoted to the failure reason whenever
-  // the subprocess is aborted by a timeout, hiding the real cause (see P0-2).
   let abortReason: string | undefined;
-  // Throttle timestamp for forwarding incremental text/thinking deltas (P0-3).
-  // The pi worker emits message_update / text_delta events as the model
-  // streams; without forwarding them the live log shows only discrete tool
-  // calls, never the model's in-progress reasoning.
   let lastTextDeltaForwardMs = 0;
   const TEXT_DELTA_THROTTLE_MS = 3000;
 
-  const exitCode: number = await new Promise<number>((resolve) => {
-    const proc = childProcess.spawn(invocation.command, invocation.args, {
-      cwd,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let event: any;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
 
-    let stdoutBuf = "";
-    const handleLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      let event: any;
-      try {
-        event = JSON.parse(trimmed);
-      } catch {
-        return;
-      }
-
-      // Extract and update current actual model from events
-      if (event?.type === "model_select" && event.model) {
-        if (typeof event.model === "string") {
-          currentModel = event.model;
-        } else if (typeof event.model === "object") {
-          const provider = event.model.provider;
-          const id = event.model.id;
-          if (provider && id) {
-            currentModel = `${provider}/${id}`;
-          } else if (id) {
-            currentModel = id;
-          }
-        }
-      } else if (event?.message?.model) {
-        const msgModel = event.message.model;
-        const msgProvider = event.message.provider;
-        if (msgProvider && typeof msgProvider === "string" && typeof msgModel === "string" && !msgModel.includes(msgProvider)) {
-          currentModel = `${msgProvider}/${msgModel}`;
-        } else if (typeof msgModel === "string") {
-          currentModel = msgModel;
-        }
-      } else if (typeof event?.model === "string") {
+    if (event?.type === "model_select" && event.model) {
+      if (typeof event.model === "string") {
         currentModel = event.model;
-      } else if (typeof event?.metadata?.model === "string") {
-        currentModel = event.metadata.model;
+      } else if (typeof event.model === "object") {
+        const provider = event.model.provider;
+        const id = event.model.id;
+        if (provider && id) {
+          currentModel = `${provider}/${id}`;
+        } else if (id) {
+          currentModel = id;
+        }
       }
-      // Surface live in-task progress. Without this, the subagent subprocess is
-      // silent for the whole (often multi-minute) execution and the user "sees
-      // no task progress" until the single final message_end. Forwarding each
-      // tool the subagent runs gives a real-time activity stream through the
-      // orchestrator's onUpdate -> [Subagent] live log path.
-      if (event?.type === "tool_execution_start" && onUpdate) {
-        const progress = summarizeSubagentToolActivity(event);
-        if (progress) {
+    } else if (event?.message?.model) {
+      const msgModel = event.message.model;
+      const msgProvider = event.message.provider;
+      if (msgProvider && typeof msgProvider === "string" && typeof msgModel === "string" && !msgModel.includes(msgProvider)) {
+        currentModel = `${msgProvider}/${msgModel}`;
+      } else if (typeof msgModel === "string") {
+        currentModel = msgModel;
+      }
+    } else if (typeof event?.model === "string") {
+      currentModel = event.model;
+    } else if (typeof event?.metadata?.model === "string") {
+      currentModel = event.metadata.model;
+    }
+    if (event?.type === "tool_execution_start" && onUpdate) {
+      const progress = summarizeSubagentToolActivity(event);
+      if (progress) {
+        try {
+          onUpdate({ content: [{ type: "text", text: progress }] });
+        } catch {
+          // ignore observer errors
+        }
+      }
+      return;
+    }
+    if (event?.type === "tool_execution_end" && event.isError && onUpdate) {
+      const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+      try {
+        onUpdate({ content: [{ type: "text", text: `⚠ ${toolName} failed` }] });
+      } catch {
+        // ignore observer errors
+      }
+      return;
+    }
+    if ((event?.type === "message_update" || event?.type === "text_delta") && onUpdate) {
+      const deltaText =
+        typeof event?.delta === "string" ? event.delta
+        : typeof event?.delta?.text === "string" ? event.delta.text
+        : typeof event?.text === "string" ? event.text
+        : "";
+      if (deltaText) {
+        const now = Date.now();
+        if (now - lastTextDeltaForwardMs >= TEXT_DELTA_THROTTLE_MS) {
+          lastTextDeltaForwardMs = now;
+          const preview = clipSubprocessLogText(deltaText, 100);
           try {
-            onUpdate({ content: [{ type: "text", text: progress }] });
+            onUpdate({ content: [{ type: "text", text: `… ${preview}` }] });
           } catch {
             // ignore observer errors
           }
         }
-        return;
       }
-      if (event?.type === "tool_execution_end" && event.isError && onUpdate) {
-        const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
-        try {
-          onUpdate({ content: [{ type: "text", text: `⚠ ${toolName} failed` }] });
-        } catch {
-          // ignore observer errors
-        }
-        return;
-      }
-      // Forward incremental text/thinking deltas (throttled) so the live log
-      // shows the model's in-progress reasoning, not just discrete tool calls
-      // (P0-3). pi --mode json emits these as message_update / text_delta
-      // events; previously handleLine ignored them entirely.
-      if ((event?.type === "message_update" || event?.type === "text_delta") && onUpdate) {
-        const deltaText =
-          typeof event?.delta === "string" ? event.delta
-          : typeof event?.delta?.text === "string" ? event.delta.text
-          : typeof event?.text === "string" ? event.text
-          : "";
-        if (deltaText) {
-          const now = Date.now();
-          if (now - lastTextDeltaForwardMs >= TEXT_DELTA_THROTTLE_MS) {
-            lastTextDeltaForwardMs = now;
-            const preview = clipSubprocessLogText(deltaText, 100);
+      return;
+    }
+    if (event?.type === "message_end" && event.message?.role === "assistant") {
+      const parts = Array.isArray(event.message.content) ? event.message.content : [];
+      for (const part of parts) {
+        if (part?.type === "text" && typeof part.text === "string" && part.text) {
+          finalAssistantText = part.text;
+          if (onUpdate) {
             try {
-              onUpdate({ content: [{ type: "text", text: `… ${preview}` }] });
+              onUpdate({ content: [{ type: "text", text: stripAnsi(part.text) }] });
             } catch {
               // ignore observer errors
             }
           }
         }
-        return;
       }
-      if (event?.type === "message_end" && event.message?.role === "assistant") {
-        const parts = Array.isArray(event.message.content) ? event.message.content : [];
-        for (const part of parts) {
-          if (part?.type === "text" && typeof part.text === "string" && part.text) {
-            finalAssistantText = part.text;
-            if (onUpdate) {
-              try {
-                onUpdate({ content: [{ type: "text", text: stripAnsi(part.text) }] });
-              } catch {
-                // ignore observer errors
-              }
-            }
-          }
-        }
-      }
-    };
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      stdoutBuf += chunk.toString("utf-8");
-      let nl: number;
-      while ((nl = stdoutBuf.indexOf("\n")) !== -1) {
-        const line = stdoutBuf.substring(0, nl);
-        stdoutBuf = stdoutBuf.substring(nl + 1);
-        handleLine(line);
-      }
-    });
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderrBuf += chunk.toString("utf-8");
-    });
-
-    const onAbort = () => {
-      wasAborted = true;
-      // Read the abort reason from the signal so the true cause (e.g. a
-      // timeout) is carried through to the error message instead of being
-      // replaced by stale stderr (see P0-2).
-      const reason = signal?.reason;
-      if (reason instanceof Error) {
-        abortReason = reason.message;
-      } else if (typeof reason === "string" && reason) {
-        abortReason = reason;
-      }
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      // SIGKILL fallback if the child refuses to exit
-      setTimeout(() => {
-        try {
-          if (proc.exitCode === null) proc.kill("SIGKILL");
-        } catch {
-          // ignore
-        }
-      }, 2000);
-    };
-    if (signal) {
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
     }
+  };
 
-    proc.on("error", (err: Error) => {
-      stderrBuf += `\n[spawn error] ${err.message}`;
-      resolve(1);
-    });
-    proc.on("close", (code) => {
-      if (stdoutBuf.trim()) handleLine(stdoutBuf);
-      stdoutBuf = "";
-      if (signal) signal.removeEventListener("abort", onAbort);
-      resolve(typeof code === "number" ? code : (wasAborted ? 130 : 1));
-    });
+  const onAbortReason = () => {
+    const reason = signal?.reason;
+    if (reason instanceof Error) {
+      abortReason = reason.message;
+    } else if (typeof reason === "string" && reason) {
+      abortReason = reason;
+    }
+  };
+  if (signal) {
+    if (signal.aborted) onAbortReason();
+    else signal.addEventListener("abort", onAbortReason, { once: true });
+  }
+
+  const r = await runSubprocess({
+    label: `subagent:${agent.name}`,
+    command: invocation.command,
+    args: invocation.args,
+    cwd,
+    signal,
+    abortMode: "internal",
+    onStdoutLine: handleLine,
   });
 
-  // Clean up temp prompt file
+  if (signal) signal.removeEventListener("abort", onAbortReason);
+
+  const stderrBuf = r.stderr;
+  const wasAborted = r.aborted;
+
   if (tmpDir) {
     try {
       await fs.promises.rm(tmpDir, { recursive: true, force: true });
@@ -3859,17 +4274,13 @@ async function runPiAgentSubprocess(
     }
   }
 
+  const exitCode: number = r.code ?? (wasAborted ? 130 : 1);
   const stderr = stderrBuf.trim();
   const isError = exitCode !== 0 || wasAborted;
-  // Surface the true abort cause instead of masking it with residual stderr.
-  // When the subprocess was aborted (timeout or user), prefer the captured
-  // abort reason over stderr. This ensures timeout errors contain "timeout"
-  // so isTransientError classifies them correctly and the retry path engages
-  // with the right reason (see P0-2).
   const abortMessage = wasAborted ? (abortReason || "Subagent aborted") : undefined;
   const exitMessage = `pi subprocess exited with code ${exitCode}`;
   const errorMessage = isError
-    ? (abortMessage || stderr || exitMessage)
+    ? (abortMessage || stderr || (r.spawnError?.message) || exitMessage)
     : undefined;
   const textOut = finalAssistantText.trim() || (isError ? (errorMessage || stderr || exitMessage) : "");
 
@@ -4253,6 +4664,13 @@ async function runCcReviewWorkflow(
     env: process.env,
   });
 
+  // Resolve the concurrency limit for parallel task execution
+  const concurrencyResolution = resolveCcReviewConcurrency({
+    flag: options.concurrency ?? options.concurrencyLimit,
+    env: process.env,
+  });
+  const resolvedConcurrency = concurrencyResolution.concurrency;
+
   // Trace workflow start
   emitTrace(ctx, "workflow_start", {
     goalLength: goal.length,
@@ -4264,6 +4682,7 @@ async function runCcReviewWorkflow(
     checklistWindow: resolvedChecklistWindow,
     taskTimeoutMs: resolvedTaskTimeoutMs,
     plannerTimeoutMs: resolvedPlannerTimeoutMs,
+    concurrency: resolvedConcurrency,
     reviewerTimeoutMs: resolvedReviewerTimeoutMs,
     maxReviewRepairRounds,
   });
@@ -4287,6 +4706,8 @@ async function runCcReviewWorkflow(
   let logSequence = 0;
 
   const workflowCwd: string = ctx?.cwd || process.cwd();
+  const workerAgent = discoverAgent("worker", "both", workflowCwd);
+  const resolvedWorkerModel = workerAgent?.model;
   let persistedLogState: PersistedLogState = {
     filePath: path.join(workflowCwd, WORKFLOW_LOG_FILE),
     appendedLineCount: 0,
@@ -4300,7 +4721,8 @@ async function runCcReviewWorkflow(
   const workflowRunId = generateWorkflowRunId();
   let verificationPlan: VerificationPlan | null = null;
   let findingsRollup = emptyFindingsRollup();
-  const taskStatuses: Array<TaskStatus | undefined> = [];
+  const taskStatuses: Array<TaskStatus | "running" | undefined> = [];
+  const taskModels: Array<string | undefined> = [];
   const collectedTaskFindings: ReviewFinding[][] = [];
   let rollupEmitted = false;
   let reviewedTaskCount = 0;
@@ -4436,14 +4858,67 @@ async function runCcReviewWorkflow(
     });
   };
 
+  const updateExecutionPhase = () => {
+    const runningIndices = taskStatuses
+      .map((status, idx) => (status === "running" ? idx : -1))
+      .filter((idx) => idx !== -1);
+
+    if (runningIndices.length > 1) {
+      displayState = "executing";
+      currentTaskIndex = runningIndices[0];
+      const taskNumbers = runningIndices.map(idx => idx + 1).join(", ");
+      currentPhase = `Executing Tasks ${taskNumbers} concurrently`;
+    } else if (runningIndices.length === 1) {
+      const index = runningIndices[0];
+      const task = getTaskOrThrow(index);
+      currentTaskIndex = index;
+      displayState = "executing";
+      currentPhase = `Executing Task ${index + 1}/${tasks.length}: ${task.title}`;
+    }
+  };
+
   const transitionToExecuting = (index: number) => {
     const task = getTaskOrThrow(index);
     currentTaskIndex = index;
-    displayState = "executing";
-    retryState = undefined;
-    currentPhase = `Executing Task ${index + 1}/${tasks.length}: ${task.title}`;
-    log(`Starting execution of Task: "${task.title}"`);
-    log(`Description: ${task.description}`);
+    if (resolvedWorkerModel) {
+      taskModels[index] = resolvedWorkerModel;
+    }
+
+    const runningIndices = taskStatuses
+      .map((status, idx) => (status === "running" ? idx : -1))
+      .filter((idx) => idx !== -1);
+
+    if (runningIndices.length > 1) {
+      displayState = "executing";
+      retryState = undefined;
+      currentTaskIndex = runningIndices[0];
+      const taskNumbers = runningIndices.map(idx => idx + 1).join(", ");
+      currentPhase = `Executing Tasks ${taskNumbers} concurrently`;
+    } else {
+      currentTaskIndex = index;
+      displayState = "executing";
+      retryState = undefined;
+      currentPhase = `Executing Task ${index + 1}/${tasks.length}: ${task.title}`;
+    }
+
+    log({
+      severity: "info",
+      source: "subagent",
+      message: `Starting execution of Task: "${task.title}"`,
+      details: {
+        taskIndex: index,
+        subagentRunId: `subagent-run-${workflowRunId}-${index}`,
+      }
+    });
+    log({
+      severity: "info",
+      source: "subagent",
+      message: `Description: ${task.description}`,
+      details: {
+        taskIndex: index,
+        subagentRunId: `subagent-run-${workflowRunId}-${index}`,
+      }
+    });
   };
 
   const transitionToReviewing = (index: number) => {
@@ -4463,7 +4938,12 @@ async function runCcReviewWorkflow(
     log(`Invoking ${reviewProviderConfig.label} once to review and fix the complete workflow.`);
   };
 
+  let preRetryDisplayState: CcReviewDisplayState | undefined;
+
   const noteRetry = (attempt: number, maxAttempts: number) => {
+    if (displayState !== "retrying") {
+      preRetryDisplayState = displayState;
+    }
     retryState = { attempt, maxAttempts };
     displayState = "retrying";
   };
@@ -4471,8 +4951,19 @@ async function runCcReviewWorkflow(
   const clearRetry = () => {
     retryState = undefined;
     if (displayState === "retrying") {
-      displayState = currentTaskIndex < 0 ? "planning" : "executing";
+      displayState = preRetryDisplayState ?? (currentTaskIndex < 0 ? "planning" : "executing");
+      preRetryDisplayState = undefined;
     }
+  };
+
+  const abortWorkflow = (reason?: string) => {
+    displayState = "cancelled";
+    currentPhase = reason ?? "cancelled";
+  };
+
+  const failWorkflow = (reason?: string) => {
+    displayState = "failed";
+    currentPhase = reason ?? "failed";
   };
 
   const noteReviewWarning = (warningMessage: string) => {
@@ -4499,7 +4990,11 @@ async function runCcReviewWorkflow(
 
   const buildWidgetState = (): CcReviewWidgetState => ({
     goal,
-    tasks: tasks.map((task, index) => ({ title: task.title, status: taskStatuses[index] })),
+    tasks: tasks.map((task, index) => ({
+      title: task.title,
+      status: taskStatuses[index],
+      model: taskModels[index],
+    })),
     currentTaskIndex,
     displayState,
     currentPhase,
@@ -4513,6 +5008,7 @@ async function runCcReviewWorkflow(
     persistedLogPath: persistedLogState.filePath,
     findingsRollup,
     taskStatuses,
+    taskModels,
   });
 
   const refreshWorkflowUi = () => {
@@ -4599,6 +5095,7 @@ async function runCcReviewWorkflow(
         }
         onUpdate({
           content: [{ type: "text", text: deltaLines.join("\n") }],
+          details: entry.details,
         });
       }
     }
@@ -4657,7 +5154,7 @@ async function runCcReviewWorkflow(
 
   // Clean up processes on abort
   const onAbort = () => {
-    displayState = "cancelled";
+    abortWorkflow();
     log({ severity: "warning", source: "cc-review", message: "Workflow aborted by user. Killing subprocesses..." });
     const pidsToKill: number[] = [];
     for (const proc of activeProcesses) {
@@ -4910,8 +5407,7 @@ async function runCcReviewWorkflow(
   try {
     const verificationPlanLoad = loadVerificationPlan(workflowCwd, options.validationCommands);
     if (verificationPlanLoad.error) {
-      displayState = "failed";
-      currentPhase = "failed";
+      failWorkflow();
       log({
         severity: "error",
         source: "cc-review",
@@ -4939,6 +5435,11 @@ async function runCcReviewWorkflow(
               title: { type: "string" },
               description: { type: "string" },
               acceptanceCriteria: { type: "string" },
+              dependsOn: {
+                type: "array",
+                items: { type: "integer", minimum: 1 },
+                description: "1-based task numbers that must finish before this task can start; use [] only when independent.",
+              },
             },
             required: ["title", "description", "acceptanceCriteria"],
             additionalProperties: false,
@@ -4953,7 +5454,7 @@ async function runCcReviewWorkflow(
     // PHASE 1: Task breakdowns via the selected provider
     transitionToPlanning();
 
-    const plannerPrompt = `Break down the following goal into a sequence of small, self-contained, and incremental implementation tasks: ${goal}. Ensure each task is tightly scoped, independent, and includes specific, verifiable acceptance criteria. Summarize any necessary parent workflow context for each task instead of copying the entire goal or parent context wholesale, so the subagent can execute the task with clear boundaries.`;
+    const plannerPrompt = `Break down the following goal into a sequence of small, self-contained, and incremental implementation tasks: ${goal}. Ensure each task is tightly scoped and includes specific, verifiable acceptance criteria. For every task, include dependsOn as 1-based task numbers that must finish before it can start; use [] only when the task is truly independent of earlier task output. Summarize any necessary parent workflow context for each task instead of copying the entire goal or parent context wholesale, so the subagent can execute the task with clear boundaries.`;
     const plannerProvider = reviewProviderConfig.provider;
     const plannerLabel = `${reviewProviderConfig.label.replace(/ reviewer$/i, "")} planner`;
 
@@ -5010,6 +5511,11 @@ async function runCcReviewWorkflow(
                   title: { type: "string" },
                   description: { type: "string" },
                   acceptanceCriteria: { type: "string" },
+                  dependsOn: {
+                    type: "array",
+                    items: { type: "integer", minimum: 1 },
+                    description: "1-based task numbers that must finish before this task can start; use [] only when independent.",
+                  },
                 },
                 required: ["title", "description", "acceptanceCriteria"],
               },
@@ -5170,9 +5676,470 @@ async function runCcReviewWorkflow(
     setPlannedTasks(tasks);
 
     // PHASE 2: Task Execution Loop
-    for (let i = 0; i < tasks.length; i++) {
-      throwIfAborted();
-      transitionToExecuting(i);
+    if (reviewMode === "after-all") {
+      const executionBatches = buildAfterAllExecutionBatches(tasks);
+      const parallelBatchCount = executionBatches.filter((batch) => batch.length > 1).length;
+      log(
+        `Running ${tasks.length} subagent tasks in ${executionBatches.length} dependency-aware batch${executionBatches.length === 1 ? "" : "es"} with concurrency limit of ${resolvedConcurrency}${parallelBatchCount > 0 ? ` (${parallelBatchCount} parallel-capable)` : ""}...`
+      );
+
+      const taskAbortControllers: AbortController[] = tasks.map(() => new AbortController());
+      const parentAbortHandler = () => {
+        for (const controller of taskAbortControllers) {
+          controller.abort();
+        }
+      };
+      if (signal) {
+        signal.addEventListener("abort", parentAbortHandler);
+      }
+
+      let executionError: any = null;
+
+      try {
+        for (let batchIndex = 0; batchIndex < executionBatches.length; batchIndex++) {
+          throwIfAborted();
+          const batch = executionBatches[batchIndex];
+          const batchPriorResults = taskResults.filter(
+            (result): result is TaskResult => result !== undefined
+          );
+          const taskNumbers = batch.map(({ index }) => index + 1).join(", ");
+          log({
+            severity: "info",
+            source: "cc-review",
+            message: `[Execution Batch ${batchIndex + 1}/${executionBatches.length}] Starting task${batch.length === 1 ? "" : "s"} ${taskNumbers}${batch.length > 1 && resolvedConcurrency > 1 ? " concurrently" : ""}.`,
+            details: {
+              batchIndex,
+              taskIndices: batch.map(({ index }) => index),
+              concurrency: resolvedConcurrency,
+            },
+          });
+
+          await runWithConcurrencyLimit(resolvedConcurrency, batch, async (batchItem) => {
+            const task = batchItem.task;
+            const i = batchItem.index;
+            throwIfAborted();
+
+          const subagentRunId = `subagent-run-${workflowRunId}-${i}`;
+          taskStatuses[i] = "running";
+          transitionToExecuting(i);
+          const taskStartedAt = new Date().toISOString();
+          let cachedSubagentResult: SubagentToolResult = {};
+          let structuredReport: SubagentStructuredReport | null = null;
+          let schemaParseStatus: SchemaParseStatus = "absent";
+
+          const summarizedParentContext = summarizeParentContext(goal);
+          const priorHandoff = priorTaskHandoffFromResults(batchPriorResults);
+          const subagentPrompt = buildSubagentTaskPrompt(task, summarizedParentContext, priorHandoff);
+          let subagentResult: SubagentResult = { code: 0 };
+          let subagentOutputText = "";
+          let validationError: string | undefined = undefined;
+          let unresolvedItems: string[] | undefined = undefined;
+          let taskStatus: TaskResult["status"] = "completed";
+          let retryFeedback: string | undefined = undefined;
+          const unresolvedItemsForFailedTask: string[] = [];
+
+          const maxTaskExecutionRetries = 2;
+          const maxTaskExecutionAttempts = maxTaskExecutionRetries + 1;
+
+          for (let attempt = 1; attempt <= maxTaskExecutionAttempts; attempt++) {
+            if (signal?.aborted || taskAbortControllers[i].signal.aborted) {
+              throw new Error("Workflow aborted by user");
+            }
+            if (attempt > 1) {
+              log({
+                severity: "info",
+                source: "subagent",
+                message: `[Task ${i + 1}] Retrying task execution in subagent (attempt ${attempt}/${maxTaskExecutionAttempts})...`,
+                details: { taskIndex: i, subagentRunId },
+              });
+            }
+
+            const attemptPrompt = retryFeedback
+              ? [
+                  subagentPrompt,
+                  "Previous attempt feedback:",
+                  retryFeedback,
+                  "Resolve the previous attempt's errors or unresolved items before reporting completion.",
+                ].join("\n\n")
+              : subagentPrompt;
+
+            emitTrace(ctx, "subagent_assignment", {
+              role: "executor",
+              agent: "worker",
+              taskIndex: i,
+              subagentRunId,
+              attempt,
+              model: resolvedWorkerModel,
+            });
+
+            emitTrace(ctx, "tool_execution_start", {
+              taskIndex: i,
+              subagentRunId,
+              toolName: "subagent",
+              source: "_subagent",
+              model: resolvedWorkerModel,
+            });
+
+            const executeSubagentTool = getSubagentExecutor(pi);
+            let result: SubagentToolResult = {};
+            const maxTransientRetries = 3;
+            let transientAttempt = 1;
+            let transientDone = false;
+
+            while (transientAttempt <= maxTransientRetries && !transientDone) {
+              if (signal?.aborted || taskAbortControllers[i].signal.aborted) {
+                throw new Error("Workflow aborted by user");
+              }
+
+              const attemptAbortController = new AbortController();
+              const onTaskAbort = () => {
+                attemptAbortController.abort();
+              };
+              taskAbortControllers[i].signal.addEventListener("abort", onTaskAbort);
+
+              const subagentTimeoutMs = resolvedTaskTimeoutMs;
+              const timeoutTimer = subagentTimeoutMs > 0
+                ? setTimeout(() => {
+                    log({
+                      severity: "warning",
+                      source: "subagent",
+                      message: `[Timeout] [Task ${i + 1}] Subagent task execution exceeded timeout of ${subagentTimeoutMs}ms. Aborting subagent...`,
+                      details: { taskIndex: i, subagentRunId },
+                    });
+                    attemptAbortController.abort(new Error(`Subagent execution timed out after ${subagentTimeoutMs}ms`));
+                  }, subagentTimeoutMs)
+                : undefined;
+
+              try {
+                result = await executeSubagentTool(
+                  "subagent",
+                  {
+                    agent: "worker",
+                    task: attemptPrompt,
+                    agentScope: "both",
+                    cwd: ctx?.cwd ?? process.cwd(),
+                  },
+                  attemptAbortController.signal,
+                  (partial) => {
+                    const subagentText = partial?.content?.find(
+                      (item: any) => item?.type === "text" && item.text
+                    )?.text;
+                    if (subagentText) {
+                      const formatted = formatSubprocessStreamLine(subagentText);
+                      if (formatted !== null) {
+                        log({
+                          severity: "info",
+                          source: "subagent",
+                          message: `[Subagent - Task ${i + 1}] ${formatted}`,
+                          details: {
+                            subagentRunId,
+                            taskIndex: i,
+                          }
+                        });
+                      }
+                    }
+                    if (onUpdate) {
+                      onUpdate({
+                        ...partial,
+                        details: {
+                          ...partial?.details,
+                          subagentRunId,
+                          taskIndex: i,
+                        }
+                      });
+                    }
+                  },
+                  ctx
+                );
+
+                const subagentFailure = result.details?.results?.[0];
+                const errorMsg = result.isError
+                  ? (subagentFailure?.errorMessage || subagentFailure?.stderr || extractSubagentText(result) || "Subagent execution error")
+                  : "";
+
+                if (result.isError && isTransientError(errorMsg)) {
+                  if (transientAttempt < maxTransientRetries) {
+                    const backoff = Math.pow(2, transientAttempt) * 1000;
+                    log({
+                      severity: "warning",
+                      source: "subagent",
+                      message: `[Transient Error] [Task ${i + 1}] Subagent tool call failed with transient error: "${errorMsg}". Retrying in ${backoff}ms... (Attempt ${transientAttempt}/${maxTransientRetries})`,
+                      details: { taskIndex: i, subagentRunId },
+                    });
+                    await delay(backoff, taskAbortControllers[i].signal);
+                    transientAttempt++;
+                    continue;
+                  }
+                }
+                transientDone = true;
+              } catch (err: any) {
+                if (signal?.aborted || taskAbortControllers[i].signal.aborted) {
+                  throw new Error("Workflow aborted by user");
+                }
+                const errorMessage = err?.message || String(err);
+                if (isTransientError(errorMessage) && transientAttempt < maxTransientRetries) {
+                  const backoff = Math.pow(2, transientAttempt) * 1000;
+                  log({
+                    severity: "warning",
+                    source: "subagent",
+                    message: `[Transient Error] [Task ${i + 1}] Subagent tool call threw transient exception: "${errorMessage}". Retrying in ${backoff}ms... (Attempt ${transientAttempt}/${maxTransientRetries})`,
+                    details: { taskIndex: i, subagentRunId },
+                  });
+                  await delay(backoff, taskAbortControllers[i].signal);
+                  transientAttempt++;
+                  continue;
+                }
+                emitTrace(ctx, "failure", {
+                  phase: "subagent_execution",
+                  taskIndex: i,
+                  subagentRunId,
+                  error: errorMessage,
+                });
+                result = {
+                  content: [{ type: "text", text: errorMessage }],
+                  details: { results: [{ exitCode: 1, errorMessage }] },
+                  isError: true,
+                };
+                transientDone = true;
+              } finally {
+                if (timeoutTimer) clearTimeout(timeoutTimer);
+                taskAbortControllers[i].signal.removeEventListener("abort", onTaskAbort);
+              }
+            }
+
+            const resultCode = getSubagentExitCode(result);
+            subagentResult = {
+              code: resultCode,
+              model: result.model || result.details?.results?.[0]?.model,
+            };
+            emitTrace(ctx, "tool_execution_end", {
+              taskIndex: i,
+              subagentRunId,
+              toolName: "subagent",
+              source: "_subagent",
+              exitCode: resultCode,
+              model: result.model || result.details?.results?.[0]?.model,
+            });
+
+            subagentOutputText = extractSubagentText(result);
+
+            // Validate subagent outputs
+            const validation = validateSubagentOutput(result, task);
+            structuredReport = validation.structuredReport ?? null;
+            schemaParseStatus = validation.schemaParseStatus ?? "absent";
+            cachedSubagentResult = result;
+            if (!validation.valid) {
+              validationError = validation.error || "Output validation failed";
+              appendUnique(unresolvedItemsForFailedTask, validation.unresolvedItems || [validationError]);
+              unresolvedItems = unresolvedItemsForFailedTask.length > 0 ? [...unresolvedItemsForFailedTask] : undefined;
+              taskStatus = "validation_failed";
+            } else {
+              validationError = undefined;
+              unresolvedItems = undefined;
+              taskStatus = resultCode === 0 ? "completed" : "completed_with_warnings";
+            }
+
+            if (resultCode === 0 && validation.valid) {
+              log({
+                severity: "info",
+                source: "subagent",
+                message: `[Subagent Execution Done] [Task ${i + 1}] Completed and validated.`,
+                details: { taskIndex: i, subagentRunId },
+              });
+              break;
+            } else {
+              const subagentFailure = result.details?.results?.[0];
+              const errorMsg =
+                validationError ||
+                subagentFailure?.errorMessage ||
+                subagentFailure?.stderr ||
+                `Subagent process exited with code ${resultCode}`;
+              if (attempt < maxTaskExecutionAttempts) {
+                retryFeedback = [
+                  `Exit code: ${resultCode}`,
+                  `Error: ${errorMsg}`,
+                  unresolvedItems?.length ? `Unresolved items:\n${unresolvedItems.map((item) => `- ${item}`).join("\n")}` : undefined,
+                  subagentOutputText ? `Output:\n${subagentOutputText}` : undefined,
+                ].filter(Boolean).join("\n\n");
+                emitTrace(ctx, "retry", {
+                  phase: "execution",
+                  taskIndex: i,
+                  subagentRunId,
+                  attempt,
+                  maxAttempts: maxTaskExecutionAttempts,
+                  error: errorMsg,
+                });
+              } else {
+                log({
+                  severity: "error",
+                  source: "subagent",
+                  message: `[Subagent Execution Failure] [Task ${i + 1}] ${errorMsg}`,
+                  details: { taskIndex: i, subagentRunId },
+                });
+                taskStatus = resultCode === 0 ? "validation_failed" : "failed";
+              }
+            }
+          }
+
+          // Early Termination Gate or record result
+          if (taskStatus === "failed" || taskStatus === "validation_failed") {
+            log({
+              severity: "warning",
+              source: "cc-review",
+              message: `[Workflow Halted] Halting workflow due to unrecoverable task failure on: "${task.title}".`,
+              details: { taskIndex: i, subagentRunId },
+            });
+            const completedAt = new Date().toISOString();
+            const artifactPath = writeTaskArtifactForIndex({
+              taskIndex: i,
+              task,
+              startedAt: taskStartedAt,
+              completedAt,
+              execution: {
+                exitCode: subagentResult.code,
+                status: taskStatus,
+                rawOutput: subagentOutputText,
+                structuredReport,
+                schemaParseStatus,
+                model: subagentResult.model,
+              },
+              review: {
+                provider: reviewProviderConfig.provider,
+                reviewerExitCode: -1,
+                stdout: "",
+                stderr: "",
+                combinedOutput: "",
+                reviewParseStatus: "absent",
+                reportedVerdict: null,
+                effectiveVerdict: null,
+                blockReason: null,
+                fallbackApplied: false,
+                result: null,
+              },
+              validation: {
+                valid: false,
+                error: validationError ?? "execution failed",
+                unresolvedItems: unresolvedItems ?? [],
+              },
+              postReviewValidation: {
+                required: false,
+                workspaceChanged: false,
+                passed: true,
+                error: null,
+                commands: [],
+              },
+              workflow: { haltedOnReview: false, haltedOnExecution: true },
+            });
+            taskStatuses[i] = taskStatus;
+            taskModels[i] = subagentResult.model || resolvedWorkerModel;
+            const res: TaskResult = {
+              title: task.title,
+              description: task.description,
+              executionCode: subagentResult.code,
+              reviewCode: -1,
+              output: subagentOutputText,
+              validationError,
+              unresolvedItems,
+              status: taskStatus,
+              artifactPath,
+              structuredReport: structuredReport ?? undefined,
+              schemaParseStatus,
+              model: subagentResult.model,
+            };
+            taskResults[i] = res; // Assign directly to correct index
+            updateExecutionPhase();
+            refreshWorkflowUi();
+
+            // Trigger abort on all other tasks
+            for (const controller of taskAbortControllers) {
+              controller.abort();
+            }
+            throw new Error(`Task execution failed unrecoverably on: "${task.title}" (${validationError || "exit code " + subagentResult.code})`);
+          }
+
+          const result: TaskResult = {
+            title: task.title,
+            description: task.description,
+            executionCode: subagentResult.code,
+            reviewCode: -1,
+            output: subagentOutputText,
+            validationError,
+            unresolvedItems,
+            status: "completed",
+            structuredReport: structuredReport ?? undefined,
+            schemaParseStatus,
+            model: subagentResult.model,
+          };
+          taskStatuses[i] = "completed";
+          taskModels[i] = subagentResult.model || resolvedWorkerModel;
+          taskResults[i] = result; // Assign directly to correct index
+          batchTaskExecutions[i] = {
+            taskIndex: i,
+            task,
+            startedAt: taskStartedAt,
+            subagentResult,
+            subagentOutputText,
+            cachedSubagentResult,
+            validationError,
+            unresolvedItems,
+            structuredReport,
+            schemaParseStatus,
+            result,
+          };
+          log({
+            severity: "info",
+            source: "subagent",
+            message: `[Task Execution Done] [Task ${i + 1}] Queued "${task.title}" for the final workflow review.`,
+            details: { taskIndex: i, subagentRunId },
+          });
+          updateExecutionPhase();
+          refreshWorkflowUi();
+          });
+        }
+      } catch (err: any) {
+        executionError = err;
+      } finally {
+        if (signal) {
+          signal.removeEventListener("abort", parentAbortHandler);
+        }
+      }
+
+      if (executionError) {
+        const isTimeout = /timeout/i.test(executionError.message || "");
+        const isCancelled =
+          signal?.aborted ||
+          executionError.message?.includes("aborted") ||
+          executionError.message?.includes("timeout") ||
+          executionError.message?.includes("cancel");
+
+        // Fill remaining/unexecuted slots to prevent crash in downstream report/UI code
+        for (let idx = 0; idx < tasks.length; idx++) {
+          if (!taskResults[idx]) {
+            const wasStarted = taskStatuses[idx] !== undefined;
+            if (wasStarted || !isCancelled) {
+              taskResults[idx] = {
+                title: tasks[idx].title,
+                description: tasks[idx].description,
+                executionCode: -1,
+                reviewCode: -1,
+                output: "",
+                status: isCancelled ? "cancelled" : "failed",
+                model: taskModels[idx] || resolvedWorkerModel,
+              };
+            }
+          }
+        }
+        throw executionError;
+      }
+
+      // Filter out any undefined/sparse values in batchTaskExecutions to keep it compact and correct for subsequent stages
+      const activeBatchTaskExecutions = batchTaskExecutions.filter(Boolean);
+      batchTaskExecutions.length = 0;
+      batchTaskExecutions.push(...activeBatchTaskExecutions);
+    } else {
+      for (let i = 0; i < tasks.length; i++) {
+        throwIfAborted();
+        transitionToExecuting(i);
       const task = tasks[i];
       const taskStartedAt = new Date().toISOString();
       let cachedSubagentResult: SubagentToolResult = {};
@@ -5247,12 +6214,14 @@ async function runCcReviewWorkflow(
           agent: "worker",
           taskIndex: i,
           attempt,
+          model: resolvedWorkerModel,
         });
 
         emitTrace(ctx, "tool_execution_start", {
           taskIndex: currentTaskIndex,
           toolName: "subagent",
           source: "_subagent",
+          model: resolvedWorkerModel,
         });
 
         const executeSubagentTool = getSubagentExecutor(pi);
@@ -5356,12 +6325,16 @@ async function runCcReviewWorkflow(
         }
 
         const resultCode = getSubagentExitCode(result);
-        subagentResult = { code: resultCode };
+        subagentResult = {
+          code: resultCode,
+          model: result.model || result.details?.results?.[0]?.model,
+        };
         emitTrace(ctx, "tool_execution_end", {
           taskIndex: currentTaskIndex,
           toolName: "subagent",
           source: "_subagent",
           exitCode: resultCode,
+          model: result.model || result.details?.results?.[0]?.model,
         });
 
         subagentOutputText = extractSubagentText(result);
@@ -5428,6 +6401,7 @@ async function runCcReviewWorkflow(
             rawOutput: subagentOutputText,
             structuredReport,
             schemaParseStatus,
+            model: subagentResult.model,
           },
           review: {
             provider: reviewProviderConfig.provider,
@@ -5457,6 +6431,7 @@ async function runCcReviewWorkflow(
           workflow: { haltedOnReview: false, haltedOnExecution: true },
         });
         taskStatuses[i] = taskStatus;
+        taskModels[i] = subagentResult.model || resolvedWorkerModel;
         recordTaskResult({
           title: task.title,
           description: task.description,
@@ -5469,42 +6444,9 @@ async function runCcReviewWorkflow(
           artifactPath,
           structuredReport: structuredReport ?? undefined,
           schemaParseStatus,
-          model: cachedSubagentResult.model,
+          model: subagentResult.model,
         });
         throw new Error(`Task execution failed unrecoverably on: "${task.title}" (${validationError || "exit code " + subagentResult.code})`);
-      }
-
-      if (reviewMode === "after-all") {
-        const result: TaskResult = {
-          title: task.title,
-          description: task.description,
-          executionCode: subagentResult.code,
-          reviewCode: -1,
-          output: subagentOutputText,
-          validationError,
-          unresolvedItems,
-          status: "completed",
-          structuredReport: structuredReport ?? undefined,
-          schemaParseStatus,
-          model: cachedSubagentResult.model,
-        };
-        taskStatuses[i] = "completed";
-        recordTaskResult(result);
-        batchTaskExecutions.push({
-          taskIndex: i,
-          task,
-          startedAt: taskStartedAt,
-          subagentResult,
-          subagentOutputText,
-          cachedSubagentResult,
-          validationError,
-          unresolvedItems,
-          structuredReport,
-          schemaParseStatus,
-          result,
-        });
-        log(`[Task Execution Done] Queued "${task.title}" for the final workflow review.`);
-        break REPAIR_LOOP;
       }
 
       // Part B: Review and Fix with the configured review provider
@@ -5583,6 +6525,7 @@ async function runCcReviewWorkflow(
           rawOutput: subagentOutputText,
           structuredReport,
           schemaParseStatus,
+          model: subagentResult.model,
         },
         review: {
           provider: reviewProviderConfig.provider,
@@ -5632,6 +6575,7 @@ async function runCcReviewWorkflow(
       findingsRollup = updateFindingsRollup(findingsRollup, effectiveVerdict, findings);
       reviewedTaskCount += 1;
       taskStatuses[i] = taskStatus;
+      taskModels[i] = subagentResult.model || resolvedWorkerModel;
       refreshWorkflowUi();
 
       recordTaskResult({
@@ -5652,7 +6596,7 @@ async function runCcReviewWorkflow(
         effectiveVerdict,
         blockReason: derived.blockReason,
         reviewerExitDiagnostic,
-        model: cachedSubagentResult.model,
+        model: subagentResult.model,
       });
 
       if (effectiveVerdict === "block") {
@@ -5683,6 +6627,7 @@ async function runCcReviewWorkflow(
       }
       break REPAIR_LOOP; // not block → task passed review, move to next task
       } // end REPAIR_LOOP
+    }
     }
 
     if (reviewMode === "after-all") {
@@ -5876,6 +6821,7 @@ async function runCcReviewWorkflow(
             rawOutput: execution.subagentOutputText,
             structuredReport: execution.structuredReport,
             schemaParseStatus: execution.schemaParseStatus,
+            model: execution.subagentResult.model,
           },
           review: {
             provider: reviewProviderConfig.provider,
@@ -5909,6 +6855,7 @@ async function runCcReviewWorkflow(
         });
         lastArtifactPath = artifactPath;
         taskStatuses[execution.taskIndex] = batchStatus;
+        taskModels[execution.taskIndex] = execution.subagentResult.model || resolvedWorkerModel;
         Object.assign(execution.result, {
           reviewCode: reviewProcessResult.exitCode,
           reviewWarningName: reviewProviderConfig.warningName,
@@ -6041,8 +6988,7 @@ async function runCcReviewWorkflow(
     }
 
     if (err instanceof WorkflowError) {
-      displayState = "failed";
-      currentPhase = "failed";
+      failWorkflow();
       err.meta ??= buildCcReviewSummaryMeta(taskResults);
       refreshWorkflowUi();
       throw err;
@@ -6050,10 +6996,13 @@ async function runCcReviewWorkflow(
 
     // Mark the currently executing/reviewing task as cancelled if it was interrupted
     if (isCancelled) {
-      displayState = isTimeout ? "timeout" : "cancelled";
+      if (isTimeout) {
+        displayState = "timeout";
+      } else {
+        abortWorkflow();
+      }
     } else {
-      displayState = "failed";
-      currentPhase = "failed";
+      failWorkflow();
     }
     if (isCancelled && currentTaskIndex >= 0 && currentTaskIndex < tasks.length) {
       if (taskResults.length === currentTaskIndex) {

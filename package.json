@@ -1,0 +1,12 @@
+{
+  "name": "pi-cc-review",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.17",
+    "typescript": "5.9.3"
+  }
+}

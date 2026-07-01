@@ -107,6 +107,7 @@ export interface TaskArtifact {
     rawOutput: string;
     structuredReport: SubagentStructuredReport | null;
     schemaParseStatus: SchemaParseStatus;
+    model?: string;
   };
   review: {
     provider: string;
