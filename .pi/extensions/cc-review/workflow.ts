@@ -521,7 +521,16 @@ const claudeSummarizer: StreamSummarizer = {
     const obj = payload as Record<string, unknown>;
     if (typeof obj.type !== "string") return null;
 
-    if (obj.type === "system" || obj.type === "user" || obj.type === "stream_event") {
+    if (obj.type === "system" || obj.type === "user") {
+      return { kind: "terminal", summary: null };
+    }
+    if (obj.type === "stream_event") {
+      const event = obj.event && typeof obj.event === "object" ? obj.event as Record<string, unknown> : undefined;
+      const delta = event?.delta && typeof event.delta === "object" ? event.delta as Record<string, unknown> : undefined;
+      if (event?.type === "content_block_delta" && delta?.type === "text_delta") {
+        const text = structuredTextPreview(delta.text, 100);
+        return { kind: "terminal", summary: text || null };
+      }
       return { kind: "terminal", summary: null };
     }
     if (obj.type === "assistant") {
@@ -761,6 +770,15 @@ export function extractAssistantTextFromStream(stdout: string): string {
         if (part?.type === "text" && typeof part.text === "string") {
           finalText += part.text;
         }
+      }
+    }
+    // Claude stream-json with --include-partial-messages: text deltas arrive as
+    // stream_event payloads before the terminal assistant/result event.
+    if (event?.type === "stream_event" && event?.event?.type === "content_block_delta") {
+      const delta = event.event.delta;
+      if (delta?.type === "text_delta" && typeof delta.text === "string") {
+        hasStreamEvents = true;
+        finalText += delta.text;
       }
     }
     // Claude stream-json: final result event overrides accumulated text.
@@ -4496,6 +4514,7 @@ async function runCcReviewWorkflow(
         "--dangerously-skip-permissions",
         "--no-session-persistence",
         "--output-format", "stream-json",
+        "--include-partial-messages",
         "--verbose",
       ];
       const claudeModel = readTrimmedEnv(process.env, "CLAUDE_MODEL");
