@@ -1475,9 +1475,14 @@ export function truncateWidgetLine(text: string, maxWidth: number = WIDGET_MAX_W
   return truncatePlainByColumn(stripAnsi(text), width);
 }
 
+export interface TaskModelState {
+  configured?: string;
+  effective?: string;
+}
+
 export interface CcReviewWidgetState {
   goal: string;
-  tasks: readonly { title: string; status?: TaskStatus | "running"; model?: string }[];
+  tasks: readonly { title: string; status?: TaskStatus | "running"; model?: string; modelState?: TaskModelState }[];
   currentTaskIndex: number;
   displayState: CcReviewDisplayState;
   currentPhase: string;
@@ -1491,7 +1496,7 @@ export interface CcReviewWidgetState {
   persistedLogPath: string;
   findingsRollup: CcReviewFindingsRollup;
   taskStatuses?: readonly (TaskStatus | "running" | undefined)[];
-  taskModels?: readonly (string | undefined)[];
+  taskModels?: readonly TaskModelState[];
 }
 
 export interface TaskVisuals {
@@ -1696,8 +1701,12 @@ export function buildCcReviewWidgetLines(
       const styledTitle = theme.fg(titleColor, title);
       let modelPart = "";
       if (status !== "pending") {
-        const modelName = task.model || "Unknown model";
-        modelPart = ` ${theme.fg("muted", `[${modelName}]`)}`;
+        const modelName = task.model;
+        if (modelName) {
+          modelPart = ` ${theme.fg("muted", `[${modelName}]`)}`;
+        } else if (shouldShowUnknownTaskModel(status, task.modelState)) {
+          modelPart = ` ${theme.fg("muted", `[Unknown model]`)}`;
+        }
       }
       lines.push(truncateWidgetLine(`  ${marker} ${taskLabel}${modelPart} ${styledTitle}`, width));
     }
@@ -1968,7 +1977,8 @@ export * from "./providers.ts";
 
 interface SubagentResult {
   code: number;
-  model?: string;
+  configuredModel?: string;
+  effectiveModel?: string;
 }
 
 interface TaskResult {
@@ -1989,7 +1999,8 @@ interface TaskResult {
   blockReason?: BlockReason;
   reviewerExitDiagnostic?: string;
   status?: TaskStatus;
-  model?: string;
+  configuredModel?: string;
+  effectiveModel?: string;
 }
 
 interface BatchTaskExecution {
@@ -3085,17 +3096,31 @@ function loadAgentFromDir(dir: string, agentName: string, source: "user" | "proj
   };
 }
 
+function formatConfiguredModel(provider: unknown, model: unknown): string | undefined {
+  if (typeof model !== "string") return undefined;
+  const trimmedModel = model.trim();
+  if (!trimmedModel) return undefined;
+  if (trimmedModel.includes("/")) return trimmedModel;
+  if (typeof provider !== "string") return trimmedModel;
+  const trimmedProvider = provider.trim();
+  return trimmedProvider ? `${trimmedProvider}/${trimmedModel}` : trimmedModel;
+}
+
 function applyAgentModelOverride(agent: DiscoveredAgent): DiscoveredAgent {
   const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
   if (!fs.existsSync(settingsPath)) return agent;
   try {
     const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
     const override = settings?.subagents?.agentOverrides?.[agent.name];
-    if (override?.model || override?.thinking) {
+    const overrideModel = formatConfiguredModel(settings?.defaultProvider, override?.model);
+    const defaultModel = formatConfiguredModel(settings?.defaultProvider, settings?.defaultModel);
+    const thinking = override?.thinking || agent.thinking || settings?.defaultThinkingLevel;
+    const model = overrideModel || agent.model || defaultModel;
+    if (model || thinking) {
       return {
         ...agent,
-        model: override.model || agent.model,
-        thinking: override.thinking || agent.thinking,
+        model,
+        thinking,
       };
     }
   } catch {
@@ -3306,7 +3331,11 @@ async function runPiAgentSubprocess(
       const progress = summarizeSubagentToolActivity(event);
       if (progress) {
         try {
-          onUpdate({ content: [{ type: "text", text: progress }] });
+          onUpdate({
+            content: [{ type: "text", text: progress }],
+            details: { results: [{ agent: agent.name, model: currentModel }] },
+            model: currentModel,
+          });
         } catch {
           // ignore observer errors
         }
@@ -3316,7 +3345,11 @@ async function runPiAgentSubprocess(
     if (event?.type === "tool_execution_end" && event.isError && onUpdate) {
       const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
       try {
-        onUpdate({ content: [{ type: "text", text: `⚠ ${toolName} failed` }] });
+        onUpdate({
+          content: [{ type: "text", text: `⚠ ${toolName} failed` }],
+          details: { results: [{ agent: agent.name, model: currentModel }] },
+          model: currentModel,
+        });
       } catch {
         // ignore observer errors
       }
@@ -3334,7 +3367,11 @@ async function runPiAgentSubprocess(
           lastTextDeltaForwardMs = now;
           const preview = clipSubprocessLogText(deltaText, 100);
           try {
-            onUpdate({ content: [{ type: "text", text: `… ${preview}` }] });
+            onUpdate({
+              content: [{ type: "text", text: `… ${preview}` }],
+              details: { results: [{ agent: agent.name, model: currentModel }] },
+              model: currentModel,
+            });
           } catch {
             // ignore observer errors
           }
@@ -3349,7 +3386,11 @@ async function runPiAgentSubprocess(
           finalAssistantText = part.text;
           if (onUpdate) {
             try {
-              onUpdate({ content: [{ type: "text", text: stripAnsi(part.text) }] });
+              onUpdate({
+                content: [{ type: "text", text: stripAnsi(part.text) }],
+                details: { results: [{ agent: agent.name, model: currentModel }] },
+                model: currentModel,
+              });
             } catch {
               // ignore observer errors
             }
@@ -3593,6 +3634,41 @@ function appendPersistedLogPathToSummary(summary: string, persistedLogPath: stri
   return `${trimmed}\n\n### 📄 Persisted Workflow Log\n\nFull human-readable JSONL log available at: \`${persistedLogPath}\`\n`;
 }
 
+function resolveDisplayedTaskModel(modelState: TaskModelState | undefined): string | undefined {
+  return modelState?.effective || modelState?.configured;
+}
+
+function shouldShowUnknownTaskModel(status: TaskStatus | "running" | "pending", modelState: TaskModelState | undefined): boolean {
+  if (resolveDisplayedTaskModel(modelState)) return false;
+  return status !== "pending" && status !== "running";
+}
+
+function formatTaskModelState(configuredModel: string | undefined, effectiveModel: string | undefined): TaskModelState | undefined {
+  if (!configuredModel && !effectiveModel) return undefined;
+  return {
+    configured: configuredModel || undefined,
+    effective: effectiveModel || undefined,
+  };
+}
+
+function setTaskConfiguredModel(taskModels: TaskModelState[], index: number, configuredModel: string | undefined): void {
+  if (!configuredModel) return;
+  const current = taskModels[index];
+  taskModels[index] = {
+    configured: current?.configured || configuredModel,
+    effective: current?.effective,
+  };
+}
+
+function setTaskEffectiveModel(taskModels: TaskModelState[], index: number, effectiveModel: string | undefined): void {
+  if (!effectiveModel) return;
+  const current = taskModels[index];
+  taskModels[index] = {
+    configured: current?.configured,
+    effective: effectiveModel,
+  };
+}
+
 function formatTaskStatusText(taskResult: TaskResult): string {
   if (taskResult.status === "skipped") return "Skipped (not executed)";
   if (taskResult.status === "cancelled") return "Cancelled / Timed out (interrupted)";
@@ -3678,8 +3754,9 @@ function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task
     if (taskResult.artifactPath) {
       summaryMarkdown += `   - *Artifact:* \`${taskResult.artifactPath}\`\n`;
     }
-    if (taskResult.model) {
-      summaryMarkdown += `   - *Model:* \`${taskResult.model}\`\n`;
+    const displayedModel = resolveDisplayedTaskModel(formatTaskModelState(taskResult.configuredModel, taskResult.effectiveModel));
+    if (displayedModel) {
+      summaryMarkdown += `   - *Model:* \`${displayedModel}\`\n`;
     }
     if (taskResult.effectiveVerdict && taskResult.reviewResult?.summary) {
       summaryMarkdown += `   - *Review Summary:* ${taskResult.reviewResult.summary}\n`;
@@ -3843,7 +3920,7 @@ async function runCcReviewWorkflow(
   let verificationPlan: VerificationPlan | null = null;
   let findingsRollup = emptyFindingsRollup();
   const taskStatuses: Array<TaskStatus | "running" | undefined> = [];
-  const taskModels: Array<string | undefined> = [];
+  const taskModels: TaskModelState[] = [];
   const collectedTaskFindings: ReviewFinding[][] = [];
   let rollupEmitted = false;
   let reviewedTaskCount = 0;
@@ -3965,6 +4042,9 @@ async function runCcReviewWorkflow(
     tasks = plannedTasks;
     currentTaskIndex = -1;
     retryState = undefined;
+    for (let index = 0; index < plannedTasks.length; index++) {
+      setTaskConfiguredModel(taskModels, index, resolvedWorkerModel);
+    }
     log({
       severity: "info",
       source: "planner",
@@ -4001,9 +4081,7 @@ async function runCcReviewWorkflow(
   const transitionToExecuting = (index: number) => {
     const task = getTaskOrThrow(index);
     currentTaskIndex = index;
-    if (resolvedWorkerModel) {
-      taskModels[index] = resolvedWorkerModel;
-    }
+    setTaskConfiguredModel(taskModels, index, resolvedWorkerModel);
 
     const runningIndices = taskStatuses
       .map((status, idx) => (status === "running" ? idx : -1))
@@ -4103,6 +4181,14 @@ async function runCcReviewWorkflow(
     taskResults.push(result);
   };
 
+  const buildTaskResultModelState = (index: number, fallback?: { configuredModel?: string; effectiveModel?: string }) => {
+    const taskModelState = taskModels[index];
+    return {
+      configuredModel: taskModelState?.configured || fallback?.configuredModel,
+      effectiveModel: taskModelState?.effective || fallback?.effectiveModel,
+    };
+  };
+
   const throwIfAborted = () => {
     if (signal?.aborted) {
       throw new Error("Workflow aborted by user");
@@ -4111,11 +4197,15 @@ async function runCcReviewWorkflow(
 
   const buildWidgetState = (): CcReviewWidgetState => ({
     goal,
-    tasks: tasks.map((task, index) => ({
-      title: task.title,
-      status: taskStatuses[index],
-      model: taskModels[index],
-    })),
+    tasks: tasks.map((task, index) => {
+      const modelState = taskModels[index];
+      return {
+        title: task.title,
+        status: taskStatuses[index],
+        model: resolveDisplayedTaskModel(modelState),
+        modelState,
+      };
+    }),
     currentTaskIndex,
     displayState,
     currentPhase,
@@ -4861,11 +4951,22 @@ async function runCcReviewWorkflow(
                         });
                       }
                     }
+                    const partialModel = partial?.model || partial?.details?.results?.[0]?.model;
+                    if (partialModel) {
+                      setTaskEffectiveModel(taskModels, i, partialModel);
+                      refreshWorkflowUi();
+                    }
                     if (onUpdate) {
                       onUpdate({
                         ...partial,
+                        model: partialModel || partial?.model,
                         details: {
                           ...partial?.details,
+                          results: Array.isArray(partial?.details?.results)
+                            ? partial.details.results
+                            : partialModel
+                              ? [{ model: partialModel }]
+                              : partial?.details?.results,
                           subagentRunId,
                           taskIndex: i,
                         }
@@ -4931,17 +5032,22 @@ async function runCcReviewWorkflow(
             }
 
             const resultCode = getSubagentExitCode(result);
+            const effectiveModel = result.model || result.details?.results?.[0]?.model;
             subagentResult = {
               code: resultCode,
-              model: result.model || result.details?.results?.[0]?.model,
+              configuredModel: taskModels[i]?.configured || resolvedWorkerModel,
+              effectiveModel,
             };
+            if (effectiveModel) {
+              setTaskEffectiveModel(taskModels, i, effectiveModel);
+            }
             emitTrace(ctx, "tool_execution_end", {
               taskIndex: i,
               subagentRunId,
               toolName: "subagent",
               source: "_subagent",
               exitCode: resultCode,
-              model: result.model || result.details?.results?.[0]?.model,
+              model: effectiveModel,
             });
 
             subagentOutputText = extractSubagentText(result);
@@ -5024,7 +5130,7 @@ async function runCcReviewWorkflow(
                 rawOutput: subagentOutputText,
                 structuredReport,
                 schemaParseStatus,
-                model: subagentResult.model,
+                model: subagentResult.effectiveModel,
               },
               review: {
                 provider: reviewProviderConfig.provider,
@@ -5054,7 +5160,6 @@ async function runCcReviewWorkflow(
               workflow: { haltedOnReview: false, haltedOnExecution: true },
             });
             taskStatuses[i] = taskStatus;
-            taskModels[i] = subagentResult.model || resolvedWorkerModel;
             const res: TaskResult = {
               title: task.title,
               description: task.description,
@@ -5067,7 +5172,7 @@ async function runCcReviewWorkflow(
               artifactPath,
               structuredReport: structuredReport ?? undefined,
               schemaParseStatus,
-              model: subagentResult.model,
+              ...buildTaskResultModelState(i, subagentResult),
             };
             taskResults[i] = res; // Assign directly to correct index
             updateExecutionPhase();
@@ -5091,10 +5196,9 @@ async function runCcReviewWorkflow(
             status: "completed",
             structuredReport: structuredReport ?? undefined,
             schemaParseStatus,
-            model: subagentResult.model,
+            ...buildTaskResultModelState(i, subagentResult),
           };
           taskStatuses[i] = "completed";
-          taskModels[i] = subagentResult.model || resolvedWorkerModel;
           taskResults[i] = result; // Assign directly to correct index
           batchTaskExecutions[i] = {
             taskIndex: i,
@@ -5147,7 +5251,7 @@ async function runCcReviewWorkflow(
                 reviewCode: -1,
                 output: "",
                 status: isCancelled ? "cancelled" : "failed",
-                model: taskModels[idx] || resolvedWorkerModel,
+                ...buildTaskResultModelState(idx, { configuredModel: resolvedWorkerModel }),
               };
             }
           }
@@ -5348,16 +5452,21 @@ async function runCcReviewWorkflow(
         }
 
         const resultCode = getSubagentExitCode(result);
+        const effectiveModel = result.model || result.details?.results?.[0]?.model;
         subagentResult = {
           code: resultCode,
-          model: result.model || result.details?.results?.[0]?.model,
+          configuredModel: taskModels[i]?.configured || resolvedWorkerModel,
+          effectiveModel,
         };
+        if (effectiveModel) {
+          setTaskEffectiveModel(taskModels, i, effectiveModel);
+        }
         emitTrace(ctx, "tool_execution_end", {
           taskIndex: currentTaskIndex,
           toolName: "subagent",
           source: "_subagent",
           exitCode: resultCode,
-          model: result.model || result.details?.results?.[0]?.model,
+          model: effectiveModel,
         });
 
         subagentOutputText = extractSubagentText(result);
@@ -5424,7 +5533,7 @@ async function runCcReviewWorkflow(
             rawOutput: subagentOutputText,
             structuredReport,
             schemaParseStatus,
-            model: subagentResult.model,
+            model: subagentResult.effectiveModel,
           },
           review: {
             provider: reviewProviderConfig.provider,
@@ -5454,7 +5563,6 @@ async function runCcReviewWorkflow(
           workflow: { haltedOnReview: false, haltedOnExecution: true },
         });
         taskStatuses[i] = taskStatus;
-        taskModels[i] = subagentResult.model || resolvedWorkerModel;
         recordTaskResult({
           title: task.title,
           description: task.description,
@@ -5467,7 +5575,7 @@ async function runCcReviewWorkflow(
           artifactPath,
           structuredReport: structuredReport ?? undefined,
           schemaParseStatus,
-          model: subagentResult.model,
+          ...buildTaskResultModelState(i, subagentResult),
         });
         throw new Error(`Task execution failed unrecoverably on: "${task.title}" (${validationError || "exit code " + subagentResult.code})`);
       }
@@ -5548,7 +5656,7 @@ async function runCcReviewWorkflow(
           rawOutput: subagentOutputText,
           structuredReport,
           schemaParseStatus,
-          model: subagentResult.model,
+          model: subagentResult.effectiveModel,
         },
         review: {
           provider: reviewProviderConfig.provider,
@@ -5598,7 +5706,6 @@ async function runCcReviewWorkflow(
       findingsRollup = updateFindingsRollup(findingsRollup, effectiveVerdict, findings);
       reviewedTaskCount += 1;
       taskStatuses[i] = taskStatus;
-      taskModels[i] = subagentResult.model || resolvedWorkerModel;
       refreshWorkflowUi();
 
       recordTaskResult({
@@ -5619,7 +5726,7 @@ async function runCcReviewWorkflow(
         effectiveVerdict,
         blockReason: derived.blockReason,
         reviewerExitDiagnostic,
-        model: subagentResult.model,
+        ...buildTaskResultModelState(i, subagentResult),
       });
 
       if (effectiveVerdict === "block") {
@@ -5844,7 +5951,7 @@ async function runCcReviewWorkflow(
             rawOutput: execution.subagentOutputText,
             structuredReport: execution.structuredReport,
             schemaParseStatus: execution.schemaParseStatus,
-            model: execution.subagentResult.model,
+            model: execution.subagentResult.effectiveModel,
           },
           review: {
             provider: reviewProviderConfig.provider,
@@ -5878,7 +5985,6 @@ async function runCcReviewWorkflow(
         });
         lastArtifactPath = artifactPath;
         taskStatuses[execution.taskIndex] = batchStatus;
-        taskModels[execution.taskIndex] = execution.subagentResult.model || resolvedWorkerModel;
         Object.assign(execution.result, {
           reviewCode: reviewProcessResult.exitCode,
           reviewWarningName: reviewProviderConfig.warningName,

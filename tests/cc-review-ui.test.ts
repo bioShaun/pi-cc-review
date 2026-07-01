@@ -614,15 +614,26 @@ describe("CC Review UI Regression Tests", () => {
 
   // 6c. Subagent Model Display in TUI Widget Checklist
   describe("Subagent Model Display in TUI Widget Checklist", () => {
-    it("renders model name when present and fallback to 'Unknown model' when absent for non-pending tasks", () => {
+    it("renders effective model first, falls back to configured model while running, and only shows Unknown after completion with no model", () => {
       const state = createBaseState({
         tasks: [
-          { title: "Task with explicit model", status: "completed", model: "anthropic/claude-3-5" },
-          { title: "Task with missing model", status: "completed" },
+          {
+            title: "Task with effective model",
+            status: "completed",
+            model: "anthropic/claude-3-5",
+            modelState: { configured: "google/gemini-3.5-flash", effective: "anthropic/claude-3-5" },
+          },
+          {
+            title: "Running task with configured-only model",
+            status: "running",
+            model: "google/gemini-3.5-flash",
+            modelState: { configured: "google/gemini-3.5-flash" },
+          },
+          { title: "Completed task with missing model", status: "completed" },
           { title: "Task in pending status", status: "pending" },
         ],
-        taskStatuses: ["completed", "completed", undefined],
-        currentTaskIndex: 2,
+        taskStatuses: ["completed", "running", "completed", undefined],
+        currentTaskIndex: 3,
       });
 
       const themeMock = {
@@ -635,14 +646,12 @@ describe("CC Review UI Regression Tests", () => {
       });
 
       const taskLines = lines.filter((line) => line.includes("[Task "));
-      assert.equal(taskLines.length, 3);
+      assert.equal(taskLines.length, 4);
 
-      // Task 1: Completed with model -> displays the model name
       assert.match(taskLines[0], /\[muted\]\[anthropic\/claude-3-5\]\[\/muted\]/);
-      // Task 2: Completed with missing model -> displays 'Unknown model' fallback
-      assert.match(taskLines[1], /\[muted\]\[Unknown model\]\[\/muted\]/);
-      // Task 3: Pending task -> does not show model display at all
-      assert.doesNotMatch(taskLines[2], /Unknown model/);
+      assert.match(taskLines[1], /\[muted\]\[google\/gemini-3\.5-flash\]\[\/muted\]/);
+      assert.match(taskLines[2], /\[muted\]\[Unknown model\]\[\/muted\]/);
+      assert.doesNotMatch(taskLines[3], /Unknown model/);
     });
   });
 
