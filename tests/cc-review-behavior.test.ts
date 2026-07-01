@@ -3510,6 +3510,9 @@ describe("CC Review Behavioral Regression Tests", () => {
       const settingsDir = path.join(tempHome, ".pi", "agent");
       fs.mkdirSync(settingsDir, { recursive: true });
       fs.writeFileSync(path.join(settingsDir, "settings.json"), JSON.stringify({
+        defaultProvider: "google",
+        defaultModel: "gemini-3.5-flash",
+        defaultThinkingLevel: "medium",
         subagents: {
           agentOverrides: {
             worker: {
@@ -3549,6 +3552,33 @@ describe("CC Review Behavioral Regression Tests", () => {
       assert.equal(legacy?.systemPrompt.trim(), "Legacy generator prompt.");
       assert.equal(legacy?.model, "volcengine-coding/glm-5.2");
       assert.equal(legacy?.thinking, "high");
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
+
+  it("falls back to the default pi model when the worker override is absent", () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-default-model-home-"));
+    const originalHome = process.env.HOME;
+    process.env.HOME = tempHome;
+    try {
+      const isolatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-default-model-cwd-"));
+      const settingsDir = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(settingsDir, { recursive: true });
+      fs.writeFileSync(path.join(settingsDir, "settings.json"), JSON.stringify({
+        defaultProvider: "google",
+        defaultModel: "gemini-3.5-flash",
+        defaultThinkingLevel: "high",
+        subagents: {
+          agentOverrides: {},
+        },
+      }));
+
+      const agent = discoverAgent("worker", "both", isolatedCwd);
+      assert.ok(agent, "worker should still be discoverable via the built-in fallback");
+      assert.equal(agent?.model, "google/gemini-3.5-flash");
+      assert.equal(agent?.thinking, "high");
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
@@ -4533,11 +4563,20 @@ System prompt override`
     mockSubagentHandler = async (toolName, params, signal, onUpdate) => {
       const isTask1 = params.task.includes("Parallel Task 1");
       const taskTitle = isTask1 ? "Parallel Task 1" : "Parallel Task 2";
-      const model = isTask1 ? "anthropic/claude-3-5-sonnet-parallel-1" : "openai/gpt-4o-parallel-2";
+      const launchModel = isTask1 ? "google/gemini-3.5-flash" : "google/gemini-3.5-flash";
+      const streamedModel = isTask1 ? "anthropic/claude-3-5-sonnet-parallel-1" : "openai/gpt-4o-parallel-2";
 
       executionTimestamps.push({ task: taskTitle, event: "start", time: Date.now() });
       activeCalls.push(1);
       maxConcurrencyObserved = Math.max(maxConcurrencyObserved, activeCalls.length);
+
+      if (onUpdate) {
+        onUpdate({
+          content: [{ type: "text", text: `Tool start for ${taskTitle}` }],
+          details: { results: [{ exitCode: 0, model: launchModel }] },
+          model: launchModel,
+        });
+      }
 
       // Controlled delay to simulate concurrent work overlap
       await new Promise((resolve) => setTimeout(resolve, 80));
@@ -4545,7 +4584,8 @@ System prompt override`
       if (onUpdate) {
         onUpdate({
           content: [{ type: "text", text: `In-progress update for ${taskTitle}` }],
-          details: { results: [{ exitCode: 0, model }] }
+          details: { results: [{ exitCode: 0, model: streamedModel }] },
+          model: streamedModel,
         });
       }
 
@@ -4554,7 +4594,8 @@ System prompt override`
 
       return {
         content: [{ type: "text", text: `Successfully completed ${taskTitle}` }],
-        details: { results: [{ exitCode: 0, model }] }
+        details: { results: [{ exitCode: 0, model: streamedModel }] },
+        model: streamedModel,
       };
     };
 
@@ -4603,24 +4644,34 @@ System prompt override`
     assert.match(summaryText, /anthropic\/claude-3-5-sonnet-parallel-1/, "Summary must show model for Task 1");
     assert.match(summaryText, /openai\/gpt-4o-parallel-2/, "Summary must show model for Task 2");
 
-    // Verify that the UI displays the correct model name for each subagent
-    // We can search the captured widget snapshots for the exact model names
+    // Verify that the UI first shows the configured model during execution,
+    // then upgrades to the effective streamed model without regressing.
+    let foundConfiguredModelInUI = false;
     let foundTask1ModelInUI = false;
     let foundTask2ModelInUI = false;
+    let foundUnknownModelWhileRunning = false;
 
     for (const lines of widgetSnapshots) {
       for (const line of lines) {
+        if (line.includes("google/gemini-3.5-flash")) {
+          foundConfiguredModelInUI = true;
+        }
         if (line.includes("claude-3-5-sonnet-parallel-1")) {
           foundTask1ModelInUI = true;
         }
         if (line.includes("gpt-4o-parallel-2")) {
           foundTask2ModelInUI = true;
         }
+        if (line.includes("Unknown model") && line.includes("Parallel Task")) {
+          foundUnknownModelWhileRunning = true;
+        }
       }
     }
 
+    assert.ok(foundConfiguredModelInUI, "Configured model should be rendered before streamed model resolution");
     assert.ok(foundTask1ModelInUI, "Task 1 model name should be rendered in UI");
     assert.ok(foundTask2ModelInUI, "Task 2 model name should be rendered in UI");
+    assert.equal(foundUnknownModelWhileRunning, false, "Running tasks should not regress to Unknown model once a configured model exists");
   });
 });
 
