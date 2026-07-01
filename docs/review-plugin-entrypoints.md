@@ -24,8 +24,8 @@ This is a historical implementation note from the inspection story that preceded
 - Planning provider: the normalized provider selects either `codex exec` with an output schema or `claude -p` with JSON extracted from stdout.
 - Review provider: selected first through the explicit tool/command option (`reviewProvider` or `--provider`) and then through `CC_REVIEW_PROVIDER` via `resolveReviewProviderConfig(...)`; supported values are `codex` (default) and `claude`, and the normalized provider is used to initialize the matching entry in `REVIEW_BACKEND_FACTORIES`.
 - Review credentials and models: the chosen review CLI (`codex` or `claude`) handles its own auth via its login session or env vars. Optional model selection per provider: Codex reads `CODEX_MODEL`; Claude reads `CLAUDE_MODEL`. CC Review itself does not preflight credentials; the CLI's own auth error surfaces as a non-zero review exit recorded as `completed_with_warnings`.
-- Execution provider: task implementation is delegated to `agent: "generator"` through `getSubagentExecutor(pi)`. If `pi.toolManager.executeTool` exists, it is used; otherwise code falls back to discovering a local/user agent and spawning `pi --mode json -p --no-session` through `runPiAgentSubprocess(...)`.
-- Subagent model assumptions: `discoverAgent(...)` reads project agents from `<cwd>/.pi/agents` and user agents from `~/.pi/agent/agents`, and `applyAgentModelOverride(...)` can apply `~/.pi/agent/settings.json` overrides for the `generator` agent.
+- Execution provider: task implementation is delegated to `agent: "worker"` through `getSubagentExecutor(pi)`. If `pi.toolManager.executeTool` exists, it is used; otherwise code falls back to discovering a local/user agent and spawning `pi --mode json -p --no-session` through `runPiAgentSubprocess(...)`.
+- Subagent model assumptions: `discoverAgent(...)` reads project agents from `<cwd>/.pi/agents` and user agents from `~/.pi/agent/agents`, and `applyAgentModelOverride(...)` applies `~/.pi/agent/settings.json` model and thinking overrides for the `worker` agent. A legacy `generator.md` profile is accepted when no `worker.md` exists, but it runs under the `worker` identity and override.
 - Claude review argument selection is present through the shared prompt builder, and optional Claude model selection is handled through `CLAUDE_MODEL`. Tests mock this subprocess path and use fake Claude credentials instead of live authentication.
 
 ## Current provider selection control path
@@ -43,7 +43,7 @@ This section has been updated from the original inspection note; the explicit pr
   - `.pi/extensions/cc-review.ts` `buildCodexReviewArgs(task, env = process.env)` separately reads `CODEX_MODEL` only for Codex review, and `.pi/extensions/cc-review.ts` `buildClaudeReviewArgs(task, env = process.env)` separately reads `CLAUDE_MODEL` only for Claude review.
 - **Config files**:
   - There is no package manifest, extension manifest, project config, or settings file in this repository that selects Codex vs Claude for review.
-  - `.pi/extensions/cc-review.ts` `applyAgentModelOverride(...)` can read `~/.pi/agent/settings.json` for the `generator` subagent model, and `discoverAgent(...)` can read `<cwd>/.pi/agents` or `~/.pi/agent/agents`; these affect task execution subagents, not planner/reviewer provider selection.
+  - `.pi/extensions/cc-review.ts` `applyAgentModelOverride(...)` reads `~/.pi/agent/settings.json` for the `worker` subagent model, and `discoverAgent(...)` can read `<cwd>/.pi/agents` or `~/.pi/agent/agents`; these affect task execution subagents, not planner/reviewer provider selection.
 - **Runtime client/subprocess initialization**:
   - `.pi/extensions/cc-review.ts` `runCcReviewWorkflow(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start, before planning, so invalid explicit/environment provider values fail before planner or reviewer subprocesses are spawned. Credential/auth problems surface later from the CLI subprocess itself (recorded as `completed_with_warnings`).
   - Planning uses the normalized provider: Codex writes schema-constrained output to a temporary file, while Claude returns JSON on stdout.
@@ -66,7 +66,7 @@ The explicit provider and review-timing insertion points are implemented through
 - Widget/status IDs: `"cc-review-widget"`, `"cc-review-status"`.
 - Temp path prefixes: `"cc-review-"`, `"cc-review-subagent-"`.
 - Trace file remains `workflow-trace.jsonl` because it is a generic workflow trace artifact, not plugin metadata.
-- Provider labels in trace payloads remain `agent: "codex"` for planner, use the configured review provider for reviewer, and `agent: "generator"` for executor because they describe runtime providers, not plugin identity.
+- Provider labels in trace payloads remain `agent: "codex"` for planner, use the configured review provider for reviewer, and `agent: "worker"` for executor because they describe runtime providers, not plugin identity.
 
 ## Historical old-name inventory retained intentionally
 

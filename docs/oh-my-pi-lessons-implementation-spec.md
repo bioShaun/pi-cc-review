@@ -13,7 +13,7 @@ Note: the older `docs/omp-research-scope.md` and `docs/omp-architecture-survey.m
 CC Review already has the core orchestration loop:
 
 1. Plan tasks.
-2. Execute each task through the `generator` subagent.
+2. Execute each task through the `worker` subagent.
 3. Run a per-task reviewer/fixer.
 4. Summarize the workflow.
 
@@ -33,7 +33,7 @@ Oh My Pi's review/subagent subsystem suggests the same direction for all of thes
 - Make reviewer output machine-readable with a verdict and prioritized findings.
 - Sort and display findings by priority so blocking issues float to the top.
 - Preserve current behavior where the reviewer may directly fix workspace files before reporting its verdict.
-- Keep the rollout incremental and compatible with existing `generator` agent definitions.
+- Keep the rollout incremental and compatible with existing `generator` agent definitions through the legacy profile fallback.
 
 ## Non-Goals
 
@@ -59,7 +59,7 @@ Oh My Pi's review/subagent subsystem suggests the same direction for all of thes
 
 ### Subagent Final Report
 
-The generator subagent should end its response with one JSON object. The orchestrator should attempt to parse the last balanced JSON object from the final assistant text.
+The worker subagent should end its response with one JSON object. The orchestrator should attempt to parse the last balanced JSON object from the final assistant text.
 
 ```json
 {
@@ -307,7 +307,7 @@ Static tests:
 
 ## Migration and Compatibility
 
-- Existing user-installed generator agents remain supported through fallback text validation.
+- Existing user-installed generator agents remain supported as legacy worker profiles through fallback text validation.
 - Existing review providers remain supported because final JSON parsing is additive.
 - Existing `workflow-logs.jsonl` and `workflow-trace.jsonl` behavior stays unchanged.
 - Summary output changes from inline truncated subagent output to artifact path plus structured status.

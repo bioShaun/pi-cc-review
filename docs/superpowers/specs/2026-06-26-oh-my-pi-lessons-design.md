@@ -27,7 +27,7 @@ Oh-my-pi (`can1357/oh-my-pi`) demonstrates the target pattern: parent workflows 
 - Halt workflow on reviewer `block` (effective verdict), symmetric to execution gate.
 - Post-review validation when reviewer applies fixes.
 - Display: widget rollups, `cc-review-findings` (per-task + rollup), enhanced summary renderer.
-- Incremental rollout compatible with existing generator agents and review providers.
+- Incremental rollout uses the standard worker name while remaining compatible with legacy generator profiles and existing review providers.
 
 ## Non-Goals
 

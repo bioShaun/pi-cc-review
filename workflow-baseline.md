@@ -16,7 +16,7 @@ It bridges the gap between high-level planning and precise code execution by ite
 ### Relation to `_subagent` Extension Hooks
 - **Delegated Coupling**: `.pi/extensions/cc-review.ts` does not import `_subagent` internals directly. It delegates through the public extension API by resolving `pi.toolManager.executeTool` in `getSubagentExecutor(...)`.
 - **Subagent Dispatch**: Planned subtasks prefer `pi.toolManager.executeTool` when the runtime exposes it and otherwise use the implemented `pi --mode json -p --no-session` fallback that mirrors `_subagent` behavior. Codex planning and configured review remain the only provider-specific subprocess behavior.
-- **Standard Agent Profiles**: Planned subtasks are dispatched to the `generator` profile with `agentScope: "user"`, allowing the standard `subagent` tool to own profile discovery, settings inheritance, safety controls, and execution details.
+- **Standard Agent Profiles**: Planned subtasks are dispatched to the `worker` profile with `agentScope: "user"`, allowing the standard `subagent` tool to own profile discovery, settings inheritance, safety controls, and execution details.
 
 ---
 
@@ -29,7 +29,7 @@ Concrete locations in `.pi/extensions/cc-review.ts`:
    - Tool registration starts at `registerTool({ name: "cc_review", ... })` and calls `runCcReviewWorkflow(...)` with an `AbortSignal` and `onUpdate` callback.
 2. **Subagent Creation / Dispatch**:
    - `getSubagentExecutor(pi)` resolves `pi.toolManager.executeTool`.
-   - Planned subtasks are dispatched with `executeSubagentTool("subagent", { agent: "generator", task: attemptPrompt, agentScope: "user", cwd }, signal, onUpdate, ctx)`.
+   - Planned subtasks are dispatched with `executeSubagentTool("subagent", { agent: "worker", task: attemptPrompt, agentScope: "user", cwd }, signal, onUpdate, ctx)`.
    - `getSubagentExitCode(...)` maps subagent tool results to deterministic execution codes.
 3. **Planning and Task Collection**:
    - Codex planning arguments are built in `codexPlanArgs`.

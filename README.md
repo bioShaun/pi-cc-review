@@ -272,12 +272,12 @@ An explicit `reviewRepairRounds` or `--review-repair-rounds` takes precedence ov
 Any optimization, modification, or refactoring work **must preserve** the following design contracts. The test suites explicitly verify these patterns.
 
 ### A. Subagent Integration Contract
-- **Rule**: Planned task execution must preserve the standard `subagent` result contract and generator agent profile semantics.
+- **Rule**: Planned task execution must preserve the standard `subagent` result contract and worker agent profile semantics.
 - **Contract**: Prefer the extension API's tool manager when available, and otherwise use the built-in fallback that mirrors `_subagent` via `pi --mode json -p --no-session` while returning the same `content`, `details.results[0]`, and `isError` shape:
   ```typescript
   const executeSubagentTool = getSubagentExecutor(pi);
   const subagentResult = await executeSubagentTool("subagent", {
-    agent: "generator",
+    agent: "worker",
     task: subagentPrompt,
     agentScope: "user",
   }, signal, onUpdate, ctx);

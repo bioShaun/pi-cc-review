@@ -35,10 +35,10 @@ Each of the following criteria maps to a specific pain point from the baseline, 
   - Run a 2-task workflow where Task 1 writes a temporary variable/config and Task 2 reads and outputs it. The workflow must succeed, and Task 2 initialization time must be at least 50% lower than Task 1 initialization time when measured from subagent dispatch to first structured output event.
 
 ### Criterion 2: Integration with `_subagent` Extension (Easier Configuration & Unified Execution)
-* **Goal**: Preserve the standard `subagent` result contract and generator profile semantics across runtimes where the in-process tool manager may or may not be exposed.
+* **Goal**: Preserve the standard `subagent` result contract and worker profile semantics across runtimes where the in-process tool manager may or may not be exposed.
 * **Measurable Criteria**:
   1. **Contract-Preserving Dispatch**: Planned subtasks in `cc-review.ts` must flow through `getSubagentExecutor(pi)` and return the canonical `content`, `details.results[0]`, and `isError` shape.
-  2. **Standard Agent Profiles**: Subtask execution must target specialized agents (e.g., `generator`, `evaluator`, `reviewer`) with `agentScope` semantics matching the standard `subagent` tool.
+  2. **Standard Agent Profiles**: Subtask execution must target specialized agents (e.g., `worker`, `evaluator`, `reviewer`) with `agentScope` semantics matching the standard `subagent` tool.
   3. **Configuration Inheritance**: The orchestrator must inherit and respect model overrides, safety filters, custom tool limits, and timeouts defined in standard configurations (e.g., `settings.json` or `.pi/agents`) instead of hardcoding provider behavior.
 * **Verification Method**:
   - Static Code Audit: planned-task execution must call `getSubagentExecutor(pi)`, invoke the returned executor with tool name `subagent`, and parse results via `getSubagentExitCode(...)`. A narrow `grep -E 'spawn\("pi"'` check is insufficient for auditing this path because it misses indirect invocations such as `spawn(piInvocation.command, piInvocation.args, ...)` in the documented fallback.

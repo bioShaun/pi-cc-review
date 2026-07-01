@@ -21,12 +21,13 @@ or a live `pi` / `claude` invocation captured during the investigation.
 - `pi` version: `0.80.2` (`/opt/homebrew/bin/pi`)
 - `claude` version: `2.1.185` (`/Users/guilixuan/.local/bin/claude`)
 - `codex` present at `/opt/homebrew/bin/codex`
-- Worker/generator model comes from the user's pi config, not the plugin:
-  `~/.pi/agent/settings.json` → `subagents.agentOverrides.worker.model`
-  (currently `volcengine-coding/glm-5.2`; default session model
-  `google/gemini-3.5-flash`).
-- The execution subagent resolves to `~/.pi/agent/agents/generator.md`
-  (`name: generator`), spawned as `pi --mode json -p --no-session ...`.
+- Worker model and thinking level come from the user's pi config, not the plugin:
+  `~/.pi/agent/settings.json` →
+  `subagents.agentOverrides.worker.{model,thinking}`.
+- The execution subagent uses the `worker` identity. It prefers `worker.md`,
+  accepts `~/.pi/agent/agents/generator.md` as a legacy profile fallback, and
+  otherwise uses the built-in worker prompt. It is spawned as
+  `pi --mode json -p --no-session ...`.
 
 ---
 
@@ -250,15 +251,15 @@ post-mortem visibility (which made diagnosing the failures above harder).
 ## Clarification: glm-5.1 is not a plugin defect
 
 The plugin contains no reference to `glm` or `volcengine`; it only passes through
-whatever model the user's pi subagent config specifies (via `CODEX_MODEL` /
-`CLAUDE_MODEL` env or agent frontmatter `model`). The `glm-5.1` warning was:
+the worker model selected by `subagents.agentOverrides.worker.model` or agent
+frontmatter `model`. The `glm-5.1` warning was:
 - Emitted by pi itself ("Model not found for provider ... Using custom model id")
   because `glm-5.1` was not in `~/.pi/agent/models.json` at the time.
 - Harmless — tasks using it succeeded in the same run.
 - Only surfaced as an "error" because of the mis-attribution bug in P0-2.
 
-The model has since been changed to `glm-5.2`; `glm-5.1` last appears on 06-25 and
-not in any later run.
+At the time of this incident review, the model had been changed to `glm-5.2`;
+`glm-5.1` last appeared on 06-25 and not in any later reviewed run.
 
 ---
 

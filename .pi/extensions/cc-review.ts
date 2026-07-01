@@ -1061,7 +1061,7 @@ function resolvePhaseTimeoutFromEnv(env: NodeJS.ProcessEnv, key: string, fallbac
 // ---------------------------------------------------------------------------
 // resolveMaxReviewRepairRounds: resolver for the reviewer-block repair loop
 // bound (see P1-1). On a reviewer "block" verdict, the orchestrator re-dispatches
-// the generator with the reviewer's findings as feedback, then re-reviews, up
+// the worker with the reviewer's findings as feedback, then re-reviews, up
 // to this many rounds before hard-failing.
 //
 // Precedence: explicit `flag` (tool param / slash flag
@@ -3152,10 +3152,10 @@ function summarizeParentContext(goal: string): string {
 
 // ---------------------------------------------------------------------------
 // buildRepairFeedback: produces a compact feedback string from a reviewer
-// "block" verdict, to be injected into the generator's next attempt prompt
+// "block" verdict, to be injected into the worker's next attempt prompt
 // during the repair loop (P1-1). Includes only structured fields: the verdict,
 // block reason, reviewer summary, and unfixed findings with locations. This
-// lets the generator address the reviewer's concrete findings instead of
+// lets the worker address the reviewer's concrete findings instead of
 // hard-failing the entire workflow on the first block.
 // ---------------------------------------------------------------------------
 export function buildRepairFeedback(
@@ -3218,7 +3218,7 @@ export function buildRepairFeedback(
 //
 // `buildPriorTaskHandoff` produces a compact, bounded "Prior Tasks (Handoff)"
 // block that is injected into each subsequent task's subagent prompt so
-// downstream generator runs can build on what earlier tasks delivered.
+// downstream worker runs can build on what earlier tasks delivered.
 //
 // Design constraints (per sprint contract):
 //   * Includes ONLY structured fields: title, verdict (effectiveVerdict ?? status),
@@ -3227,7 +3227,7 @@ export function buildRepairFeedback(
 //     log fragments, or `reviewResult.findings[*].message` (reviewer prose).
 //   * Total length is hard-capped (default 4096 chars). When the natural
 //     rendering exceeds the cap, the string is truncated and a stable marker
-//     `… (truncated)` is appended so the generator knows context was elided.
+//     `… (truncated)` is appended so the worker knows context was elided.
 //   * Per-task fields are also individually clipped (summary ≤ 400 chars,
 //     filesChanged ≤ 12 items, unresolvedItems ≤ 8 items) to keep one large
 //     task from starving later ones.
@@ -3428,6 +3428,7 @@ export { buildSubagentTaskPrompt };
 interface DiscoveredAgent {
   name: string;
   model?: string;
+  thinking?: string;
   tools?: string[];
   systemPrompt: string;
   source: "user" | "project";
@@ -3481,6 +3482,7 @@ function loadAgentFromDir(dir: string, agentName: string, source: "user" | "proj
   return {
     name: frontmatter.name,
     model: frontmatter.model || undefined,
+    thinking: frontmatter.thinking || undefined,
     tools,
     systemPrompt: body,
     source,
@@ -3494,8 +3496,12 @@ function applyAgentModelOverride(agent: DiscoveredAgent): DiscoveredAgent {
   try {
     const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
     const override = settings?.subagents?.agentOverrides?.[agent.name];
-    if (override?.model) {
-      return { ...agent, model: override.model };
+    if (override?.model || override?.thinking) {
+      return {
+        ...agent,
+        model: override.model || agent.model,
+        thinking: override.thinking || agent.thinking,
+      };
     }
   } catch {
     // ignore malformed settings
@@ -3503,15 +3509,15 @@ function applyAgentModelOverride(agent: DiscoveredAgent): DiscoveredAgent {
   return agent;
 }
 
-// Built-in fallback definition for the `generator` subagent. CC Review previously
+// Built-in fallback definition for the `worker` subagent. CC Review previously
 // hard-required ~/.pi/agent/agents/generator.md, which made the extension fail
 // for any user who didn't install that agent (goal #1: minimize external plugin
 // dependencies). The prompt below is intentionally lightweight: it gives the
 // subagent a single, focused responsibility and avoids the sprint-contract
-// workflow some users layer on top of their own generator.md. Users who have
-// their own generator.md still take precedence via discoverAgent().
-const BUILTIN_GENERATOR_PROMPT = [
-  "You are CC Review's built-in generator subagent.",
+// workflow some users layer on top of their own agent profiles. A worker.md
+// profile takes precedence; legacy generator.md profiles remain supported.
+const BUILTIN_WORKER_PROMPT = [
+  "You are CC Review's built-in worker subagent.",
   "",
   "Scope rules:",
   "- Implement exactly the single task in the prompt; do not invent or pre-stage other work.",
@@ -3530,12 +3536,13 @@ const BUILTIN_GENERATOR_PROMPT = [
   "- Do not loop or stall: if the same operation has failed twice, report the error instead of retrying indefinitely.",
 ].join("\n");
 
-export function buildBuiltinGeneratorAgent(): DiscoveredAgent {
+export function buildBuiltinWorkerAgent(): DiscoveredAgent {
   return {
-    name: "generator",
+    name: "worker",
     model: undefined,
+    thinking: undefined,
     tools: undefined,
-    systemPrompt: BUILTIN_GENERATOR_PROMPT,
+    systemPrompt: BUILTIN_WORKER_PROMPT,
     source: "user",
     filePath: "<builtin>",
   };
@@ -3556,9 +3563,23 @@ export function discoverAgent(
   if (!agent && (agentScope === "user" || agentScope === "both")) {
     agent = loadAgentFromDir(userDir, agentName, "user");
   }
-  if (!agent && agentName === "generator") {
+  if (!agent && agentName === "worker") {
+    // Preserve existing installations that defined the executor as generator.md,
+    // while exposing one canonical runtime role and one settings override: worker.
+    let legacyAgent: DiscoveredAgent | undefined;
+    if (agentScope === "project" || agentScope === "both") {
+      legacyAgent = loadAgentFromDir(projectDir, "generator", "project");
+    }
+    if (!legacyAgent && (agentScope === "user" || agentScope === "both")) {
+      legacyAgent = loadAgentFromDir(userDir, "generator", "user");
+    }
+    if (legacyAgent) {
+      agent = { ...legacyAgent, name: "worker" };
+    }
+  }
+  if (!agent && agentName === "worker") {
     // Last-resort built-in so the workflow runs without any user-installed agent.
-    return buildBuiltinGeneratorAgent();
+    agent = buildBuiltinWorkerAgent();
   }
   return agent ? applyAgentModelOverride(agent) : undefined;
 }
@@ -3631,6 +3652,7 @@ async function runPiAgentSubprocess(
 
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
   if (agent.model) args.push("--model", agent.model);
+  if (agent.thinking) args.push("--thinking", agent.thinking);
   if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
   if (tmpPromptPath) args.push("--append-system-prompt", tmpPromptPath);
   args.push(`Task: ${task}`);
@@ -3653,7 +3675,7 @@ async function runPiAgentSubprocess(
   // the subprocess is aborted by a timeout, hiding the real cause (see P0-2).
   let abortReason: string | undefined;
   // Throttle timestamp for forwarding incremental text/thinking deltas (P0-3).
-  // The pi generator emits message_update / text_delta events as the model
+  // The pi worker emits message_update / text_delta events as the model
   // streams; without forwarding them the live log shows only discrete tool
   // calls, never the model's in-progress reasoning.
   let lastTextDeltaForwardMs = 0;
@@ -5134,7 +5156,7 @@ async function runCcReviewWorkflow(
       let taskStatus: TaskResult["status"] = "completed";
       let retryFeedback: string | undefined = undefined;
       // Repair feedback from a reviewer "block" verdict, injected into the next
-      // generator attempt so the subagent can fix the reviewer's findings
+      // worker attempt so the subagent can fix the reviewer's findings
       // instead of hard-failing the whole workflow (P1-1).
       let repairFeedback: string | undefined = undefined;
       let repairRequiresPostReviewValidation = false;
@@ -5150,7 +5172,7 @@ async function runCcReviewWorkflow(
       const maxTaskExecutionAttempts = maxTaskExecutionRetries + 1;
 
       // Reviewer-block repair loop (P1-1): when the reviewer returns a "block"
-      // verdict, re-dispatch the generator with the reviewer's findings as
+      // verdict, re-dispatch the worker with the reviewer's findings as
       // feedback, then re-review, up to maxReviewRepairRounds. Only hard-fail
       // after the bound is hit. Previously a single block threw and aborted the
       // entire workflow, preventing later tasks from ever running.
@@ -5186,7 +5208,7 @@ async function runCcReviewWorkflow(
 
         emitTrace(ctx, "subagent_assignment", {
           role: "executor",
-          agent: "generator",
+          agent: "worker",
           taskIndex: i,
           attempt,
         });
@@ -5230,7 +5252,7 @@ async function runCcReviewWorkflow(
             result = await executeSubagentTool(
               "subagent",
               {
-                agent: "generator",
+                agent: "worker",
                 task: attemptPrompt,
                 agentScope: "user",
                 cwd: ctx?.cwd ?? process.cwd(),
@@ -5609,7 +5631,7 @@ async function runCcReviewWorkflow(
           );
         }
         // Build repair feedback from the reviewer's findings and re-execute +
-        // re-review (P1-1). The generator gets the concrete findings so it can
+        // re-review (P1-1). The worker gets the concrete findings so it can
         // fix them instead of the whole workflow aborting on the first block.
         repairFeedback = buildRepairFeedback(reviewResultObject ?? null, derived.blockReason, findings);
         repairRequiresPostReviewValidation ||= derived.blockReason === "post_review_validation_failed";

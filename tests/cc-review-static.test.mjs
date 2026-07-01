@@ -48,7 +48,7 @@ test("planned task execution uses the subagent contract (via subprocess fallback
   //   * Exit code is read via `getSubagentExitCode`
   assert.match(source, /function getSubagentExecutor\(pi: ExtensionAPI\): SubagentToolExecutor/);
   assert.match(source, /executeSubagentTool\(\n\s+"subagent",/);
-  assert.match(source, /agent: "generator"/);
+  assert.match(source, /agent: "worker"/);
   assert.match(source, /agentScope: "user"/);
   assert.match(source, /function getSubagentExitCode\(result: SubagentToolResult\): number/);
   assert.match(source, /return result\.isError \? 1 : 0/);
@@ -61,6 +61,7 @@ test("planned task execution uses the subagent contract (via subprocess fallback
   assert.match(source, /function getPiInvocation\(/);
   assert.match(source, /"--mode", "json"/);
   assert.match(source, /"--no-session"/);
+  assert.match(source, /args\.push\("--thinking", agent\.thinking\)/);
   assert.match(source, /"--append-system-prompt"/);
   assert.match(source, /runPiAgentSubprocess\(/);
   assert.match(source, /event\?\.type === "message_end"/);
@@ -358,7 +359,7 @@ test("provider selection flow implementation note documents current control path
     "throws `Invalid reviewProvider` or `Invalid CC_REVIEW_PROVIDER` for empty, whitespace-only, or unsupported values",
     "`buildClaudeReviewArgs(task, env = process.env)` separately reads `CLAUDE_MODEL`",
     "There is no package manifest, extension manifest, project config, or settings file",
-    "`applyAgentModelOverride(...)` can read `~/.pi/agent/settings.json`",
+    "`applyAgentModelOverride(...)` reads `~/.pi/agent/settings.json`",
     "these affect task execution subagents, not planner/reviewer provider selection",
     "`runCcReviewWorkflow(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start",
     "invalid explicit/environment provider values fail before planner or reviewer subprocesses are spawned",
@@ -389,7 +390,7 @@ test("baseline documents the current subagent execution contract", () => {
   assert.match(baseline, /Standard `subagent` tool/);
   assert.match(baseline, /pi\.toolManager\.executeTool\("subagent"/);
   assert.match(baseline, /getSubagentExecutor\(pi\)/);
-  assert.match(baseline, /agent: "generator"/);
+  assert.match(baseline, /agent: "worker"/);
   assert.match(baseline, /agentScope: "user"/);
   assert.match(baseline, /"acceptanceCriteria": \{ "type": "string" \}/);
   assert.match(baseline, /"required": \["title", "description", "acceptanceCriteria"\]/);

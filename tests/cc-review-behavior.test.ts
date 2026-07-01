@@ -9,7 +9,7 @@ import { EventEmitter } from "node:events";
 
 import ccReviewExtension, {
   appendPersistedLogEntry,
-  buildBuiltinGeneratorAgent,
+  buildBuiltinWorkerAgent,
   buildCcReviewStatusText,
   buildCcReviewWidgetLines,
   buildPriorTaskHandoff,
@@ -3277,23 +3277,54 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.ok(typeof first.droppedLineCount === "number" && first.droppedLineCount > 0);
   });
 
-  it("provides a built-in generator fallback when no agent file is installed", () => {
+  it("provides a configured built-in worker and supports legacy generator profiles", () => {
     const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-empty-home-"));
     const originalHome = process.env.HOME;
     process.env.HOME = tempHome;
     try {
       const isolatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-empty-cwd-"));
-      const agent = discoverAgent("generator", "both", isolatedCwd);
-      assert.ok(agent, "generator should be discoverable via the built-in fallback");
-      assert.equal(agent?.name, "generator");
+      const settingsDir = path.join(tempHome, ".pi", "agent");
+      fs.mkdirSync(settingsDir, { recursive: true });
+      fs.writeFileSync(path.join(settingsDir, "settings.json"), JSON.stringify({
+        subagents: {
+          agentOverrides: {
+            worker: {
+              model: "volcengine-coding/glm-5.2",
+              thinking: "high",
+            },
+          },
+        },
+      }));
+
+      const agent = discoverAgent("worker", "both", isolatedCwd);
+      assert.ok(agent, "worker should be discoverable via the built-in fallback");
+      assert.equal(agent?.name, "worker");
       assert.equal(agent?.filePath, "<builtin>");
-      assert.ok(/built-in generator subagent/i.test(agent?.systemPrompt || ""));
+      assert.equal(agent?.model, "volcengine-coding/glm-5.2");
+      assert.equal(agent?.thinking, "high");
+      assert.ok(/built-in worker subagent/i.test(agent?.systemPrompt || ""));
       // An unknown agent should still return undefined when no file is present.
       assert.equal(discoverAgent("definitely-missing-agent", "both", isolatedCwd), undefined);
       // The exported builder produces the same lightweight prompt.
-      const builtin = buildBuiltinGeneratorAgent();
-      assert.equal(builtin.name, "generator");
+      const builtin = buildBuiltinWorkerAgent();
+      assert.equal(builtin.name, "worker");
       assert.equal(builtin.filePath, "<builtin>");
+
+      const legacyDir = path.join(isolatedCwd, ".pi", "agents");
+      fs.mkdirSync(legacyDir, { recursive: true });
+      fs.writeFileSync(path.join(legacyDir, "generator.md"), [
+        "---",
+        "name: generator",
+        "description: legacy executor profile",
+        "---",
+        "Legacy generator prompt.",
+      ].join("\n"));
+      const legacy = discoverAgent("worker", "both", isolatedCwd);
+      assert.equal(legacy?.name, "worker");
+      assert.equal(legacy?.filePath, path.join(legacyDir, "generator.md"));
+      assert.equal(legacy?.systemPrompt.trim(), "Legacy generator prompt.");
+      assert.equal(legacy?.model, "volcengine-coding/glm-5.2");
+      assert.equal(legacy?.thinking, "high");
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
