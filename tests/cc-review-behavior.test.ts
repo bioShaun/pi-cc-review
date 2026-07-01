@@ -1,4 +1,4 @@
-import test, { describe, it, beforeEach, afterEach } from "node:test";
+import test, { describe, it, beforeEach, afterEach, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -19,6 +19,7 @@ import ccReviewExtension, {
   priorTaskHandoffFromResults,
   classifyCcReviewSummary,
   computeChecklistWindow,
+  computeDefaultAutoConcurrency,
   countCcReviewTaskOutcomesFromSummary,
   createSubprocessStreamLogger,
   DEFAULT_MAX_REVIEW_REPAIR_ROUNDS,
@@ -34,6 +35,7 @@ import ccReviewExtension, {
   previewWidgetText,
   renderCcReviewLogEntry,
   resolveCcReviewLogLevel,
+  resolveCcReviewLogPath,
   resolveCcReviewConcurrency,
   resolveMaxReviewRepairRounds,
   resolvePlannerTimeoutMs,
@@ -47,6 +49,12 @@ import ccReviewExtension, {
   summarizeLogSeverities,
   summarizeSubagentToolActivity,
   truncateForWidget,
+  runSubprocess,
+  appendStreamText,
+  SUBPROCESS_OUTPUT_TRUNCATED_MARKER,
+  enterCcReviewWorkflowNest,
+  CcReviewNestDepthError,
+  CC_REVIEW_NEST_DEPTH_ENV,
 } from "../.pi/extensions/cc-review.ts";
 
 const plainWidgetTheme = { fg: (_color: string, text: string) => text };
@@ -748,33 +756,241 @@ describe("resolveReviewMode selects review timing", () => {
   });
 });
 
+describe("computeDefaultAutoConcurrency defines the worker default auto-parallel policy", () => {
+  it("returns an automatic value when no explicit concurrency is configured", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 4 }), 4);
+  });
+
+  it("is at least 1 regardless of CPU count", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 0 }), 1);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: -5 }), 1);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 1 }), 1);
+  });
+
+  it("caps the CPU-based value at a reasonable upper bound", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 16 }), 8);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 8 }), 8);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 7 }), 7);
+  });
+
+  it("supports injecting CPU count and task count so tests stay machine-independent", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 16, taskCount: 3 }), 3);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 2, taskCount: 10 }), 2);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 4, taskCount: 4 }), 4);
+    // No CPU injection: fallback is used, and it is still bounded.
+    assert.equal(computeDefaultAutoConcurrency({ fallbackCpuCount: 2 }), 2);
+  });
+
+  it("falls back to a safe default when cpuCount is missing and degrades to the minimum for invalid values", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: NaN }), 1);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: Infinity }), 1);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: -1 }), 1);
+    assert.equal(computeDefaultAutoConcurrency({}), 4);
+  });
+
+  it("allows custom min and max bounds to be injected", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 16, maxConcurrency: 4 }), 4);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 1, minConcurrency: 2 }), 2);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 16, minConcurrency: 2, maxConcurrency: 4 }), 4);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 0, minConcurrency: 2, maxConcurrency: 4 }), 2);
+  });
+
+  it("ignores taskCount when it is not a positive finite integer", () => {
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 4, taskCount: 0 }), 4);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 4, taskCount: -1 }), 4);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 4, taskCount: NaN }), 4);
+    assert.equal(computeDefaultAutoConcurrency({ cpuCount: 4, taskCount: Infinity }), 4);
+  });
+
+  it("always returns a positive integer", () => {
+    const result = computeDefaultAutoConcurrency({ cpuCount: 4.7, taskCount: 2.9 });
+    assert.equal(result, 2);
+    assert.ok(Number.isInteger(result));
+    assert.ok(result >= 1);
+  });
+});
+
 describe("resolveCcReviewConcurrency selects the subagent concurrency limit", () => {
   it("uses explicit value, environment fallback, and the default limit of 4", () => {
-    assert.deepEqual(resolveCcReviewConcurrency({ flag: "2" }), { concurrency: 2, source: "flag" });
+    assert.deepEqual(resolveCcReviewConcurrency({ flag: "2", cpuCount: 4 }), { concurrency: 2, source: "flag" });
     assert.deepEqual(
-      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "3" } as NodeJS.ProcessEnv }),
+      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "3" } as NodeJS.ProcessEnv, cpuCount: 4 }),
       { concurrency: 3, source: "env" }
     );
-    assert.deepEqual(resolveCcReviewConcurrency({ env: {} as NodeJS.ProcessEnv }), {
+    assert.deepEqual(resolveCcReviewConcurrency({ env: {} as NodeJS.ProcessEnv, cpuCount: 4 }), {
       concurrency: 4,
       source: "default",
     });
   });
 
   it("falls back to the default for invalid values", () => {
-    assert.deepEqual(resolveCcReviewConcurrency({ flag: "0" }), {
+    assert.deepEqual(resolveCcReviewConcurrency({ flag: "0", cpuCount: 4 }), {
       concurrency: 4,
       source: "default",
       invalidInput: { source: "flag", raw: "0" },
     });
     assert.deepEqual(
-      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "many" } as NodeJS.ProcessEnv }),
+      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "many" } as NodeJS.ProcessEnv, cpuCount: 4 }),
       {
         concurrency: 4,
         source: "default",
         invalidInput: { source: "env", raw: "many" },
       }
     );
+  });
+
+  it("automatically calculates dynamic concurrency when neither flag nor env is configured", () => {
+    // Large machine (e.g., 16 cores) is capped at the upper bound of 8
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ cpuCount: 16 }),
+      { concurrency: 8, source: "default" }
+    );
+
+    // Medium machine (e.g., 6 cores) yields exactly 6
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ cpuCount: 6 }),
+      { concurrency: 6, source: "default" }
+    );
+
+    // Small machine (e.g., 2 cores) yields exactly 2
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ cpuCount: 2 }),
+      { concurrency: 2, source: "default" }
+    );
+
+    // Tiny machine (e.g., 1 core) is bounded at the lower limit of 1
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ cpuCount: 1 }),
+      { concurrency: 1, source: "default" }
+    );
+
+    // Capped by taskCount if provided and smaller than cores limit
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ cpuCount: 16, taskCount: 3 }),
+      { concurrency: 3, source: "default" }
+    );
+
+    // Not capped by taskCount if taskCount is larger than cores limit
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ cpuCount: 4, taskCount: 10 }),
+      { concurrency: 4, source: "default" }
+    );
+  });
+
+  it("always respects the explicit concurrency flag and environment variable over the automatic/dynamic value", () => {
+    // Explicit flag wins even if automatic logic would compute 2 on a 2-core machine
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ flag: 12, cpuCount: 2 }),
+      { concurrency: 12, source: "flag" }
+    );
+
+    // Environment wins even if automatic logic would compute 8 on a 16-core machine
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "1" } as NodeJS.ProcessEnv, cpuCount: 16 }),
+      { concurrency: 1, source: "env" }
+    );
+
+    // Explicit flag or env overrides taskCount capping
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ flag: 12, cpuCount: 2, taskCount: 3 }),
+      { concurrency: 12, source: "flag" }
+    );
+    assert.deepEqual(
+      resolveCcReviewConcurrency({ env: { CC_REVIEW_CONCURRENCY: "5" } as NodeJS.ProcessEnv, cpuCount: 16, taskCount: 2 }),
+      { concurrency: 5, source: "env" }
+    );
+  });
+
+  it("ensures the automatic concurrency is always a positive integer within bounds", () => {
+    // Floating point cpu count is truncated and bounded correctly
+    const resFloat = resolveCcReviewConcurrency({ cpuCount: 4.7 });
+    assert.ok(Number.isInteger(resFloat.concurrency), "must be an integer");
+    assert.equal(resFloat.concurrency, 4);
+
+    // Out-of-bounds/invalid inputs degrade safely
+    const resNegative = resolveCcReviewConcurrency({ cpuCount: -5 });
+    assert.ok(resNegative.concurrency >= 1 && resNegative.concurrency <= 8, "must be within [1, 8]");
+    assert.ok(Number.isInteger(resNegative.concurrency), "must be an integer");
+
+    const resInfinite = resolveCcReviewConcurrency({ cpuCount: Infinity });
+    assert.ok(resInfinite.concurrency >= 1 && resInfinite.concurrency <= 8, "must be within [1, 8]");
+    assert.ok(Number.isInteger(resInfinite.concurrency), "must be an integer");
+  });
+});
+
+describe("resolveCcReviewLogPath generates unique, stable log file paths", () => {
+  it("returns a unique path in cwd when no explicit path is configured", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const runId = "20260701T120000000Z-abc123";
+    const p = resolveCcReviewLogPath({ cwd, runId });
+    assert.equal(path.dirname(p), cwd);
+    assert.match(path.basename(p), /^workflow-logs-20260701T120000000Z-abc123\.jsonl$/);
+    assert.equal(p, path.join(cwd, "workflow-logs-20260701T120000000Z-abc123.jsonl"));
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("returns different paths for different runIds", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const p1 = resolveCcReviewLogPath({ cwd, runId: "run-a" });
+    const p2 = resolveCcReviewLogPath({ cwd, runId: "run-b" });
+    assert.notEqual(p1, p2);
+    assert.match(path.basename(p1), /run-a\.jsonl$/);
+    assert.match(path.basename(p2), /run-b\.jsonl$/);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("uses an explicit relative log file path when provided", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const p = resolveCcReviewLogPath({ cwd, runId: "run-id", explicitLogFile: "my-logs.jsonl" });
+    assert.equal(p, path.join(cwd, "my-logs.jsonl"));
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("uses an explicit absolute log file path when provided", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const absolute = path.join(cwd, "absolute", "logs.jsonl");
+    const p = resolveCcReviewLogPath({ cwd, runId: "run-id", explicitLogFile: absolute });
+    assert.equal(p, absolute);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("gives explicit flag precedence over the environment variable", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const p = resolveCcReviewLogPath({
+      cwd,
+      runId: "run-id",
+      explicitLogFile: "flag-logs.jsonl",
+      envLogFile: "env-logs.jsonl",
+    });
+    assert.equal(p, path.join(cwd, "flag-logs.jsonl"));
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("falls back to the environment variable when no explicit flag is set", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const p = resolveCcReviewLogPath({ cwd, runId: "run-id", envLogFile: "env-logs.jsonl" });
+    assert.equal(p, path.join(cwd, "env-logs.jsonl"));
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("generates a unique file inside a configured directory", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const logDir = path.join(cwd, "logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    const p = resolveCcReviewLogPath({ cwd, runId: "20260701T120000000Z-abc123", envLogFile: "logs" });
+    assert.equal(path.dirname(p), logDir);
+    assert.match(path.basename(p), /^workflow-logs-20260701T120000000Z-abc123\.jsonl$/);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("generates a unique file inside a configured absolute directory", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-log-path-"));
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-absolute-log-dir-"));
+    const p = resolveCcReviewLogPath({ cwd, runId: "20260701T120000000Z-abc123", envLogFile: logDir });
+    assert.equal(path.dirname(p), logDir);
+    assert.match(path.basename(p), /^workflow-logs-20260701T120000000Z-abc123\.jsonl$/);
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(logDir, { recursive: true, force: true });
   });
 });
 
@@ -936,6 +1152,102 @@ describe("normalizes log entries into the CC Review display contract", () => {  
     assert.equal(first.message, "Recovered");
     assert.equal(first.id, repeated.id, "same normalized fields and sequence should derive the same stable id");
     assert.notEqual(first.id, interleaved.id, "different sequence should disambiguate interleaved duplicate logs");
+  });
+});
+
+describe("cc_review nest depth guard", () => {
+  it("allows the root workflow and blocks nested invocation", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    const exit = enterCcReviewWorkflowNest(env);
+    assert.equal(env[CC_REVIEW_NEST_DEPTH_ENV], "1");
+    assert.throws(() => enterCcReviewWorkflowNest(env), CcReviewNestDepthError);
+    exit();
+    assert.equal(env[CC_REVIEW_NEST_DEPTH_ENV], undefined);
+  });
+});
+
+describe("runSubprocess stream safety", () => {
+  const originalSpawn = child_process.spawn;
+  let spawnMock: ReturnType<typeof mock.method>;
+
+  before(() => {
+    spawnMock = mock.method(child_process, "spawn", (command: string, args: string[], options: any) => {
+      if (command === "cc-review-stream-test") {
+        const mockProc = new EventEmitter() as any;
+        mockProc.pid = 4242;
+        mockProc.stdout = new EventEmitter();
+        mockProc.stderr = new EventEmitter();
+        process.nextTick(() => {
+          mockProc.stdout.emit("data", Buffer.from("line-1\n"));
+          mockProc.stdout.emit("data", Buffer.from("line-2\n"));
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      if (command === "cc-review-huge-stdout") {
+        const mockProc = new EventEmitter() as any;
+        mockProc.pid = 4243;
+        mockProc.stdout = new EventEmitter();
+        mockProc.stderr = new EventEmitter();
+        process.nextTick(() => {
+          mockProc.stdout.emit("data", Buffer.from("x".repeat(4096)));
+          mockProc.stdout.emit("data", Buffer.from("y".repeat(4096)));
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return originalSpawn(command, args, options);
+    });
+  });
+
+  after(() => {
+    spawnMock.mock.restore();
+  });
+
+  it("appendStreamText truncates once the byte cap is reached", () => {
+    const state = { bytes: 0, truncated: false, maxBytes: 10 };
+    let buf = appendStreamText("", "hello", state);
+    assert.equal(buf, "hello");
+    buf = appendStreamText(buf, "world-overflow", state);
+    assert.ok(state.truncated);
+    assert.match(buf, /truncated/);
+  });
+
+  it("does not retain stdout when parsing NDJSON lines", async () => {
+    const lines: string[] = [];
+    const result = await runSubprocess({
+      label: "line-parser",
+      command: "cc-review-stream-test",
+      args: [],
+      cwd: process.cwd(),
+      onStdoutLine: (line) => lines.push(line),
+      maxStreamBytes: 1024,
+    });
+    assert.deepEqual(lines, ["line-1", "line-2"]);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stdoutTruncated, false);
+  });
+
+  it("truncates retained stdout instead of exceeding the configured cap", async () => {
+    const result = await runSubprocess({
+      label: "huge-stdout",
+      command: "cc-review-huge-stdout",
+      args: [],
+      cwd: process.cwd(),
+      maxStreamBytes: 4096,
+    });
+    assert.ok(result.stdoutTruncated);
+    assert.match(result.stdout, new RegExp(SUBPROCESS_OUTPUT_TRUNCATED_MARKER.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.ok(Buffer.byteLength(result.stdout, "utf8") <= 4096 + 256);
+  });
+});
+
+describe("built-in worker safety prompt", () => {
+  it("forbids nested cc_review and full-suite test runs", () => {
+    const agent = buildBuiltinWorkerAgent();
+    assert.match(agent.systemPrompt, /NEVER invoke the cc_review tool/);
+    assert.match(agent.systemPrompt, /test-name-pattern/);
+    assert.match(agent.systemPrompt, /Do not run the full `node --test tests\/cc-review-behavior\.test\.ts`/);
   });
 });
 
@@ -1256,6 +1568,8 @@ describe("CC Review Behavioral Regression Tests", () => {
   const originalCcReviewLogLevel = process.env.CC_REVIEW_LOG_LEVEL;
   const originalCcReviewMode = process.env.CC_REVIEW_MODE;
   const originalCcReviewMaxRepairRounds = process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
+  const originalCcReviewLogFile = process.env.CC_REVIEW_LOG_FILE;
+  const originalCcReviewNestDepth = process.env.CC_REVIEW_NEST_DEPTH;
 
   beforeEach(() => {
     tempTestDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-test-workspace-"));
@@ -1276,6 +1590,8 @@ describe("CC Review Behavioral Regression Tests", () => {
     delete process.env.CC_REVIEW_LOG_LEVEL;
     delete process.env.CC_REVIEW_MODE;
     delete process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
+    process.env.CC_REVIEW_LOG_FILE = "workflow-logs.jsonl";
+    delete process.env.CC_REVIEW_NEST_DEPTH;
     process.env.CODEX_API_KEY = "test-codex-review-key";
     process.env.ANTHROPIC_API_KEY = "test-claude-review-key";
     globalThis.fetch = originalFetch;
@@ -1308,6 +1624,27 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(registeredTool.parameters.properties.reviewProvider.enum, undefined);
     assert.equal((piMock as any).codex_workflow, undefined);
     assert.equal((piMock as any).codexWorkflow, undefined);
+  });
+
+  it("rejects nested cc_review tool calls while a workflow is active", async () => {
+    process.env.CC_REVIEW_NEST_DEPTH = "1";
+    let spawnCalls = 0;
+    mockSpawnHandler = () => {
+      spawnCalls++;
+      return null;
+    };
+
+    const result = await registeredTool.execute(
+      "nested-cc-review",
+      { goal: "Nested workflow should be blocked" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    assert.equal(spawnCalls, 0);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Nested invocation is blocked/i);
   });
 
   it("slash command missing goal reports validation error without spawning workflow", async () => {
@@ -1395,6 +1732,16 @@ describe("CC Review Behavioral Regression Tests", () => {
       delete process.env.CC_REVIEW_MAX_REPAIR_ROUNDS;
     } else {
       process.env.CC_REVIEW_MAX_REPAIR_ROUNDS = originalCcReviewMaxRepairRounds;
+    }
+    if (originalCcReviewLogFile === undefined) {
+      delete process.env.CC_REVIEW_LOG_FILE;
+    } else {
+      process.env.CC_REVIEW_LOG_FILE = originalCcReviewLogFile;
+    }
+    if (originalCcReviewNestDepth === undefined) {
+      delete process.env.CC_REVIEW_NEST_DEPTH;
+    } else {
+      process.env.CC_REVIEW_NEST_DEPTH = originalCcReviewNestDepth;
     }
     globalThis.fetch = originalFetch;
     try {
@@ -3509,6 +3856,21 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.ok(typeof first.droppedLineCount === "number" && first.droppedLineCount > 0);
   });
 
+  it("appendPersistedLogEntry creates the log directory when it does not exist", () => {
+    const nestedDir = path.join(tempTestDir, "nested", "log", "dir");
+    const filePath = path.join(nestedDir, "test.jsonl");
+    assert.ok(!fs.existsSync(nestedDir), "precondition: nested directory should not exist");
+    const state = appendPersistedLogEntry(
+      { filePath, appendedLineCount: 0 },
+      normalizeCcReviewLogEntry({ message: "hello from nested dir" }, { sequence: 1 })
+    );
+    assert.ok(fs.existsSync(filePath), "log file should be created in a non-existent directory");
+    assert.equal(state.filePath, filePath);
+    const lines = fs.readFileSync(filePath, "utf8").trim().split("\n").filter(Boolean);
+    assert.equal(lines.length, 1);
+    assert.ok(JSON.parse(lines[0]).message.includes("hello from nested dir"));
+  });
+
   it("provides a configured built-in worker and supports legacy generator profiles", () => {
     const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-empty-home-"));
     const originalHome = process.env.HOME;
@@ -4090,6 +4452,191 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.ok(boundaryEntries.length >= 2, "should have ≥2 run-boundary entries");
   });
 
+  it("regression test: continuous twice execution does not overwrite previous execution log", async () => {
+    delete process.env.CC_REVIEW_LOG_FILE;
+
+    const mockTasks = [
+      { title: "Unique log task", description: "Implement feature", acceptanceCriteria: "Feature works" }
+    ];
+
+    const makeSpawnHandler = () => (command: string, args: string[]) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("--output-schema")) {
+            const oIndex = args.indexOf("-o");
+            fs.writeFileSync(args[oIndex + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    // Run 1
+    mockSpawnHandler = makeSpawnHandler();
+    const result1 = await registeredTool.execute(
+      "tool-call-log-run-unique-1",
+      { goal: "First run goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    // Find the log file written by run 1
+    const filesAfterFirst = fs.readdirSync(tempTestDir).filter(f => f.startsWith("workflow-logs-") && f.endsWith(".jsonl"));
+    assert.equal(filesAfterFirst.length, 1, "There should be exactly one unique log file after first run");
+    const firstLogPath = path.join(tempTestDir, filesAfterFirst[0]);
+    const firstLogContent = fs.readFileSync(firstLogPath, "utf8");
+    assert.match(firstLogContent, /=== Workflow run .* started/);
+
+    // Run 2
+    mockSpawnHandler = makeSpawnHandler();
+    const result2 = await registeredTool.execute(
+      "tool-call-log-run-unique-2",
+      { goal: "Second run goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    // Find all log files after second run
+    const filesAfterSecond = fs.readdirSync(tempTestDir).filter(f => f.startsWith("workflow-logs-") && f.endsWith(".jsonl"));
+    assert.equal(filesAfterSecond.length, 2, "There should be exactly two unique log files after second run");
+
+    // Identify first and second log files
+    const secondLogFile = filesAfterSecond.find(f => f !== filesAfterFirst[0]);
+    assert.ok(secondLogFile, "Should find the second log file");
+    const secondLogPath = path.join(tempTestDir, secondLogFile);
+
+    assert.notEqual(firstLogPath, secondLogPath, "Consecutive runs should generate different log file paths");
+
+    // Verify first log contents are preserved and that the two files are distinct.
+    const firstLogContentAfterSecondRun = fs.readFileSync(firstLogPath, "utf8");
+    assert.equal(firstLogContentAfterSecondRun, firstLogContent, "First log content should be preserved intact after second run");
+
+    // Verify second log contents are written to a new file and not identical to the first.
+    const secondLogContent = fs.readFileSync(secondLogPath, "utf8");
+    assert.notEqual(secondLogContent, firstLogContent, "Second run should write to a separate log file with its own content");
+    assert.match(secondLogContent, /=== Workflow run .* started/);
+  });
+
+  it("explicit tool logFile parameter uses a fixed path and appends across runs", async () => {
+    const mockTasks = [{ title: "Fixed log task", description: "Implement feature", acceptanceCriteria: "Feature works" }];
+
+    const makeSpawnHandler = () => (command: string, args: string[]) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("--output-schema")) {
+            const oIndex = args.indexOf("-o");
+            fs.writeFileSync(args[oIndex + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task." }],
+      details: { results: [{ exitCode: 0 }] },
+    });
+
+    mockSpawnHandler = makeSpawnHandler();
+    const result1 = await registeredTool.execute(
+      "tool-call-log-file-1",
+      { goal: "First fixed log run", logFile: "custom-logs.jsonl" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    const fixedLogPath = path.join(tempTestDir, "custom-logs.jsonl");
+    assert.ok(fs.existsSync(fixedLogPath), "fixed log file should be created");
+    assert.ok(result1.content[0].text.includes(fixedLogPath), "summary should surface the fixed log path");
+    const firstContent = fs.readFileSync(fixedLogPath, "utf8");
+    assert.match(firstContent, /=== Workflow run .* started/);
+
+    mockSpawnHandler = makeSpawnHandler();
+    const result2 = await registeredTool.execute(
+      "tool-call-log-file-2",
+      { goal: "Second fixed log run", logFile: "custom-logs.jsonl" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+
+    const secondContent = fs.readFileSync(fixedLogPath, "utf8");
+    assert.ok(secondContent.length > firstContent.length, "fixed log file should append across runs");
+    const boundaries = secondContent.trim().split("\n").filter((line) => /=== Workflow run .* started/.test(line));
+    assert.equal(boundaries.length, 2, "fixed log should contain two run-boundary entries");
+    assert.ok(result2.content[0].text.includes(fixedLogPath), "second summary should also surface the fixed log path");
+  });
+
+  it("slash command --log-file forwards a fixed log path and appends across runs", async () => {
+    const mockTasks = [{ title: "Slash log task", description: "Implement feature", acceptanceCriteria: "Feature works" }];
+
+    const makeSpawnHandler = () => (command: string, args: string[]) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("--output-schema")) {
+            const oIndex = args.indexOf("-o");
+            fs.writeFileSync(args[oIndex + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task." }],
+      details: { results: [{ exitCode: 0 }] },
+    });
+
+    const slashLogPath = path.join(tempTestDir, "slash-logs.jsonl");
+    const notifications: Array<{ message: string; level: string }> = [];
+
+    mockSpawnHandler = makeSpawnHandler();
+    await registeredCommand.handler(`Run slash fixed log --log-file ${slashLogPath}`, {
+      cwd: tempTestDir,
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+      },
+    });
+
+    assert.ok(fs.existsSync(slashLogPath), "slash command fixed log file should be created");
+    const firstContent = fs.readFileSync(slashLogPath, "utf8");
+    assert.match(firstContent, /=== Workflow run .* started/);
+
+    mockSpawnHandler = makeSpawnHandler();
+    await registeredCommand.handler(`Run slash fixed log again --log-file ${slashLogPath}`, {
+      cwd: tempTestDir,
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+      },
+    });
+
+    const secondContent = fs.readFileSync(slashLogPath, "utf8");
+    assert.ok(secondContent.length > firstContent.length, "slash command fixed log should append across runs");
+    const boundaries = secondContent.trim().split("\n").filter((line) => /=== Workflow run .* started/.test(line));
+    assert.equal(boundaries.length, 2, "slash command fixed log should contain two run-boundary entries");
+  });
+
   it("failed workflow execution attaches structured metadata details", async () => {
     // 1) verification plan load failure
     const validationConfigPath = path.join(tempTestDir, ".cc-review-validation.json");
@@ -4426,6 +4973,127 @@ System prompt override`
     assert.match(reportText, /Parallel Task 2/);
   });
 
+
+  describe("worker automatic concurrency policy in end-to-end execution", () => {
+    const setupParallelMockTasks = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        title: `Auto Parallel Task ${i + 1}`,
+        description: `Job ${i + 1}`,
+        acceptanceCriteria: `Criterion ${i + 1} is verified`,
+        dependsOn: [] as number[],
+      }));
+
+    const runAutoConcurrencyScenario = async (options: {
+      cpuCount: number;
+      taskCount: number;
+      explicitConcurrencyLimit?: number;
+    }) => {
+      const mockTasks = setupParallelMockTasks(options.taskCount);
+      const previousCpuCount = process.env.CC_REVIEW_CPU_COUNT;
+      process.env.CC_REVIEW_CPU_COUNT = String(options.cpuCount);
+
+      try {
+        mockSpawnHandler = (command, args) => {
+          if (command === "codex") {
+            const mockProc = new MockChildProcess();
+            process.nextTick(() => {
+              if (args.includes("-o")) {
+                const outputPath = args[args.indexOf("-o") + 1];
+                fs.writeFileSync(outputPath, JSON.stringify({ tasks: mockTasks }), "utf8");
+              }
+              mockProc.emit("close", 0, null);
+            });
+            return mockProc;
+          }
+          return null;
+        };
+
+        const activeCalls: number[] = [];
+        let maxConcurrencyObserved = 0;
+
+        mockSubagentHandler = async () => {
+          activeCalls.push(1);
+          maxConcurrencyObserved = Math.max(maxConcurrencyObserved, activeCalls.length);
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          activeCalls.pop();
+          return {
+            content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+            details: { results: [{ exitCode: 0, model: "test-parallel-model" }] },
+          };
+        };
+
+        const params: any = {
+          goal: "Test automatic concurrency",
+          reviewMode: "after-all",
+        };
+        if (options.explicitConcurrencyLimit !== undefined) {
+          params.concurrencyLimit = options.explicitConcurrencyLimit;
+        }
+
+        const result = await registeredTool.execute(
+          "tool-call-auto-concurrency",
+          params,
+          undefined,
+          undefined,
+          { cwd: tempTestDir }
+        );
+
+        return { result, maxConcurrencyObserved };
+      } finally {
+        if (previousCpuCount === undefined) {
+          delete process.env.CC_REVIEW_CPU_COUNT;
+        } else {
+          process.env.CC_REVIEW_CPU_COUNT = previousCpuCount;
+        }
+      }
+    };
+
+    it("uses the automatic CPU-based concurrency when no limit is configured", async () => {
+      const { result, maxConcurrencyObserved } = await runAutoConcurrencyScenario({
+        cpuCount: 4,
+        taskCount: 6,
+      });
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.meta.concurrency, 4, "meta should report the automatic concurrency");
+      assert.match(result.content[0].text, /- \*Worker concurrency:\* 4/);
+      assert.equal(maxConcurrencyObserved, 4, "automatic concurrency should cap the observed parallelism");
+    });
+
+    it("honors an explicit concurrencyLimit over the automatic CPU-based value", async () => {
+      const { result, maxConcurrencyObserved } = await runAutoConcurrencyScenario({
+        cpuCount: 16,
+        taskCount: 4,
+        explicitConcurrencyLimit: 2,
+      });
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.meta.concurrency, 2, "meta should report the explicit limit");
+      assert.match(result.content[0].text, /- \*Worker concurrency:\* 2/);
+      assert.equal(maxConcurrencyObserved, 2, "explicit limit should cap concurrent execution");
+    });
+
+    it("clamps automatic concurrency to the lower boundary of 1", async () => {
+      const { result, maxConcurrencyObserved } = await runAutoConcurrencyScenario({
+        cpuCount: 0,
+        taskCount: 2,
+      });
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.meta.concurrency, 1, "meta should report the lower-bound concurrency");
+      assert.match(result.content[0].text, /- \*Worker concurrency:\* 1/);
+      assert.equal(maxConcurrencyObserved, 1, "zero CPUs must still execute at least one task at a time");
+    });
+
+    it("clamps automatic concurrency to the upper boundary of 8", async () => {
+      const { result, maxConcurrencyObserved } = await runAutoConcurrencyScenario({
+        cpuCount: 16,
+        taskCount: 8,
+      });
+      assert.equal(result.isError, undefined);
+      assert.equal(result.details.meta.concurrency, 8, "meta should report the upper-bound concurrency");
+      assert.match(result.content[0].text, /- \*Worker concurrency:\* 8/);
+      assert.equal(maxConcurrencyObserved, 8, "high CPU counts should be capped at the maximum concurrency");
+    });
+  });
+
   it("verifies parallel-safe subagent logs and status updates with stable run/subagent IDs", async () => {
     const mockTasks = [
       { title: "Parallel Task 1", description: "First job", acceptanceCriteria: "A is verified", dependsOn: [] },
@@ -4680,6 +5348,58 @@ System prompt override`
     assert.ok(foundTask1ModelInUI, "Task 1 model name should be rendered in UI");
     assert.ok(foundTask2ModelInUI, "Task 2 model name should be rendered in UI");
     assert.equal(foundUnknownModelWhileRunning, false, "Running tasks should not regress to Unknown model once a configured model exists");
+  });
+
+  it("reports the final worker concurrency in the summary and meta", async () => {
+    const mockTasks = [
+      { title: "Task 1", description: "Implement feature A", acceptanceCriteria: "A is verified" }
+    ];
+
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("-o")) {
+            fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+          }
+          mockProc.emit("close", 0, null);
+        });
+        return mockProc;
+      }
+      return null;
+    };
+
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] }
+    });
+
+    // Default auto concurrency: summary/meta contain a valid positive integer.
+    const autoResult = await registeredTool.execute(
+      "tool-call-concurrency-auto",
+      { goal: "Verify default concurrency is surfaced" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+    assert.equal(autoResult.isError, undefined);
+    assert.match(autoResult.content[0].text, /### ⚙️ Execution Configuration/);
+    assert.match(autoResult.content[0].text, /- \*Worker concurrency:\* \d+/);
+    assert.ok(Number.isInteger(autoResult.details?.meta?.concurrency), "meta.concurrency should be an integer");
+    assert.ok(autoResult.details?.meta?.concurrency >= 1, "meta.concurrency should be at least 1");
+    assert.ok(autoResult.details?.meta?.concurrency <= 8, "meta.concurrency should be capped at 8");
+
+    // Explicit concurrency overrides the default and is reflected in summary/meta.
+    const explicitResult = await registeredTool.execute(
+      "tool-call-concurrency-explicit",
+      { goal: "Verify explicit concurrency is respected", concurrency: 3 },
+      undefined,
+      undefined,
+      { cwd: tempTestDir }
+    );
+    assert.equal(explicitResult.isError, undefined);
+    assert.match(explicitResult.content[0].text, /- \*Worker concurrency:\* 3/);
+    assert.equal(explicitResult.details?.meta?.concurrency, 3);
   });
 });
 

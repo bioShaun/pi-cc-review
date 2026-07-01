@@ -216,3 +216,13 @@ test("buildSummaryMeta handles mixed-outcome aggregation correctly", () => {
   assert.equal(meta.taskOutcomes.cancelled, 1);
   assert.equal(meta.taskOutcomes.review_blocked, 1);
 });
+
+test("buildSummaryMeta propagates an optional concurrency value into the summary meta", () => {
+  const meta = buildSummaryMeta([{ status: "completed" as const }], { concurrency: 4 });
+  assert.equal(meta.concurrency, 4);
+});
+
+test("buildSummaryMeta leaves concurrency absent when no options are provided", () => {
+  const meta = buildSummaryMeta([{ status: "completed" as const }]);
+  assert.equal(meta.concurrency, undefined);
+});

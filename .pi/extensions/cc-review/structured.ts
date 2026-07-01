@@ -791,7 +791,10 @@ export function mergeRollupFindings(taskFindings: ReviewFinding[][]): ReviewFind
   return sortReviewFindings(taskFindings.flat());
 }
 
-export function buildSummaryMeta(taskResults: Array<{ status?: TaskStatus; reviewResult?: ReviewResult | null }>): CcReviewSummaryMeta {
+export function buildSummaryMeta(
+  taskResults: Array<{ status?: TaskStatus; reviewResult?: ReviewResult | null }>,
+  options?: { concurrency?: number }
+): CcReviewSummaryMeta {
   const taskOutcomes = { review_blocked: 0, failed: 0, warning: 0, completed: 0, cancelled: 0 };
   const blockers: ReviewFinding[] = [];
   for (const result of taskResults) {
@@ -811,7 +814,11 @@ export function buildSummaryMeta(taskResults: Array<{ status?: TaskStatus; revie
       }
     }
   }
-  return { taskOutcomes, topBlockers: sortReviewFindings(blockers).slice(0, 3) };
+  return {
+    taskOutcomes,
+    topBlockers: sortReviewFindings(blockers).slice(0, 3),
+    ...(options?.concurrency !== undefined ? { concurrency: options.concurrency } : {}),
+  };
 }
 
 export function isExecutionGateHaltError(message: string): boolean {

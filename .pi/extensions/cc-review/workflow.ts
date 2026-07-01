@@ -163,7 +163,7 @@ const CcReviewParams = {
     },
     logLevel: {
       type: "string",
-      description: "Optional minimum log severity for compact surfaces (widget + onUpdate). Supported values: debug, info, warning, error (aliases: warn, fatal). Omit to use CC_REVIEW_LOG_LEVEL or the default 'info'. Persisted workflow-logs.jsonl is never filtered.",
+      description: "Optional minimum log severity for compact surfaces (widget + onUpdate). Supported values: debug, info, warning, error (aliases: warn, fatal). Omit to use CC_REVIEW_LOG_LEVEL or the default 'info'. Persisted workflow logs are never filtered.",
     },
     logSources: {
       type: "string",
@@ -193,12 +193,16 @@ const CcReviewParams = {
     concurrency: {
       type: "integer",
       minimum: 1,
-      description: "Optional maximum number of concurrent subagent tasks. Omit to use CC_REVIEW_CONCURRENCY or the default 4.",
+      description: "Optional maximum number of concurrent subagent tasks. Omit to use CC_REVIEW_CONCURRENCY or the default automatically computed from the available CPUs (bounded between 1 and 8, capped by the planned task count).",
     },
     concurrencyLimit: {
       type: "integer",
       minimum: 1,
-      description: "Optional maximum number of concurrent subagent tasks. Omit to use CC_REVIEW_CONCURRENCY or the default 4.",
+      description: "Optional maximum number of concurrent subagent tasks. Omit to use CC_REVIEW_CONCURRENCY or the default automatically computed from the available CPUs (bounded between 1 and 8, capped by the planned task count).",
+    },
+    logFile: {
+      type: "string",
+      description: "Optional path for the persisted JSONL execution log. Relative paths are resolved against the workflow cwd; absolute paths are used as-is. When omitted, a unique workflow-logs-<runId>.jsonl file is created in the cwd, or CC_REVIEW_LOG_FILE is used if set.",
     },
   },
   required: ["goal"],
@@ -217,6 +221,7 @@ interface CcReviewExecuteParams {
   checklistWindow?: number;
   concurrency?: number;
   concurrencyLimit?: number;
+  logFile?: string;
 }
 
 interface ProcessResult {
@@ -1099,6 +1104,8 @@ import {
   resolveCcReviewLogSources,
   resolveCcReviewWidgetLogLines,
   resolveCcReviewChecklistWindow,
+  enterCcReviewWorkflowNest,
+  readAvailableCpuCount,
 } from "./config.ts";
 
 export * from "./config.ts";
@@ -1174,9 +1181,9 @@ export function summarizeLogSeverities(
 const WIDGET_MAX_WIDTH_DEFAULT = 96;
 const WIDGET_CHECKLIST_WINDOW = 8;
 const WIDGET_LIVE_LOG_LINES = 5;
-const WORKFLOW_LOG_FILE = "workflow-logs.jsonl";
 const WORKFLOW_LOG_MAX_LINES_DEFAULT = 2000;
 const WORKFLOW_LOG_TRUNCATE_KEEP = 1500;
+
 // Heartbeat interval for subprocess progress logging (P0-3). Emits a "still
 // running" log line at this cadence while any planner/reviewer subprocess is
 // active, so the user can distinguish a working-but-slow run from a hang.
@@ -1939,6 +1946,10 @@ export function appendPersistedLogEntry(
   const keepLines = options.keepLines ?? WORKFLOW_LOG_TRUNCATE_KEEP;
   const line = JSON.stringify(entry) + "\n";
   try {
+    const dir = path.dirname(state.filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
     fs.appendFileSync(state.filePath, line, "utf8");
   } catch {
     return state;
@@ -1964,6 +1975,40 @@ export function appendPersistedLogEntry(
   } catch {
     return { filePath: state.filePath, appendedLineCount: nextCount };
   }
+}
+
+export interface ResolveCcReviewLogPathOptions {
+  /** Working directory used to resolve relative paths. */
+  cwd: string;
+  /** Unique run identifier included in the generated file name. */
+  runId: string;
+  /** Explicit log file path from tool parameters / CLI flags. */
+  explicitLogFile?: string | undefined;
+  /** Optional environment override (e.g. process.env.CC_REVIEW_LOG_FILE). */
+  envLogFile?: string | undefined;
+}
+
+// Resolve the path for the persisted human-readable JSONL log.
+//
+// Precedence:
+//   1. explicitLogFile (tool/CLI flag)
+//   2. envLogFile (e.g. CC_REVIEW_LOG_FILE)
+//   3. Generated unique file in cwd: workflow-logs-<runId>.jsonl
+//
+// If the chosen explicit path is an existing directory, a unique file is
+// generated inside that directory so callers can configure a log directory
+// without specifying a full file name.
+export function resolveCcReviewLogPath(options: ResolveCcReviewLogPathOptions): string {
+  const cwd = options.cwd;
+  const logFile = options.explicitLogFile ?? options.envLogFile;
+  if (logFile) {
+    const resolved = path.isAbsolute(logFile) ? logFile : path.join(cwd, logFile);
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+      return path.join(resolved, `workflow-logs-${options.runId}.jsonl`);
+    }
+    return resolved;
+  }
+  return path.join(cwd, `workflow-logs-${options.runId}.jsonl`);
 }
 
 import {
@@ -2063,6 +2108,7 @@ interface RunCcReviewWorkflowOptions {
   validationCommands?: VerificationCommand[];
   concurrency?: number;
   concurrencyLimit?: number;
+  logFile?: string;
 }
 
 type SubagentToolExecutor = (
@@ -2230,7 +2276,7 @@ function extractCcReviewSummaryHeadline(summary: string): string {
 export default function ccReviewExtension(pi: ExtensionAPI) {
   // Register the slash command
   pi.registerCommand("cc-review", {
-    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to bound repair/re-review rounds (default 1; 0 disables; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout. Use --concurrency <n> or --concurrency-limit <n> (or CC_REVIEW_CONCURRENCY; default 4) to cap dependency-safe parallel subagents.",
+    description: "Run CC Review to plan, execute via Pi subagents, and review either per task or once after all tasks. Use --review-mode per-task|after-all to select review timing; when omitted, set CC_REVIEW_MODE or fall back to after-all. Use --review-repair-rounds <n> to bound repair/re-review rounds (default 1; 0 disables; CC_REVIEW_MAX_REPAIR_ROUNDS fallback). Use --provider claude or --provider codex to select the planner+reviewer backend; when omitted, set CC_REVIEW_PROVIDER or fall back to codex. Use --log-level <debug|info|warning|error> and --log-sources <planner,subagent,reviewer,cc-review> (or their CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES env fallbacks) to filter compact surfaces. Explicit values override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Use --task-timeout <ms> (or the CC_REVIEW_TASK_TIMEOUT_MS env fallback; default 1800000, 0 disables) to configure the per-attempt subagent execution timeout. Use --concurrency <n> or --concurrency-limit <n> (or CC_REVIEW_CONCURRENCY; default automatically computed from available CPUs, bounded between 1 and 8 and capped by the planned task count) to cap dependency-safe parallel subagents. Use --log-file <path> (or CC_REVIEW_LOG_FILE) to write the persisted JSONL log to a fixed path; when omitted, a unique workflow-logs-<runId>.jsonl file is created in the cwd.",
     handler: async (args: string, ctx: any) => {
       const parsedArgs = parseCcReviewCommandArgs(args);
       if (parsedArgs.error) {
@@ -2259,6 +2305,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           widgetLogLines: parsedArgs.widgetLogLines,
           checklistWindow: parsedArgs.checklistWindow,
           concurrency: parsedArgs.concurrency,
+          logFile: parsedArgs.logFile,
         });
         ctx?.ui?.notify?.("CC Review completed.", "info");
         
@@ -2295,7 +2342,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "cc_review",
     label: "CC Review",
-    description: "Run CC Review: plan a goal, execute tasks in dependency-safe after-all batches or per-task order, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to bound repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 1; 0 disables repair. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Explicit logSources override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default. Pass concurrency or concurrencyLimit as a positive integer, or omit to use CC_REVIEW_CONCURRENCY / the default 4.",
+    description: "Run CC Review: plan a goal, execute tasks in dependency-safe after-all batches or per-task order, then review/fix either per task or once after all tasks. Pass reviewMode as per-task or after-all, or omit it to use CC_REVIEW_MODE / the after-all default. Pass reviewRepairRounds as a non-negative integer to bound repair/re-review rounds, or omit it to use CC_REVIEW_MAX_REPAIR_ROUNDS / the default 1; 0 disables repair. Pass reviewProvider as codex or claude, or omit it to use CC_REVIEW_PROVIDER / the codex default. Pass logLevel as debug|info|warning|error and logSources as a comma-separated planner,subagent,reviewer,cc-review allow-list, or omit them to use CC_REVIEW_LOG_LEVEL / CC_REVIEW_LOG_SOURCES. Explicit logSources override the environment, invalid values show all sources with one warning, and persisted logs remain unfiltered. Pass taskTimeoutMs as a non-negative number of milliseconds (0 disables), or omit it to use CC_REVIEW_TASK_TIMEOUT_MS / the 1800000 (30 min) default. Pass concurrency or concurrencyLimit as a positive integer, or omit to use CC_REVIEW_CONCURRENCY / the default automatically computed from available CPUs (bounded between 1 and 8, capped by the planned task count). Pass logFile as a fixed log file path (or set CC_REVIEW_LOG_FILE); when omitted, a unique workflow-logs-<runId>.jsonl file is created in the cwd.",
     parameters: CcReviewParams,
     async execute(_toolCallId: string, params: CcReviewExecuteParams, signal?: AbortSignal, onUpdate?: (update: any) => void, ctx?: any) {
       const renderDetails = {
@@ -2320,6 +2367,7 @@ export default function ccReviewExtension(pi: ExtensionAPI) {
           checklistWindow: params.checklistWindow,
           concurrency: params.concurrency,
           concurrencyLimit: params.concurrencyLimit,
+          logFile: params.logFile,
         });
         return {
           content: [{ type: "text", text: workflowResult.summary }],
@@ -2483,7 +2531,7 @@ function splitCommandLine(input: string): string[] {
   return tokens;
 }
 
-export function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; logSources?: string; reviewMode?: string; reviewRepairRounds?: number; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; concurrency?: number; error?: string } {
+export function parseCcReviewCommandArgs(args: string): { goal: string; reviewProvider?: string; logLevel?: string; logSources?: string; reviewMode?: string; reviewRepairRounds?: number; taskTimeoutMs?: number; widgetLogLines?: number; checklistWindow?: number; concurrency?: number; logFile?: string; error?: string } {
   const hasProviderFlag = /(?:^|\s)--(?:review-)?provider(?:=|\s|$)/.test(args);
   const hasLogLevelFlag = /(?:^|\s)--log-level(?:=|\s|$)/.test(args);
   const hasLogSourcesFlag = /(?:^|\s)--log-sources(?:=|\s|$)/.test(args);
@@ -2493,7 +2541,8 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
   const hasWidgetLogLinesFlag = /(?:^|\s)--widget-log-lines(?:=|\s|$)/.test(args);
   const hasChecklistWindowFlag = /(?:^|\s)--checklist-window(?:=|\s|$)/.test(args);
   const hasConcurrencyFlag = /(?:^|\s)--(?:concurrency|concurrency-limit)(?:=|\s|$)/.test(args);
-  if (!hasProviderFlag && !hasLogLevelFlag && !hasLogSourcesFlag && !hasReviewModeFlag && !hasReviewRepairRoundsFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag && !hasConcurrencyFlag) {
+  const hasLogFileFlag = /(?:^|\s)--log-file(?:=|\s|$)/.test(args);
+  if (!hasProviderFlag && !hasLogLevelFlag && !hasLogSourcesFlag && !hasReviewModeFlag && !hasReviewRepairRoundsFlag && !hasTaskTimeoutFlag && !hasWidgetLogLinesFlag && !hasChecklistWindowFlag && !hasConcurrencyFlag && !hasLogFileFlag) {
     return { goal: args.trim() };
   }
 
@@ -2508,6 +2557,7 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
   let widgetLogLines: number | undefined;
   let checklistWindow: number | undefined;
   let concurrency: number | undefined;
+  let logFile: string | undefined;
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
@@ -2710,6 +2760,22 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
       continue;
     }
 
+    const equalsLogFileMatch = token.match(/^--log-file=(.*)$/);
+    if (equalsLogFileMatch) {
+      logFile = equalsLogFileMatch[1];
+      continue;
+    }
+
+    if (token === "--log-file") {
+      const value = tokens[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { goal: "", error: `Invalid ${token} value "${value ?? ""}". Expected a log file path.` };
+      }
+      logFile = value;
+      i++;
+      continue;
+    }
+
     goalTokens.push(token);
   }
 
@@ -2724,6 +2790,7 @@ export function parseCcReviewCommandArgs(args: string): { goal: string; reviewPr
     widgetLogLines,
     checklistWindow,
     concurrency,
+    logFile,
   };
 }
 
@@ -3145,11 +3212,19 @@ const BUILTIN_WORKER_PROMPT = [
   "- Do not consult or rely on external contract files (e.g. sprint-contract.json, eval-report.json). They may be left over from unrelated workflows.",
   "- Read only the files you need to understand the change; avoid speculative exploration.",
   "",
+  "Forbidden tools and patterns:",
+  "- NEVER invoke the cc_review tool or /cc-review slash command. You are already inside a CC Review worker; nested workflows cause runaway subprocess output and crash the orchestrator.",
+  "- Do not dogfood CC Review to verify your changes.",
+  "",
   "Process:",
   "1. Restate the task in one sentence (privately) and identify the smallest set of files to change.",
   "2. Make the change directly. Add or update focused tests covering the acceptance criteria when tests exist or are mentioned in the criteria.",
   "3. Verify the acceptance criteria before reporting completion (run targeted commands; do not run the whole test suite if a focused subset suffices).",
   "4. Reply with a one-paragraph summary: what changed, where, and how the criteria were verified.",
+  "",
+  "Verification:",
+  "- Prefer targeted checks, e.g. `node --test --test-name-pattern=\"your test name\" tests/...`.",
+  "- Do not run the full `node --test tests/cc-review-behavior.test.ts` suite unless the task explicitly requires it.",
   "",
   "Failure protocol:",
   "- If a step is genuinely blocked, reply with \"ERROR: <one-sentence reason>\" and stop.",
@@ -3700,7 +3775,7 @@ function formatTaskStatusText(taskResult: TaskResult): string {
   return `Completed with warnings (subagent exit ${taskResult.executionCode}, ${taskResult.reviewWarningName || "review"} exit ${taskResult.reviewCode})`;
 }
 
-function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task[]): string {
+function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task[], options?: { concurrency?: number }): string {
   const results = [...taskResults];
   for (let j = results.length; j < tasks.length; j++) {
     results.push({
@@ -3813,11 +3888,14 @@ function buildSummaryReport(goal: string, taskResults: TaskResult[], tasks: Task
     summaryMarkdown += `3. **Resume Execution**: Restart the workflow for remaining tasks after fixes.\n\n`;
   }
 
+  summaryMarkdown += `### ⚙️ Execution Configuration\n\n`;
+  summaryMarkdown += `- *Worker concurrency:* ${options?.concurrency ?? "auto"}\n\n`;
+
   return summaryMarkdown;
 }
 
-export function buildCcReviewSummaryMeta(taskResults: TaskResult[]): CcReviewSummaryMeta {
-  return buildSummaryMeta(taskResults);
+export function buildCcReviewSummaryMeta(taskResults: TaskResult[], options?: { concurrency?: number }): CcReviewSummaryMeta {
+  return buildSummaryMeta(taskResults, options);
 }
 
 export interface CcReviewWorkflowResult {
@@ -3836,6 +3914,7 @@ async function runCcReviewWorkflow(
   signal?: AbortSignal,
   options: RunCcReviewWorkflowOptions = {}
 ): Promise<CcReviewWorkflowResult> {
+  const exitCcReviewNest = enterCcReviewWorkflowNest(process.env);
   const reviewProviderConfig = resolveReviewProviderConfig(options.reviewProvider);
   const reviewMode = resolveReviewMode(options.reviewMode);
   const logLevelResolution = resolveCcReviewLogLevel({ flag: options.logLevel, env: process.env });
@@ -3866,8 +3945,9 @@ async function runCcReviewWorkflow(
   const concurrencyResolution = resolveCcReviewConcurrency({
     flag: options.concurrency ?? options.concurrencyLimit,
     env: process.env,
+    cpuCount: readAvailableCpuCount(process.env),
   });
-  const resolvedConcurrency = concurrencyResolution.concurrency;
+  let resolvedConcurrency = concurrencyResolution.concurrency;
 
   // Trace workflow start
   emitTrace(ctx, "workflow_start", {
@@ -3903,11 +3983,21 @@ async function runCcReviewWorkflow(
   const liveLogs: CcReviewLogEntry[] = [];
   let logSequence = 0;
 
+  const workflowRunId = generateWorkflowRunId();
   const workflowCwd: string = ctx?.cwd || process.cwd();
   const workerAgent = discoverAgent("worker", "both", workflowCwd);
   const resolvedWorkerModel = workerAgent?.model;
+
+  // Resolve explicit or automatic unique log path
+  const logFilePath = resolveCcReviewLogPath({
+    cwd: workflowCwd,
+    runId: workflowRunId,
+    explicitLogFile: options.logFile,
+    envLogFile: process.env.CC_REVIEW_LOG_FILE,
+  });
+
   let persistedLogState: PersistedLogState = {
-    filePath: path.join(workflowCwd, WORKFLOW_LOG_FILE),
+    filePath: logFilePath,
     appendedLineCount: 0,
   };
   // Preserve prior run history: do NOT truncate the persisted log at workflow
@@ -3915,8 +4005,6 @@ async function runCcReviewWorkflow(
   // post-mortem visibility. A run-boundary entry is emitted as the first log
   // line (below, after the log function is defined) so individual runs remain
   // separable in the accumulated file.
-
-  const workflowRunId = generateWorkflowRunId();
   let verificationPlan: VerificationPlan | null = null;
   let findingsRollup = emptyFindingsRollup();
   const taskStatuses: Array<TaskStatus | "running" | undefined> = [];
@@ -4528,7 +4616,7 @@ async function runCcReviewWorkflow(
       throw new WorkflowError(
         verificationPlanLoad.error,
         verificationPlanLoad.error,
-        buildCcReviewSummaryMeta(taskResults)
+        buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency })
       );
     }
     verificationPlan = verificationPlanLoad.plan;
@@ -4787,6 +4875,23 @@ async function runCcReviewWorkflow(
     }
 
     setPlannedTasks(tasks);
+
+    // If the concurrency was automatically resolved, adjust it based on the actual planned tasks count
+    if (concurrencyResolution.source === "default") {
+      resolvedConcurrency = resolveCcReviewConcurrency({
+        flag: options.concurrency ?? options.concurrencyLimit,
+        env: process.env,
+        cpuCount: readAvailableCpuCount(process.env),
+        taskCount: tasks.length,
+      }).concurrency;
+    }
+
+    emitTrace(ctx, "execution_config", {
+      concurrency: resolvedConcurrency,
+      concurrencySource: concurrencyResolution.source,
+      taskCount: tasks.length,
+      cpuCount: readAvailableCpuCount(process.env),
+    });
 
     // PHASE 2: Task Execution Loop
     if (reviewMode === "after-all") {
@@ -5734,13 +5839,13 @@ async function runCcReviewWorkflow(
           // Exhausted repair rounds → hard-fail (P1-1).
           log(`[Workflow Halted] Blocked by reviewer after ${maxReviewRepairRounds} repair round(s) on: "${task.title}".`);
           const summary = appendPersistedLogPathToSummary(
-            buildSummaryReport(goal, taskResults, tasks),
+            buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }),
             persistedLogState.filePath
           );
           throw new WorkflowError(
             `Blocked by reviewer on: "${task.title}" (after ${maxReviewRepairRounds} repair round(s))`,
             summary,
-            buildCcReviewSummaryMeta(taskResults)
+            buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency })
           );
         }
         // Build repair feedback from the reviewer's findings and re-execute +
@@ -6018,13 +6123,13 @@ async function runCcReviewWorkflow(
       if (effectiveVerdict === "block") {
         log(`[Workflow Halted] Final workflow review remained blocked after ${maxReviewRepairRounds} repair round(s).`);
         const summary = appendPersistedLogPathToSummary(
-          buildSummaryReport(goal, taskResults, tasks),
+          buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }),
           persistedLogState.filePath
         );
         throw new WorkflowError(
           `Blocked by final workflow review (after ${maxReviewRepairRounds} repair round(s))`,
           summary,
-          buildCcReviewSummaryMeta(taskResults)
+          buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency })
         );
       }
       break BATCH_REPAIR_LOOP;
@@ -6067,8 +6172,8 @@ async function runCcReviewWorkflow(
     });
 
     return {
-      summary: appendPersistedLogPathToSummary(buildSummaryReport(goal, taskResults, tasks), persistedLogState.filePath),
-      meta: buildCcReviewSummaryMeta(taskResults),
+      summary: appendPersistedLogPathToSummary(buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }), persistedLogState.filePath),
+      meta: buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency }),
     };
   } catch (err: any) {
     emitTrace(ctx, "failure", { error: err.message });
@@ -6118,7 +6223,7 @@ async function runCcReviewWorkflow(
 
     if (err instanceof WorkflowError) {
       failWorkflow();
-      err.meta ??= buildCcReviewSummaryMeta(taskResults);
+      err.meta ??= buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency });
       refreshWorkflowUi();
       throw err;
     }
@@ -6146,12 +6251,13 @@ async function runCcReviewWorkflow(
     }
 
     const summary = appendPersistedLogPathToSummary(
-      buildSummaryReport(goal, taskResults, tasks),
+      buildSummaryReport(goal, taskResults, tasks, { concurrency: resolvedConcurrency }),
       persistedLogState.filePath
     );
     refreshWorkflowUi();
-    throw new WorkflowError(err.message, summary, buildCcReviewSummaryMeta(taskResults));
+    throw new WorkflowError(err.message, summary, buildCcReviewSummaryMeta(taskResults, { concurrency: resolvedConcurrency }));
   } finally {
+    exitCcReviewNest();
     // Clean up temporary files
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });

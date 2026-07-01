@@ -29,6 +29,24 @@ test("subprocess runner handles spawn errors and cancellation", () => {
   assert.match(source, /throw new Error\("Workflow aborted by user"\)/);
 });
 
+test("subprocess runner caps stream output and skips stdout retention when line parsing", () => {
+  assert.match(source, /SUBPROCESS_OUTPUT_TRUNCATED_MARKER/);
+  assert.match(source, /resolveSubprocessStreamMaxBytes/);
+  assert.match(source, /retainStdoutBuffer = !onStdoutLine/);
+  assert.match(source, /appendStreamText\(/);
+});
+
+test("cc_review rejects nested workflow invocation", () => {
+  assert.match(source, /enterCcReviewWorkflowNest/);
+  assert.match(source, /CC_REVIEW_NEST_DEPTH/);
+  assert.match(source, /Nested invocation is blocked/);
+});
+
+test("built-in worker forbids cc_review dogfooding and full-suite runs", () => {
+  assert.match(source, /NEVER invoke the cc_review tool/);
+  assert.match(source, /test-name-pattern/);
+});
+
 test("slash command notifications tolerate headless contexts", () => {
   assert.doesNotMatch(source, /ctx\.ui\.notify/);
   assert.match(source, /ctx\?\.ui\?\.notify\?\./);
@@ -188,7 +206,7 @@ test("review provider configuration is typed, validated, and defaults to Codex",
   assert.match(source, /rawProvider\.trim\(\)\.toLowerCase\(\)/);
   assert.match(source, /Invalid \$\{providerSource\} value/);
   assert.match(source, /Supported review providers: \$\{SUPPORTED_REVIEW_PROVIDERS\.join\(", "\)\}/);
-  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; logSources\?: string; reviewMode\?: string; reviewRepairRounds\?: number; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?(?:concurrency\?: number; )?error\?: string \}/);
+  assert.match(source, /function parseCcReviewCommandArgs\(args: string\): \{ goal: string; reviewProvider\?: string; logLevel\?: string; logSources\?: string; reviewMode\?: string; reviewRepairRounds\?: number; taskTimeoutMs\?: number; (?:widgetLogLines\?: number; )?(?:checklistWindow\?: number; )?(?:concurrency\?: number; )?(?:logFile\?: string; )?error\?: string \}/);
   assert.match(source, /--\(\?:review-\)\?provider/);
   assert.match(source, /reviewProvider: params\.reviewProvider/);
   assert.match(source, /reviewProvider: parsedArgs\.reviewProvider/);
@@ -668,7 +686,7 @@ test("log-level and log-sources resolvers are exported with the documented signa
   assert.match(source, /logSources:\s*\{\s*\n\s+type: "string",\s*\n\s+description: "Optional comma-separated list of compact-surface log sources/);
   assert.match(
     source,
-    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?(?:\s+concurrency\?: number;\n)?(?:\s+concurrencyLimit\?: number;\n)?\}/
+    /interface CcReviewExecuteParams \{\n\s+goal: string;\n\s+reviewProvider\?: string;\n\s+logLevel\?: string;\n\s+logSources\?: string;\n\s+reviewMode\?: string;\n\s+reviewRepairRounds\?: number;\n\s+taskTimeoutMs\?: number;\n(?:\s+widgetLogLines\?: number;\n)?(?:\s+checklistWindow\?: number;\n)?(?:\s+concurrency\?: number;\n)?(?:\s+concurrencyLimit\?: number;\n)?(?:\s+logFile\?: string;\n)?\}/
   );
   assert.match(
     source,
@@ -788,8 +806,8 @@ test("workflow handles partial results and surfaces unresolved items determinist
   assert.match(source, /allUnresolved\.push\(`Task Failed: "\$\{taskResult\.title\}" - Error: Subagent exited with code \$\{taskResult\.executionCode\}`\)/);
   assert.match(source, /allUnresolved\.push\(`Task Validation Failed: "\$\{taskResult\.title\}" - Reason: \$\{taskResult\.validationError\}`\)/);
   assert.match(source, /if \(err instanceof WorkflowError\)/);
-  assert.match(source, /const summary = appendPersistedLogPathToSummary\(\s*\n?\s*buildSummaryReport\(goal, taskResults, tasks\),/);
-  assert.match(source, /throw new WorkflowError\(err\.message, summary, buildCcReviewSummaryMeta\(taskResults\)\);/);
+  assert.match(source, /const summary = appendPersistedLogPathToSummary\(\s*\n?\s*buildSummaryReport\(goal, taskResults, tasks(?:,\s*\{[^}]*\})?\),/);
+  assert.match(source, /throw new WorkflowError\(err\.message, summary, buildCcReviewSummaryMeta\(taskResults(?:,\s*\{[^}]*\})?\)\);/);
 });
 
 test("subagent failures are retried with structured feedback instead of thrown immediately", () => {
@@ -866,7 +884,7 @@ test("regression test for successful multi-step execution", () => {
   // tests. Source-grep locks removed so execution pipeline can be deduped (#2).
   assert.match(source, /for\s*\(let\s+i\s*=\s*0;\s*i\s*<\s*tasks\.length;\s*i\+\+\)/);
   assert.match(source, /recordTaskResult\(\{/);
-  assert.match(source, /buildSummaryReport\(goal, taskResults, tasks\)/);
+  assert.match(source, /buildSummaryReport\(goal, taskResults, tasks(?:,\s*\{[^}]*\})?\)/);
 });
 
 test("regression test for subagent failure", () => {

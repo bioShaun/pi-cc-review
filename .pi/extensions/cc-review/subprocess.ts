@@ -41,6 +41,8 @@ export interface SubprocessResult {
   timedOut: boolean;
   aborted: boolean;
   spawnError: Error | null;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
 }
 
 export interface RunSubprocessOptions {
@@ -56,6 +58,63 @@ export interface RunSubprocessOptions {
   onStdoutLine?: (line: string) => void;
   registerProc?: (proc: import("child_process").ChildProcess) => (() => void) | undefined;
   abortMode?: "external" | "internal";
+  /** Override CC_REVIEW_SUBPROCESS_OUTPUT_MAX_BYTES for this invocation. */
+  maxStreamBytes?: number;
+}
+
+export const SUBPROCESS_OUTPUT_TRUNCATED_MARKER =
+  "\n[cc-review: subprocess output truncated; further output was discarded]\n";
+export const DEFAULT_SUBPROCESS_STREAM_MAX_BYTES = 32 * 1024 * 1024;
+
+export function resolveSubprocessStreamMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CC_REVIEW_SUBPROCESS_OUTPUT_MAX_BYTES;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(String(raw).trim());
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_SUBPROCESS_STREAM_MAX_BYTES;
+}
+
+interface StreamAppendState {
+  bytes: number;
+  truncated: boolean;
+  maxBytes: number;
+}
+
+function createStreamAppendState(maxBytes: number): StreamAppendState {
+  return { bytes: 0, truncated: false, maxBytes };
+}
+
+export function appendStreamText(
+  existing: string,
+  chunk: string,
+  state: StreamAppendState
+): string {
+  if (state.truncated || state.bytes >= state.maxBytes) {
+    state.truncated = true;
+    if (!existing.includes(SUBPROCESS_OUTPUT_TRUNCATED_MARKER.trim())) {
+      return existing + SUBPROCESS_OUTPUT_TRUNCATED_MARKER;
+    }
+    return existing;
+  }
+
+  const chunkBytes = Buffer.byteLength(chunk, "utf8");
+  const remaining = state.maxBytes - state.bytes;
+  if (chunkBytes <= remaining) {
+    state.bytes += chunkBytes;
+    return existing + chunk;
+  }
+
+  state.truncated = true;
+  const partial = Buffer.from(chunk, "utf8").subarray(0, remaining).toString("utf8");
+  state.bytes = state.maxBytes;
+  let result = existing + partial;
+  if (!result.includes(SUBPROCESS_OUTPUT_TRUNCATED_MARKER.trim())) {
+    result += SUBPROCESS_OUTPUT_TRUNCATED_MARKER;
+  }
+  return result;
 }
 
 const SUBPROCESS_KILL_GRACE_MS = 500;
@@ -87,6 +146,7 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
     label, command, args, cwd, timeoutMs, signal, traceCtx,
     onStdoutChunk, onStderrChunk, onStdoutLine, registerProc,
     abortMode = "external",
+    maxStreamBytes,
   } = opts;
 
   if (traceCtx) emitTrace(traceCtx, "tool_execution_start", { label, command, source: "subprocess" });
@@ -102,6 +162,14 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
   let unregister: (() => void) | undefined;
   if (registerProc) unregister = registerProc(proc);
 
+  const streamMaxBytes = maxStreamBytes ?? resolveSubprocessStreamMaxBytes();
+  const stdoutStoreState = createStreamAppendState(streamMaxBytes);
+  const stderrStoreState = createStreamAppendState(streamMaxBytes);
+  const stdoutLineState = createStreamAppendState(streamMaxBytes);
+  const combinedStdoutState = createStreamAppendState(streamMaxBytes);
+  const combinedStderrState = createStreamAppendState(streamMaxBytes);
+  const retainStdoutBuffer = !onStdoutLine;
+
   let stdoutBuf = "";
   let stderrBuf = "";
   let combined = "";
@@ -115,31 +183,56 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
   let resolvedSignal: string | null = null;
 
   const finalize = (): SubprocessResult => ({
-    code: resolvedCode, signal: resolvedSignal,
-    stdout: stdoutBuf, stderr: stderrBuf, combinedOutput: combined,
-    timedOut, aborted, spawnError,
+    code: resolvedCode,
+    signal: resolvedSignal,
+    stdout: stdoutBuf,
+    stderr: stderrBuf,
+    combinedOutput: combined,
+    timedOut,
+    aborted,
+    spawnError,
+    stdoutTruncated: retainStdoutBuffer ? stdoutStoreState.truncated : stdoutLineState.truncated,
+    stderrTruncated: stderrStoreState.truncated,
   });
 
   proc.stdout?.on("data", (chunk: Buffer) => {
     const text = chunk.toString("utf-8");
-    stdoutBuf += text;
-    combined += text;
-    if (onStdoutChunk) { try { onStdoutChunk(chunk); } catch { /* ignore */ } }
+    if (onStdoutChunk) {
+      try {
+        onStdoutChunk(chunk);
+      } catch {
+        // ignore
+      }
+    }
     if (onStdoutLine) {
-      stdoutLineRem += text;
+      stdoutLineRem = appendStreamText(stdoutLineRem, text, stdoutLineState);
       let nl: number;
       while ((nl = stdoutLineRem.indexOf("\n")) !== -1) {
         const line = stdoutLineRem.slice(0, nl);
         stdoutLineRem = stdoutLineRem.slice(nl + 1);
-        try { onStdoutLine(line); } catch { /* ignore */ }
+        try {
+          onStdoutLine(line);
+        } catch {
+          // ignore
+        }
       }
+    }
+    if (retainStdoutBuffer) {
+      stdoutBuf = appendStreamText(stdoutBuf, text, stdoutStoreState);
+      combined = appendStreamText(combined, text, combinedStdoutState);
     }
   });
   proc.stderr?.on("data", (chunk: Buffer) => {
     const text = chunk.toString("utf-8");
-    stderrBuf += text;
-    combined += text;
-    if (onStderrChunk) { try { onStderrChunk(chunk); } catch { /* ignore */ } }
+    stderrBuf = appendStreamText(stderrBuf, text, stderrStoreState);
+    combined = appendStreamText(combined, text, combinedStderrState);
+    if (onStderrChunk) {
+      try {
+        onStderrChunk(chunk);
+      } catch {
+        // ignore
+      }
+    }
   });
 
   if (timeoutMs) {
@@ -164,7 +257,8 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
     proc.on("error", (err: Error) => {
       if (settled) return;
       spawnError = err;
-      stderrBuf += `\n[spawn error] ${err.message}`;
+      stderrBuf = appendStreamText(stderrBuf, `\n[spawn error] ${err.message}`, stderrStoreState);
+      combined = appendStreamText(combined, `\n[spawn error] ${err.message}`, combinedStderrState);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (abortMode === "internal" && signal) signal.removeEventListener("abort", onAbortInternal);
       if (traceCtx) emitTrace(traceCtx, "failure", { phase: "subprocess_start", label, command, error: err.message });
@@ -181,7 +275,11 @@ export async function runSubprocess(opts: RunSubprocessOptions): Promise<Subproc
       if (abortMode === "internal" && signal) signal.removeEventListener("abort", onAbortInternal);
 
       if (onStdoutLine && stdoutLineRem.length > 0) {
-        try { onStdoutLine(stdoutLineRem); } catch { /* ignore */ }
+        try {
+          onStdoutLine(stdoutLineRem);
+        } catch {
+          // ignore
+        }
         stdoutLineRem = "";
       }
 
