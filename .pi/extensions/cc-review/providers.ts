@@ -139,6 +139,7 @@ function buildClaudeReviewArgs(
     // the user sees nothing for the entire review duration. The final text is
     // recovered from the stream via extractAssistantTextFromStream.
     "--output-format", "stream-json",
+    "--include-partial-messages",
     "--verbose",
   ];
   const model = readTrimmedEnv(env, "CLAUDE_MODEL");

@@ -1120,6 +1120,14 @@ describe("extractAssistantTextFromStream (P0-3: stream-json parsing)", () => {
     assert.equal(extractAssistantTextFromStream(stream), "Hello world");
   });
 
+  it("accumulates text deltas from claude partial stream events", () => {
+    const stream = [
+      JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello " } } }),
+      JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "world" } } }),
+    ].join("\n");
+    assert.equal(extractAssistantTextFromStream(stream), "Hello world");
+  });
+
   it("returns original text when no stream events are found (plain text fallback)", () => {
     const plain = "Review complete\n" + JSON.stringify({ verdict: "ship", summary: "ok", findings: [] });
     assert.equal(extractAssistantTextFromStream(plain), plain);

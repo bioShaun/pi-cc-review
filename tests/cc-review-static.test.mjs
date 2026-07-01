@@ -309,6 +309,7 @@ test("Claude review subprocess integration uses workspace-capable Claude Code", 
   assert.match(source, /runReviewerProcess\(\n\s+reviewProviderConfig\.label,\n\s+reviewProviderConfig\.command,\n\s+reviewArgs/);
   // P0-3: claude planner+reviewer stream NDJSON for live observability.
   assert.match(source, /"--output-format", "stream-json"/);
+  assert.match(source, /"--include-partial-messages"/);
   assert.match(source, /"--verbose"/);
   // P0-3: codex planner+reviewer stream JSONL for live observability.
   assert.match(source, /"--json"/);
