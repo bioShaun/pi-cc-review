@@ -34,7 +34,10 @@ export type CcReviewLogStructuredInput = Partial<Omit<CcReviewLogEntry, "severit
   severity?: CcReviewLogSeverity | string;
 };
 
-export type CcReviewLogInput = string | CcReviewLogStructuredInput;
+/** @deprecated Use CcReviewLogStructuredInput */
+export type CcReviewStructuredLogInput = CcReviewLogStructuredInput;
+
+export type CcReviewLogInput = string | CcReviewStructuredLogInput;
 
 export interface SubagentResult {
   code: number;
@@ -149,4 +152,11 @@ export type SubagentToolExecutor = (
 export interface CcReviewWorkflowResult {
   summary: string;
   meta: CcReviewSummaryMeta;
+}
+
+export interface ExtensionAPI {
+  registerCommand(name: string, config: unknown): void;
+  registerTool(config: unknown): void;
+  registerMessageRenderer?(customType: string, renderer: unknown): void;
+  sendMessage?(message: unknown): Promise<void>;
 }

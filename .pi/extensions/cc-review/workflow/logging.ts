@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { formatSubprocessStreamLineRich, inferSubprocessStreamSeverity } from "../subprocess.ts";
+import { formatSubprocessStreamLineRich, inferSubprocessStreamSeverity } from "./stream-format.ts";
 import type { CcReviewLogEntry, CcReviewLogInput, SubprocessProvider } from "./types.ts";
 
 const WORKFLOW_LOG_MAX_LINES_DEFAULT = 2000;
