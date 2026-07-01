@@ -2,7 +2,6 @@ import {
   parseSubagentStructuredReport,
   validateStructuredSubagentReport,
   type SchemaParseStatus,
-  type SubagentStructuredReport,
 } from "../structured.ts";
 import type { Task } from "./dependencies.ts";
 import type { SubagentToolResult, SubagentValidation } from "./types.ts";

@@ -1,17 +1,13 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createRequire } from "node:module";
 
 import type { Task } from "./dependencies.ts";
 import type { SubagentStructuredReport, TaskStatus, ReviewVerdict } from "../structured.ts";
 import type { SubagentToolExecutor, SubagentToolResult, TaskResult, ExtensionAPI } from "./types.ts";
-import { delay, isTransientError, stripAnsi } from "./util.ts";
+import { stripAnsi } from "./util.ts";
 import { runSubprocess } from "../subprocess.ts";
 import { clipSubprocessLogText } from "./stream-format.ts";
-
-const require = createRequire(import.meta.url);
-const childProcess = require("node:child_process") as typeof import("node:child_process");
 
 // Helper to summarize the parent workflow goal/context rather than copying wholesale
 export function summarizeParentContext(goal: string): string {

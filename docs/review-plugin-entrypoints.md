@@ -4,7 +4,7 @@ This is a historical implementation note from the inspection story that preceded
 
 ## Current review execution entry points
 
-- Extension module: `.pi/extensions/cc-review.ts` exports `ccReviewExtension(pi)`.
+- Extension entry point: `.pi/extensions/cc-review.ts` re-exports `ccReviewExtension(pi)` from the modular tree `.pi/extensions/cc-review/`.
 - User-facing triggers:
   - Slash command registration: `pi.registerCommand("cc-review", ...)`; the handler parses provider, log-level, and `--review-mode` flags before calling `runCcReviewWorkflow(...)`.
   - Tool registration: `pi.registerTool({ name: "cc_review", label: "CC Review", ... })`; `execute(...)` forwards `reviewProvider`, `logLevel`, and `reviewMode`.
@@ -33,28 +33,28 @@ This is a historical implementation note from the inspection story that preceded
 This section has been updated from the original inspection note; the explicit provider option is now implemented in runtime behavior.
 
 - **CLI/user parameters**:
-  - `.pi/extensions/cc-review.ts` `CcReviewParams` accepts required `goal` plus optional `reviewProvider` with supported values `codex` and `claude`, so API/tool callers can pass a review provider explicitly without setting environment variables.
-  - `.pi/extensions/cc-review.ts` `pi.registerTool(...).execute(...)` forwards `params.goal` and `params.reviewProvider` into `runCcReviewWorkflow(pi, params.goal, ctx, onUpdate, signal, { reviewProvider: params.reviewProvider })`.
-  - `.pi/extensions/cc-review.ts` `pi.registerCommand("cc-review", ...)` parses optional `--provider <value>`, `--provider=<value>`, `--review-provider <value>`, or `--review-provider=<value>` flags before treating the remaining slash command argument string as the goal text, then calls `runCcReviewWorkflow(pi, goal, ctx, undefined, undefined, { reviewProvider })`.
+  - `.pi/extensions/cc-review/workflow/types.ts` `CcReviewParams` accepts required `goal` plus optional `reviewProvider` with supported values `codex` and `claude`, so API/tool callers can pass a review provider explicitly without setting environment variables.
+  - `.pi/extensions/cc-review/workflow.ts` `pi.registerTool(...).execute(...)` forwards `params.goal` and `params.reviewProvider` into `runCcReviewWorkflow(pi, params.goal, ctx, onUpdate, signal, { reviewProvider: params.reviewProvider })`.
+  - `.pi/extensions/cc-review/workflow.ts` `pi.registerCommand("cc-review", ...)` parses optional `--provider <value>`, `--provider=<value>`, `--review-provider <value>`, or `--review-provider=<value>` flags before treating the remaining slash command argument string as the goal text, then calls `runCcReviewWorkflow(pi, goal, ctx, undefined, undefined, { reviewProvider })`.
   - Existing invocations without the option still work unchanged: `/cc-review <goal>` treats the full argument string as the goal, and `cc_review` tool calls that provide only `goal` still use environment/default behavior.
 - **Environment variables**:
-  - `.pi/extensions/cc-review.ts` `resolveReviewProviderConfig(explicitProvider, env = process.env)` is the sole review-provider defaulting and validation point. It uses an explicit `reviewProvider`/slash flag value first, otherwise reads `env.CC_REVIEW_PROVIDER`, returns Codex when neither source is set, normalizes configured values with `trim().toLowerCase()`, accepts only `codex` and `claude`, throws `Invalid reviewProvider` or `Invalid CC_REVIEW_PROVIDER` for empty, whitespace-only, or unsupported values, and then calls `initializeSelectedReviewBackend(normalizedProvider, env)`.
-  - `.pi/extensions/cc-review.ts` `initializeSelectedReviewBackend(...)` dispatches to `REVIEW_BACKEND_FACTORIES[provider].initialize(env)`, so only the normalized selected backend is constructed. No credential preflight occurs; auth is delegated to the chosen CLI subprocess.
-  - `.pi/extensions/cc-review.ts` `buildCodexReviewArgs(task, env = process.env)` separately reads `CODEX_MODEL` only for Codex review, and `.pi/extensions/cc-review.ts` `buildClaudeReviewArgs(task, env = process.env)` separately reads `CLAUDE_MODEL` only for Claude review.
+  - `.pi/extensions/cc-review/providers.ts` `resolveReviewProviderConfig(explicitProvider, env = process.env)` is the sole review-provider defaulting and validation point. It uses an explicit `reviewProvider`/slash flag value first, otherwise reads `env.CC_REVIEW_PROVIDER`, returns Codex when neither source is set, normalizes configured values with `trim().toLowerCase()`, accepts only `codex` and `claude`, throws `Invalid reviewProvider` or `Invalid CC_REVIEW_PROVIDER` for empty, whitespace-only, or unsupported values, and then calls `initializeSelectedReviewBackend(normalizedProvider, env)`.
+  - `.pi/extensions/cc-review/providers.ts` `initializeSelectedReviewBackend(...)` dispatches to `REVIEW_BACKEND_FACTORIES[provider].initialize(env)`, so only the normalized selected backend is constructed. No credential preflight occurs; auth is delegated to the chosen CLI subprocess.
+  - `.pi/extensions/cc-review/providers.ts` `buildCodexReviewArgs(task, env = process.env)` separately reads `CODEX_MODEL` only for Codex review, and `buildClaudeReviewArgs(task, env = process.env)` separately reads `CLAUDE_MODEL` only for Claude review.
 - **Config files**:
   - There is no package manifest, extension manifest, project config, or settings file in this repository that selects Codex vs Claude for review.
-  - `.pi/extensions/cc-review.ts` `applyAgentModelOverride(...)` reads `~/.pi/agent/settings.json` for the `worker` subagent model, and `discoverAgent(...)` can read `<cwd>/.pi/agents` or `~/.pi/agent/agents`; these affect task execution subagents, not planner/reviewer provider selection.
+  - `.pi/extensions/cc-review/workflow/execution.ts` `applyAgentModelOverride(...)` reads `~/.pi/agent/settings.json` for the `worker` subagent model, and `discoverAgent(...)` can read `<cwd>/.pi/agents` or `~/.pi/agent/agents`; these affect task execution subagents, not planner/reviewer provider selection.
 - **Runtime client/subprocess initialization**:
-  - `.pi/extensions/cc-review.ts` `runCcReviewWorkflow(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start, before planning, so invalid explicit/environment provider values fail before planner or reviewer subprocesses are spawned. Credential/auth problems surface later from the CLI subprocess itself (recorded as `completed_with_warnings`).
+  - `.pi/extensions/cc-review/workflow/orchestrator/runtime.ts` `createWorkflowRuntime(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start, before planning, so invalid explicit/environment provider values fail before planner or reviewer subprocesses are spawned. Credential/auth problems surface later from the CLI subprocess itself (recorded as `completed_with_warnings`).
   - Planning uses the normalized provider: Codex writes schema-constrained output to a temporary file, while Claude returns JSON on stdout.
-  - Review uses `.pi/extensions/cc-review.ts` `REVIEW_BACKEND_FACTORIES` and `reviewProviderConfig.buildArgs({ task })`. In `per-task` mode this runs after every task; in `after-all` mode it runs once with the overall goal and every task's acceptance criteria.
-  - `.pi/extensions/cc-review.ts` `runProcess(reviewProviderConfig.label, reviewProviderConfig.command, reviewArgs, ...)` is the shared subprocess launcher for both reviewers and is responsible for cwd, environment inheritance, detached process groups, tracing, timeout handling, and spawn/exit errors.
+  - Review uses `.pi/extensions/cc-review/providers.ts` `REVIEW_BACKEND_FACTORIES` and `reviewProviderConfig.buildArgs({ task })`. In `per-task` mode this runs after every task; in `after-all` mode it runs once with the overall goal and every task's acceptance criteria.
+  - `.pi/extensions/cc-review/workflow/orchestrator/runtime.ts` `rt.runProcess(reviewProviderConfig.label, reviewProviderConfig.command, reviewArgs, ...)` is the shared subprocess launcher for both reviewers and is responsible for cwd, environment inheritance, detached process groups, tracing, timeout handling, and spawn/exit errors.
 
 The explicit provider and review-timing insertion points are implemented through `reviewProvider` and `reviewMode`, with `CC_REVIEW_PROVIDER` and `CC_REVIEW_MODE` environment fallbacks.
 
 ## Current plugin naming surfaces
 
-- File path/name: `.pi/extensions/cc-review.ts`.
+- File path/name: `.pi/extensions/cc-review.ts` (entry point re-exporting from `.pi/extensions/cc-review/`).
 - Exported function: `ccReviewExtension`.
 - Params schema symbol: `CcReviewParams`.
 - Main workflow function: `runCcReviewWorkflow`.
@@ -86,7 +86,7 @@ No compatibility aliases were kept because this workspace has no manifest, packa
 ## Manifests, package config, and CI
 
 - No package.json was found in the workspace.
-- No extension manifest file was found under `.pi/` beyond `.pi/extensions/cc-review.ts`.
+- No extension manifest file was found under `.pi/` beyond the `.pi/extensions/cc-review.ts` entry point and its modular `.pi/extensions/cc-review/` tree.
 - No CI configuration was found: no `.github/`, workflow YAML, or other CI files appeared in the repository file scan.
 
 ## Existing tests and missing coverage

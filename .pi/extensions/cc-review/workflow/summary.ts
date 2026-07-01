@@ -6,7 +6,6 @@ import type { Task } from "./dependencies.ts";
 import { formatResumeInstructions } from "./checkpoint.ts";
 import { summarizeValidationParseFailures } from "./validation.ts";
 import type { TaskResult } from "./types.ts";
-import { truncateForWidget } from "./ui.ts";
 import type { TaskModelState } from "./ui.ts";
 
 export interface CcReviewTaskOutcomeCounts {

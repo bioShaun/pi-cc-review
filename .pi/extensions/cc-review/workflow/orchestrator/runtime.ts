@@ -1,19 +1,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createRequire } from "node:module";
 
 import {
-  type BlockReason,
   type CcReviewFindingsPayload,
   type CcReviewFindingsRollup,
   type ReviewFinding,
-  type ReviewResult,
   type SubagentStructuredReport,
   type TaskArtifact,
   type TaskStatus,
   type VerificationPlan,
-  WORKFLOW_ARTIFACT_DIR,
   generateWorkflowRunId,
   getArtifactRunDir,
   writeTaskArtifact,
@@ -61,12 +57,9 @@ import {
   mergeTaskResultIntoStateBuffer,
   persistStateBuffer,
 } from "../session.ts";
-import { runPreflight, shouldSkipPreflight, formatPreflightReport } from "../preflight.ts";
 import {
   type BatchTaskExecution,
-  type CcReviewWorkflowResult,
   type RunCcReviewWorkflowOptions,
-  type SubagentResult,
   type TaskResult,
   WorkflowError,
   type CcReviewLogEntry,
@@ -89,9 +82,6 @@ import {
 import { discoverAgent } from "../execution.ts";
 import { buildCcReviewSummaryMeta, setTaskConfiguredModel, resolveDisplayedTaskModel } from "../summary.ts";
 import type { ExtensionAPI } from "../types.ts";
-
-const require = createRequire(import.meta.url);
-const childProcess = require("node:child_process") as typeof import("node:child_process");
 
 const SUBPROCESS_HEARTBEAT_MS = 30000;
 
@@ -184,7 +174,7 @@ export interface WorkflowRuntime {
   failWorkflow: (reason?: string) => void;
   noteReviewWarning: (warningMessage: string) => void;
   transitionToComplete: () => void;
-  recordTaskResult: (result: TaskResult, structured?: SubagentStructuredReport | null) => void;
+  recordTaskResult: (taskIndex: number, result: TaskResult, structured?: SubagentStructuredReport | null) => void;
   buildTaskResultModelState: (index: number, fallback?: { configuredModel?: string; effectiveModel?: string }) => {
     configuredModel?: string;
     effectiveModel?: string;
@@ -422,57 +412,56 @@ export function createWorkflowRuntime(
     }
   };
 
-  const runVerificationCommand: RunVerificationCommand = (command) =>
-    new Promise((resolve) => {
-      const startedAt = new Date().toISOString();
-      const proc = childProcess.spawn(command.command, command.args, {
-        cwd: rt.workflowCwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let stdout = "";
-      let stderr = "";
-      let timedOut = false;
-      let timer: NodeJS.Timeout | undefined;
-      if (command.timeoutMs) {
-        timer = setTimeout(() => {
-          timedOut = true;
-          proc.kill("SIGTERM");
-        }, command.timeoutMs);
-      }
-      proc.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
-      });
-      proc.stderr.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString();
-      });
-      proc.on("close", (code) => {
-        if (timer) clearTimeout(timer);
-        resolve({
-          command: command.command,
-          args: command.args,
-          exitCode: timedOut ? 124 : (code ?? 1),
-          stdout,
-          stderr,
-          timedOut,
-          startedAt,
-          completedAt: new Date().toISOString(),
-        });
-      });
-      proc.on("error", () => {
-        if (timer) clearTimeout(timer);
-        resolve({
-          command: command.command,
-          args: command.args,
-          exitCode: 1,
-          stdout,
-          stderr,
-          timedOut,
-          startedAt,
-          completedAt: new Date().toISOString(),
-        });
-      });
+  // Route verification commands through the shared hardened subprocess runner
+  // so they get detached process groups, SIGTERM→SIGKILL escalation, AbortSignal
+  // wiring, and active-process registration. Previously this spawned directly
+  // with childProcess.spawn, sent only SIGTERM on timeout, and was NOT
+  // registered in rt.activeProcesses — so a stuck command could hang the run
+  // past its timeout and user cancellation could leave children running (I2).
+  const runVerificationCommand: RunVerificationCommand = async (command) => {
+    const startedAt = new Date().toISOString();
+    const subprocessResult = await runSubprocess({
+      label: `verification: ${command.command}`,
+      command: command.command,
+      args: command.args,
+      cwd: rt.workflowCwd,
+      timeoutMs: command.timeoutMs,
+      signal: rt.signal,
+      traceCtx: rt.ctx,
+      abortMode: "internal",
+      registerProc(proc) {
+        rt.activeProcesses.add(proc);
+        return () => rt.activeProcesses.delete(proc);
+      },
     });
+    const completedAt = new Date().toISOString();
+
+    // Map spawn errors to a non-zero exit, matching the prior contract.
+    if (subprocessResult.spawnError) {
+      return {
+        command: command.command,
+        args: command.args,
+        exitCode: 1,
+        stdout: subprocessResult.stdout,
+        stderr: subprocessResult.stderr || subprocessResult.spawnError.message,
+        timedOut: false,
+        startedAt,
+        completedAt,
+      };
+    }
+
+    const exitCode = subprocessResult.code ?? (subprocessResult.signal ? 1 : 0);
+    return {
+      command: command.command,
+      args: command.args,
+      exitCode: subprocessResult.timedOut ? 124 : exitCode,
+      stdout: subprocessResult.stdout,
+      stderr: subprocessResult.stderr,
+      timedOut: subprocessResult.timedOut,
+      startedAt,
+      completedAt,
+    };
+  };
 
   rt.writeTaskArtifactForIndex = (input: {
     taskIndex: number;
@@ -662,8 +651,13 @@ export function createWorkflowRuntime(
     rt.log("Workflow finished!");
   };
 
-  rt.recordTaskResult = (result: TaskResult, structured?: SubagentStructuredReport | null) => {
-    rt.taskResults.push(result);
+  rt.recordTaskResult = (taskIndex: number, result: TaskResult, structured?: SubagentStructuredReport | null) => {
+    // Overwrite by task index instead of appending. Previously this pushed,
+    // so a per-task repair loop that called recordTaskResult on every round
+    // accumulated one row per round — a round-0 "review_blocked" entry
+    // survived even after a round-1 success, polluting the summary, findings
+    // rollup, run-state buffer, and persisted checkpoints (I1).
+    rt.taskResults[taskIndex] = result;
     rt.runStateBuffer = mergeTaskResultIntoStateBuffer(rt.runStateBuffer, result, structured);
     try {
       rt.persistRunCheckpoint("executing");

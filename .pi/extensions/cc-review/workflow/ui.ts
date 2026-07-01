@@ -272,10 +272,6 @@ export function renderCcReviewLogEntry(
   return messageLines.map((line, index) => (index === 0 ? `${prefix}${line}` : `${continuationPrefix}${line}`));
 }
 
-function renderCcReviewLogEntries(entries: readonly CcReviewLogEntry[], options: CcReviewLogRenderOptions = {}): string[] {
-  return entries.flatMap((entry) => renderCcReviewLogEntry(entry, options));
-}
-
 // Defined severity ordering used by `filterCcReviewLogEntries`. Lower rank is
 // less severe. Mirrors LOG_SEVERITY_ROLLUP_ORDER's intent but encodes a numeric
 // threshold so callers can express "warning or worse" as a single comparison.
@@ -417,14 +413,6 @@ export function summarizeLogSeverities(
 
 export const WIDGET_MAX_WIDTH_DEFAULT = 96;
 const WIDGET_CHECKLIST_WINDOW = 8;
-const WIDGET_LIVE_LOG_LINES = 5;
-const WORKFLOW_LOG_MAX_LINES_DEFAULT = 2000;
-const WORKFLOW_LOG_TRUNCATE_KEEP = 1500;
-
-// Heartbeat interval for subprocess progress logging (P0-3). Emits a "still
-// running" log line at this cadence while any planner/reviewer subprocess is
-// active, so the user can distinguish a working-but-slow run from a hang.
-const SUBPROCESS_HEARTBEAT_MS = 30000;
 
 // ANSI-naive width truncation with ellipsis. Sufficient because cc-review widget
 // lines are plain text (we strip ANSI when normalizing log messages).

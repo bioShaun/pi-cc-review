@@ -55,6 +55,49 @@ test("deriveEffectiveVerdict blocks on unfixed P1 even when reported ship", () =
   assert.equal(derived.blockReason, "unfixed_high_severity");
 });
 
+test("deriveEffectiveVerdict does not ship when review JSON is absent even with exit 0 (I3)", () => {
+  // A reviewer that exits 0 but omits the mandated structured verdict/findings
+  // JSON must NOT green-light the task with a clean ship. Previously absent +
+  // exit 0 mapped to "ship"; now it surfaces as "ship_with_warnings" so the
+  // unreviewed task is visible in the summary and rollup.
+  const derived = deriveEffectiveVerdict({
+    reportedVerdict: null,
+    findings: [],
+    reviewerExitCode: 0,
+    reviewParseStatus: "absent",
+    ambiguousHighSeverity: false,
+    postReviewValidationFailed: false,
+  });
+  assert.equal(derived.effectiveVerdict, "ship_with_warnings");
+  assert.equal(derived.fallbackApplied, true);
+});
+
+test("deriveEffectiveVerdict does not ship on fallback_exit_code even with exit 0 (I3)", () => {
+  const derived = deriveEffectiveVerdict({
+    reportedVerdict: null,
+    findings: [],
+    reviewerExitCode: 0,
+    reviewParseStatus: "fallback_exit_code",
+    ambiguousHighSeverity: false,
+    postReviewValidationFailed: false,
+  });
+  assert.equal(derived.effectiveVerdict, "ship_with_warnings");
+  assert.equal(derived.fallbackApplied, true);
+});
+
+test("deriveEffectiveVerdict ships cleanly only when review is parsed and exit 0 (I3)", () => {
+  const derived = deriveEffectiveVerdict({
+    reportedVerdict: "ship",
+    findings: [],
+    reviewerExitCode: 0,
+    reviewParseStatus: "parsed",
+    ambiguousHighSeverity: false,
+    postReviewValidationFailed: false,
+  });
+  assert.equal(derived.effectiveVerdict, "ship");
+  assert.equal(derived.fallbackApplied, false);
+});
+
 test("writeTaskArtifact uses per-run directory and atomic write", () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-artifact-test-"));
   const runId = generateWorkflowRunId();

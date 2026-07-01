@@ -1291,7 +1291,13 @@ class MockChildProcess extends EventEmitter {
   pid = 99999;
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  autoReviewStdout = false;
+  // Default to true so non-planner reviewer mocks auto-emit a valid
+  // REVIEW_SHIP_OUTPUT on close, unless a test explicitly sets this to false.
+  // Previously defaulted to false, which meant the spawn mock's
+  // `autoReviewStdout !== false` check never enabled auto-emit; tests then
+  // relied on the old deriveEffectiveVerdict fallback (absent + exit 0 → ship)
+  // which I3 corrected to ship_with_warnings.
+  autoReviewStdout = true;
   private reviewStdoutEmitted = false;
 
   emit(event: string | symbol, ...args: any[]): boolean {
@@ -4423,14 +4429,16 @@ describe("CC Review Behavioral Regression Tests", () => {
     assert.equal(reviewCallCount, 3, `expected 3 review calls (1 + 2 repair), got ${reviewCallCount}`);
     assert.equal(result.details.status, "failed");
     assert.ok(result.details.meta);
+    // Only the terminal (final-block) result is recorded as a durable task
+    // result — intermediate blocked rounds are no longer appended (I1).
     assert.deepEqual(result.details.meta.taskOutcomes, {
-      review_blocked: 3,
+      review_blocked: 1,
       failed: 0,
       warning: 0,
       completed: 0,
       cancelled: 0,
     });
-    assert.equal(result.details.meta.topBlockers.length, 3);
+    assert.equal(result.details.meta.topBlockers.length, 1);
     assert.equal(result.details.meta.topBlockers[0].message, "fatal error");
   });
 

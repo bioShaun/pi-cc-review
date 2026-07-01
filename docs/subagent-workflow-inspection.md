@@ -6,15 +6,15 @@ This document maps the subagent workflow, orchestration entrypoints, UI state re
 
 ## 1. Subagent Orchestration & Creation Entrypoint
 
-The entire workflow is managed within the CC Review extension.
+The entire workflow is managed within the CC Review extension (modular tree under `.pi/extensions/cc-review/`, re-exported by `.pi/extensions/cc-review.ts`).
 
 - **Main Tool Entrypoint:** 
-  - Registered tool: `cc_review` via `pi.registerTool` in `.pi/extensions/cc-review.ts`.
-  - Execution delegates to: `runCcReviewWorkflow` (defined in `.pi/extensions/cc-review.ts` at line `4222`).
+  - Registered tool: `cc_review` via `pi.registerTool` in `.pi/extensions/cc-review/workflow.ts`.
+  - Execution delegates to: `runCcReviewWorkflow` (defined in `.pi/extensions/cc-review/workflow/orchestrator/`).
 
 - **Subagent Dispatch / Invocation:**
   - Inside `runCcReviewWorkflow`, Phase 2 (Task Execution Loop) handles task dispatch.
-  - It resolves the executor using `getSubagentExecutor(pi)` (defined in `.pi/extensions/cc-review.ts` at line `3894`), returning a `SubagentToolExecutor`.
+  - It resolves the executor using `getSubagentExecutor(pi)` (defined in `.pi/extensions/cc-review/workflow/execution.ts`), returning a `SubagentToolExecutor`.
   - It executes the subagent tool with parameters:
     ```typescript
     {
@@ -24,7 +24,7 @@ The entire workflow is managed within the CC Review extension.
       cwd: ctx?.cwd ?? process.cwd(),
     }
     ```
-  - `getSubagentExecutor` falls back to spawning `pi` as a subprocess via `runPiAgentSubprocess` (defined in `.pi/extensions/cc-review.ts` at line `3639`) using the discovered worker definition.
+  - `getSubagentExecutor` falls back to spawning `pi` as a subprocess via `runPiAgentSubprocess` (defined in `.pi/extensions/cc-review/workflow/execution.ts`) using the discovered worker definition.
 
 ---
 
@@ -33,7 +33,7 @@ The entire workflow is managed within the CC Review extension.
 Subagents are represented in the TUI through state properties in the widget, live log objects, and event streams.
 
 ### A. Widget State Properties
-The UI state is managed via `CcReviewWidgetState` in `.pi/extensions/cc-review.ts`. Key properties related to the subagents include:
+The UI state is managed via `CcReviewWidgetState` in `.pi/extensions/cc-review/workflow/ui.ts`. Key properties related to the subagents include:
 - `tasks`: An array of `readonly { title: string; status?: TaskStatus; model?: string }[]` representing the overall task breakdown, execution outcomes, and optional resolved model labels.
 - `currentTaskIndex`: The index of the active subagent task.
 - `displayState`: A string indicating the orchestration status (`"executing"`, `"retrying"`, `"reviewing"`, `"complete"`, `"warning"`, `"failed"`, `"cancelled"`).
@@ -77,8 +77,8 @@ While the subagent process executes, standard error output is parsed in `runPiAg
 Three distinct UI elements display the status of subagent tasks:
 
 1. **TUI Widget (`cc-review-widget`):** 
-   - Set via `ctx.ui.setWidget("cc-review-widget", ...)` in `.pi/extensions/cc-review.ts` inside `refreshWorkflowUi()`.
-   - Rendered using `buildCcReviewWidgetLines(state, options)` (line `1888`), which builds a formatted multi-line block showing the goal, task checklist with status icons (derived from `getTaskVisuals`), current phase, findings rollup, and a live tail of filtered `liveLogs`.
+   - Set via `ctx.ui.setWidget("cc-review-widget", ...)` in `.pi/extensions/cc-review/workflow/orchestrator/runtime.ts` inside `refreshWorkflowUi()`.
+   - Rendered using `buildCcReviewWidgetLines(state, options)` (defined in `.pi/extensions/cc-review/workflow/ui.ts`), which builds a formatted multi-line block showing the goal, task checklist with status icons (derived from `getTaskVisuals`), current phase, findings rollup, and a live tail of filtered `liveLogs`.
 
 2. **Status Bar (`cc-review-status`):**
    - Set via `ctx.ui.setStatus("cc-review-status", statusText)` in `updateDisplayState()` to display a concise, colored status line in the TUI status area.

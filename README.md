@@ -6,7 +6,8 @@ This workspace contains the implementation and tests for the **CC Review Orchest
 
 ## 1. Directory Structure
 
-- `.pi/extensions/cc-review.ts`: The main orchestrator extension code.
+- `.pi/extensions/cc-review.ts`: Entry-point re-export that loads the modular extension from `.pi/extensions/cc-review/`.
+- `.pi/extensions/cc-review/`: Modular extension tree (`workflow.ts`, `config.ts`, `providers.ts`, `structured.ts`, `subprocess.ts`, and `workflow/` orchestrator modules).
 - `tests/cc-review-static.test.mjs`: Node native static assertion test suite verifying structural properties, schema structures, regex matches, and baseline compliance.
 - `tests/cc-review-behavior.test.ts`: Node native behavioral test suite mocking the `pi` API and child processes to verify successful multi-step execution, retry loops, cancellation, output validation, and trace logging.
 - `workflow-baseline.md`: System target and baseline specification.
@@ -16,7 +17,7 @@ This workspace contains the implementation and tests for the **CC Review Orchest
 
 ## 2. Installation, Update, and Verification Guide
 
-The extension is installed as the **CC Review** plugin in `.pi/extensions/cc-review.ts`.
+The extension is installed as the **CC Review** plugin. The entry point is `.pi/extensions/cc-review.ts`, which re-exports the modular implementation from `.pi/extensions/cc-review/`.
 
 Active user-facing entry points:
 
@@ -24,7 +25,7 @@ Active user-facing entry points:
 - Tool name for API/tool calls: `cc_review`
 - Display label: `CC Review`
 
-To install or update the plugin in a Pi workspace, place the current `.pi/extensions/cc-review.ts` file in that workspace's `.pi/extensions/` directory, replacing any older copy of the same file, then restart or reload Pi so extension registration is refreshed. The package manifest is only for development tooling; there is no registry release flow, and the extension file remains the installation artifact.
+To install or update the plugin in a Pi workspace, copy **both** `.pi/extensions/cc-review.ts` **and** the entire `.pi/extensions/cc-review/` directory into that workspace's `.pi/extensions/` directory, replacing any older copies, then restart or reload Pi so extension registration is refreshed. The entry-point file depends on the sibling directory; copying only `cc-review.ts` will produce a broken plugin.
 
 To guarantee code quality and prevent regression, developers must run the verification suites and TypeScript compiler checks after any changes.
 
@@ -156,7 +157,7 @@ In `after-all` mode, an unrecoverable task execution or output-validation failur
 
 ### 2.5. Strict Type-Checking
 
-The extension `.pi/extensions/cc-review.ts` must maintain **100% strict type safety**. It should compile with zero TypeScript diagnostics under Node's standard type configuration.
+The extension `.pi/extensions/cc-review.ts` (and its modular `.pi/extensions/cc-review/` tree) must maintain **100% strict type safety**. It should compile with zero TypeScript diagnostics under Node's standard type configuration.
 
 Install the pinned development dependencies once, then run the repository-local type-check script:
 
@@ -171,7 +172,7 @@ npm run typecheck
 
 Use this checklist after changes that affect plugin registration, provider selection, release packaging, or marketplace/display metadata. Do not commit real credentials or secret-bearing logs.
 
-- [ ] **Install/load smoke test**: copy `.pi/extensions/cc-review.ts` into a clean Pi workspace's `.pi/extensions/` directory, restart or reload Pi, and confirm the active display name is **CC Review**.
+- [ ] **Install/load smoke test**: copy `.pi/extensions/cc-review.ts` **and** the `.pi/extensions/cc-review/` directory into a clean Pi workspace's `.pi/extensions/` directory, restart or reload Pi, and confirm the active display name is **CC Review**.
 - [ ] **Command and tool discovery**: confirm the slash command appears as `/cc-review <goal>` and API/tool usage exposes `cc_review` with label `CC Review`; no active command or tool alias should use the old pre-rename identity.
 - [ ] **Default review path**: with `CC_REVIEW_PROVIDER` unset, run a small disposable goal and verify the workflow plans with Codex and reviews with the default Codex reviewer.
 - [ ] **Claude review path**: run the same disposable goal with `CC_REVIEW_PROVIDER=claude` using mocked/test Claude credentials or a test Claude Code CLI login; verify planning still uses Codex and the review/fix phase invokes `claude -p`.

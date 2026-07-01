@@ -589,9 +589,18 @@ export function deriveEffectiveVerdict(input: {
   if (input.reportedVerdict) {
     return { effectiveVerdict: input.reportedVerdict, fallbackApplied: false };
   }
+  // We only reach here when reviewParseStatus is "absent" or
+  // "fallback_exit_code" (not "parsed", not "invalid_schema") and there are
+  // no findings to act on. Previously, a zero exit code mapped to a clean
+  // "ship" even though the reviewer produced no auditable verdict/findings
+  // (I3). Require parsed output for a clean ship; otherwise surface as a
+  // warning so the unreviewed task is visible in the summary and rollup.
+  if (input.reviewParseStatus !== "parsed") {
+    return { effectiveVerdict: "ship_with_warnings", fallbackApplied: true };
+  }
   return {
     effectiveVerdict: input.reviewerExitCode === 0 ? "ship" : "ship_with_warnings",
-    fallbackApplied: input.reviewParseStatus !== "parsed",
+    fallbackApplied: false,
   };
 }
 

@@ -1,19 +1,12 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-
 import {
   buildFindingsPayload,
   deriveEffectiveVerdict,
-  extractBalancedJsonObject,
   mapEffectiveVerdictToTaskStatus,
-  mergeRollupFindings,
   parseReviewResult,
-  reviewRequiresPostFixValidation,
   runPostReviewValidation,
   snapshotWorkspace,
   updateFindingsRollup,
   workspaceSnapshotChanged,
-  WORKFLOW_ARTIFACT_DIR,
   type SubagentStructuredReport,
 } from "../../structured.ts";
 import { buildAfterAllExecutionBatches, runWithConcurrencyLimit } from "../dependencies.ts";
@@ -22,19 +15,15 @@ import {
   readAvailableCpuCount,
   resolveCcReviewConcurrency,
 } from "../../config.ts";
-import { resolvePlannerModelEnv } from "../../providers.ts";
-import { formatResumeInstructions, writePlanArtifact } from "../checkpoint.ts";
-import { createSubprocessStreamLogger } from "../logging.ts";
 import { extractAssistantTextFromStream, formatSubprocessStreamLine } from "../stream-format.ts";
 import { validateSubagentOutput } from "../validation.ts";
 import { delay, isTransientError } from "../util.ts";
 import type { SchemaParseStatus } from "../../structured.ts";
-import type { CcReviewWorkflowResult, SubagentResult, SubagentToolResult, TaskResult } from "../types.ts";
+import type { SubagentResult, SubagentToolResult, TaskResult } from "../types.ts";
 import { WorkflowError } from "../types.ts";
 import { buildCcReviewSummaryMeta, buildSummaryReport, setTaskEffectiveModel } from "../summary.ts";
 import {
   appendUnique,
-  buildPriorTaskHandoff,
   buildSubagentTaskPrompt,
   extractSubagentText,
   getSubagentExecutor,
@@ -520,7 +509,6 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
       }
 
       if (executionError) {
-        const isTimeout = /timeout/i.test(executionError.message || "");
         const isCancelled =
           rt.signal?.aborted ||
           executionError.message?.includes("aborted") ||
@@ -860,7 +848,7 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
           workflow: { haltedOnReview: false, haltedOnExecution: true },
         });
         rt.taskStatuses[i] = taskStatus;
-        rt.recordTaskResult({
+        rt.recordTaskResult(i, {
           title: task.title,
           description: task.description,
           executionCode: subagentResult.code,
@@ -873,7 +861,7 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
           structuredReport: structuredReport ?? undefined,
           schemaParseStatus,
           ...rt.buildTaskResultModelState(i, subagentResult),
-        });
+        }, structuredReport);
         throw new Error(`Task execution failed unrecoverably on: "${task.title}" (${validationError || "exit code " + subagentResult.code})`);
       }
 
@@ -999,35 +987,40 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
           artifactPath,
         })
       );
-      rt.collectedTaskFindings.push(findings);
-      rt.findingsRollup = updateFindingsRollup(rt.findingsRollup, effectiveVerdict, findings);
-      rt.reviewedTaskCount += 1;
+      // Update task status for UI feedback on every round. The intermediate
+      // blocked status is visible during repair, but only the terminal
+      // verdict is recorded as a durable task result (I1).
       rt.taskStatuses[i] = taskStatus;
       rt.refreshWorkflowUi();
 
-      rt.recordTaskResult({
-        title: task.title,
-        description: task.description,
-        executionCode: subagentResult.code,
-        reviewCode: reviewProcessResult.exitCode,
-        output: subagentOutputText,
-        validationError,
-        unresolvedItems,
-        reviewWarningName: rt.reviewProviderConfig.warningName,
-        status: taskStatus,
-        artifactPath,
-        structuredReport: structuredReport ?? undefined,
-        schemaParseStatus,
-        reviewResult: reviewResultObject ?? undefined,
-        reportedVerdict,
-        effectiveVerdict,
-        blockReason: derived.blockReason,
-        reviewerExitDiagnostic,
-        ...rt.buildTaskResultModelState(i, subagentResult),
-      });
-
       if (effectiveVerdict === "block") {
         if (repairRound >= rt.maxReviewRepairRounds) {
+          // Terminal: exhausted repair rounds → record the final result and
+          // hard-fail. Previously recordTaskResult was called on every round,
+          // leaving stale review_blocked rows after a later success (I1).
+          rt.collectedTaskFindings.push(findings);
+          rt.findingsRollup = updateFindingsRollup(rt.findingsRollup, effectiveVerdict, findings);
+          rt.reviewedTaskCount += 1;
+          rt.recordTaskResult(i, {
+            title: task.title,
+            description: task.description,
+            executionCode: subagentResult.code,
+            reviewCode: reviewProcessResult.exitCode,
+            output: subagentOutputText,
+            validationError,
+            unresolvedItems,
+            reviewWarningName: rt.reviewProviderConfig.warningName,
+            status: taskStatus,
+            artifactPath,
+            structuredReport: structuredReport ?? undefined,
+            schemaParseStatus,
+            reviewResult: reviewResultObject ?? undefined,
+            reportedVerdict,
+            effectiveVerdict,
+            blockReason: derived.blockReason,
+            reviewerExitDiagnostic,
+            ...rt.buildTaskResultModelState(i, subagentResult),
+          }, structuredReport);
           // Exhausted repair rounds → hard-fail (P1-1).
           rt.log(`[Workflow Halted] Blocked by reviewer after ${rt.maxReviewRepairRounds} repair round(s) on: "${task.title}".`);
           const summary = rt.wrapWorkflowSummary(
@@ -1046,6 +1039,8 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
         // Build repair feedback from the reviewer's findings and re-execute +
         // re-review (P1-1). The worker gets the concrete findings so it can
         // fix them instead of the whole workflow aborting on the first block.
+        // The intermediate blocked result is NOT recorded as a durable task
+        // result; only the terminal outcome (success or final block) is (I1).
         repairFeedback = buildRepairFeedback(reviewResultObject ?? null, derived.blockReason, findings);
         repairRequiresPostReviewValidation ||= derived.blockReason === "post_review_validation_failed";
         rt.log({
@@ -1055,6 +1050,30 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
         });
         continue REPAIR_LOOP;
       }
+      // Terminal: task passed review → record the final result (I1).
+      rt.collectedTaskFindings.push(findings);
+      rt.findingsRollup = updateFindingsRollup(rt.findingsRollup, effectiveVerdict, findings);
+      rt.reviewedTaskCount += 1;
+      rt.recordTaskResult(i, {
+        title: task.title,
+        description: task.description,
+        executionCode: subagentResult.code,
+        reviewCode: reviewProcessResult.exitCode,
+        output: subagentOutputText,
+        validationError,
+        unresolvedItems,
+        reviewWarningName: rt.reviewProviderConfig.warningName,
+        status: taskStatus,
+        artifactPath,
+        structuredReport: structuredReport ?? undefined,
+        schemaParseStatus,
+        reviewResult: reviewResultObject ?? undefined,
+        reportedVerdict,
+        effectiveVerdict,
+        blockReason: derived.blockReason,
+        reviewerExitDiagnostic,
+        ...rt.buildTaskResultModelState(i, subagentResult),
+      }, structuredReport);
       break REPAIR_LOOP; // not block → task passed review, move to next task
       } // end REPAIR_LOOP
     }

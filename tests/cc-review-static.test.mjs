@@ -258,7 +258,7 @@ test("README documents CC Review installation and active plugin identity", () =>
   assert.match(readme, /Slash command: `\/cc-review <goal>`/);
   assert.match(readme, /Tool name for API\/tool calls: `cc_review`/);
   assert.match(readme, /Display label: `CC Review`/);
-  assert.match(readme, /place the current `\.pi\/extensions\/cc-review\.ts` file/);
+  assert.match(readme, /copy \*\*both\*\* `\.pi\/extensions\/cc-review\.ts` \*\*and\*\* the entire `\.pi\/extensions\/cc-review\/` directory/);
   assert.match(readme, /restart or reload Pi/);
 });
 
@@ -297,7 +297,7 @@ test("README manual verification checklist covers install, default, Claude, mark
   assert.match(readme, /### 2\.6\. Manual Verification Checklist/);
   for (const requiredTerm of [
     "Install/load smoke test",
-    "copy `.pi/extensions/cc-review.ts` into a clean Pi workspace",
+    "copy `.pi/extensions/cc-review.ts` **and** the `.pi/extensions/cc-review/` directory into a clean Pi workspace",
     "Command and tool discovery",
     "/cc-review <goal>",
     "`cc_review` with label `CC Review`",
@@ -400,13 +400,13 @@ test("provider selection flow implementation note documents current control path
     "There is no package manifest, extension manifest, project config, or settings file",
     "`applyAgentModelOverride(...)` reads `~/.pi/agent/settings.json`",
     "these affect task execution subagents, not planner/reviewer provider selection",
-    "`runCcReviewWorkflow(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start",
+    "`createWorkflowRuntime(...)` calls `resolveReviewProviderConfig(options.reviewProvider)` once at workflow start",
     "invalid explicit/environment provider values fail before planner or reviewer subprocesses are spawned",
     "Planning uses the normalized provider",
     "Codex writes schema-constrained output",
     "Claude returns JSON on stdout",
     "`REVIEW_BACKEND_FACTORIES` and `reviewProviderConfig.buildArgs({ task })`",
-    "Review uses `.pi/extensions/cc-review.ts` `REVIEW_BACKEND_FACTORIES`",
+    "Review uses `.pi/extensions/cc-review/providers.ts` `REVIEW_BACKEND_FACTORIES`",
     "in `after-all` mode it runs once",
     "`runProcess(reviewProviderConfig.label, reviewProviderConfig.command, reviewArgs, ...)`",
     "provider and review-timing insertion points are implemented",
@@ -510,7 +510,9 @@ test("display log path renders severity-aware normalized log entries", () => {
   // continuationPrefix now uses visible column width (prefixVisibleWidth) rather
   // than raw JS string length, so CJK/wide characters are counted correctly.
   assert.match(source, /const continuationPrefix = " "\.repeat\(prefixVisibleWidth\)/);
-  assert.match(source, /function renderCcReviewLogEntries\(entries: readonly CcReviewLogEntry\[\], options: CcReviewLogRenderOptions = \{\}\): string\[\]/);
+  // renderCcReviewLogEntries was removed as dead code after the modular split
+  // (I5 cleanup with noUnusedLocals). The single-entry renderCcReviewLogEntry
+  // remains the public surface; batch rendering is done by callers.
   assert.doesNotMatch(source, /registerMessageRenderer\("cc-review-log"/);
 });
 
@@ -896,7 +898,7 @@ test("regression test for successful multi-step execution", () => {
   // verified behaviorally by cc-review-behavior.test.ts multi-task workflow
   // tests. Source-grep locks removed so execution pipeline can be deduped (#2).
   assert.match(source, /for\s*\(let\s+i\s*=\s*0;\s*i\s*<\s*tasks\.length;\s*i\+\+\)/);
-  assert.match(source, /recordTaskResult\(\{/);
+  assert.match(source, /recordTaskResult\(i,\s*\{/);
   assert.match(source, /buildSummaryReport\(goal, taskResults, tasks(?:,\s*\{[^}]*\})?\)/);
 });
 
