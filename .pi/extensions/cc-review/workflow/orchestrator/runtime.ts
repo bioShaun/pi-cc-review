@@ -54,9 +54,8 @@ import {
 } from "../logging.ts";
 import {
   emptyStateBuffer,
-  loadStateBuffer,
-  mergeTaskResultIntoStateBuffer,
   persistStateBuffer,
+  rebuildStateBufferFromTaskResults,
 } from "../session.ts";
 import {
   type BatchTaskExecution,
@@ -69,20 +68,19 @@ import {
 } from "../types.ts";
 import {
   buildCcReviewStatusText,
-  buildCcReviewWidgetLines,
   getStatusColorForDisplayState,
   LOG_SEVERITY_RANK,
   normalizeCcReviewLogEntry,
   renderCcReviewLogEntry,
   type CcReviewDisplayState,
-  type CcReviewWidgetState,
-  type CcReviewWidgetTheme,
   type TaskModelState,
-  WIDGET_MAX_WIDTH_DEFAULT,
   SUPPORTED_LOG_SEVERITIES,
 } from "../ui.ts";
+import { createCcReviewUiController, type CcReviewUiController } from "../ui/controller.ts";
+import { buildRuntimeUiSnapshot } from "../ui/runtime-snapshot.ts";
+import { getHighestUnresolvedSeverity } from "../ui/selectors.ts";
 import { discoverAgent } from "../execution.ts";
-import { buildCcReviewSummaryMeta, setTaskConfiguredModel, resolveDisplayedTaskModel } from "../summary.ts";
+import { buildCcReviewSummaryMeta, setTaskConfiguredModel } from "../summary.ts";
 import type { ExtensionAPI } from "../types.ts";
 
 const SUBPROCESS_HEARTBEAT_MS = 30000;
@@ -188,6 +186,7 @@ export interface WorkflowRuntime {
   };
   throwIfAborted: () => void;
   refreshWorkflowUi: () => void;
+  disposeWorkflowUi: () => void;
   runProcess: (
     label: string,
     command: string,
@@ -315,6 +314,7 @@ class WorkflowRuntimeImpl implements WorkflowRuntime {
   };
   throwIfAborted!: () => void;
   refreshWorkflowUi!: () => void;
+  disposeWorkflowUi!: () => void;
   runProcess!: (
     label: string,
     command: string,
@@ -401,7 +401,12 @@ export function createWorkflowRuntime(
       rt.goal = rt.resumeCheckpoint.goal;
     }
     rt.skipTaskIndices = resolveTasksToSkipOnResume(rt.resumeCheckpoint, rt.options.fromTask);
-    rt.runStateBuffer = rt.resumeCheckpoint.stateBuffer ?? loadStateBuffer(rt.workflowCwd, rt.workflowRunId);
+    // State buffer is derived from task results. Rebuilding also repairs older
+    // checkpoints that incorrectly recorded failed tasks as "completed".
+    rt.runStateBuffer = rebuildStateBufferFromTaskResults(
+      rt.workflowRunId,
+      rt.resumeCheckpoint.taskResults
+    );
     rt.checkpointCreatedAt = rt.resumeCheckpoint.createdAt;
   }
 
@@ -504,14 +509,7 @@ export function createWorkflowRuntime(
     const completedTaskIndices: number[] = [];
     for (let i = 0; i < rt.taskResults.length; i++) {
       const status = rt.taskResults[i]?.status;
-      if (
-        status === "completed" ||
-        status === "completed_with_warnings" ||
-        status === "failed" ||
-        status === "validation_failed" ||
-        status === "review_blocked" ||
-        status === "cancelled"
-      ) {
+      if (status === "completed" || status === "completed_with_warnings") {
         completedTaskIndices.push(i);
       }
     }
@@ -797,7 +795,10 @@ export function createWorkflowRuntime(
     // survived even after a round-1 success, polluting the summary, findings
     // rollup, run-state buffer, and persisted checkpoints (I1).
     rt.taskResults[taskIndex] = result;
-    rt.runStateBuffer = mergeTaskResultIntoStateBuffer(rt.runStateBuffer, result, structured);
+    rt.runStateBuffer = rebuildStateBufferFromTaskResults(
+      rt.workflowRunId,
+      rt.taskResults
+    );
     try {
       rt.persistRunCheckpoint("executing");
     } catch {
@@ -819,49 +820,37 @@ export function createWorkflowRuntime(
     }
   };
 
-  const buildWidgetState = (): CcReviewWidgetState => ({
-    goal: rt.goal,
-    tasks: rt.tasks.map((task, index) => {
-      const modelState = rt.taskModels[index];
-      return {
-        title: task.title,
-        status: rt.taskStatuses[index],
-        model: resolveDisplayedTaskModel(modelState),
-        modelState,
-      };
-    }),
-    currentTaskIndex: rt.currentTaskIndex,
-    displayState: rt.displayState,
-    currentPhase: rt.currentPhase,
-    retryState: rt.retryState,
-    lastTaskWarning: rt.lastTaskWarning,
-    liveLogs: rt.liveLogs,
-    resolvedLogLevel: rt.resolvedLogLevel,
-    resolvedLogSources: rt.resolvedLogSources,
-    resolvedWidgetLogLines: rt.resolvedWidgetLogLines,
-    resolvedChecklistWindow: rt.resolvedChecklistWindow,
-    persistedLogPath: rt.persistedLogState.filePath,
-    findingsRollup: rt.findingsRollup,
-    taskStatuses: rt.taskStatuses,
-    taskModels: rt.taskModels,
-  });
+  const uiController: CcReviewUiController = createCcReviewUiController(rt.ctx ?? {});
+  let uiControllerMounted = false;
+
+  const buildWorkflowUiSnapshot = () =>
+    buildRuntimeUiSnapshot({
+      workflowRunId: rt.workflowRunId,
+      goal: rt.goal,
+      displayState: rt.displayState,
+      currentPhase: rt.currentPhase,
+      checkpointCreatedAt: rt.checkpointCreatedAt,
+      currentTaskIndex: rt.currentTaskIndex,
+      tasks: rt.tasks,
+      taskStatuses: rt.taskStatuses,
+      taskModels: rt.taskModels,
+      batchTaskExecutions: rt.batchTaskExecutions,
+      taskResults: rt.taskResults,
+      collectedTaskFindings: rt.collectedTaskFindings,
+      findingsRollup: rt.findingsRollup,
+      liveLogs: rt.liveLogs,
+      retryState: rt.retryState,
+      persistedLogPath: rt.persistedLogState.filePath,
+      artifactRunDir: rt.artifactRunDir,
+    });
 
   rt.refreshWorkflowUi = () => {
-    if (rt.ctx?.ui?.setWidget) {
-      const widgetState = buildWidgetState();
-      const uiTheme = rt.ctx.ui.theme;
-      if (uiTheme && typeof uiTheme.fg === "function") {
-        rt.ctx.ui.setWidget("cc-review-widget", (_tui: unknown, theme: CcReviewWidgetTheme) => ({
-          render: (renderWidth: number) =>
-            buildCcReviewWidgetLines(widgetState, { width: renderWidth, theme }),
-          invalidate: () => {},
-        }));
-      } else {
-        rt.ctx.ui.setWidget(
-          "cc-review-widget",
-          buildCcReviewWidgetLines(widgetState, { width: WIDGET_MAX_WIDTH_DEFAULT })
-        );
-      }
+    const snapshot = buildWorkflowUiSnapshot();
+    if (!uiControllerMounted) {
+      uiController.mount(snapshot);
+      uiControllerMounted = true;
+    } else {
+      uiController.update(snapshot);
     }
 
     const statusText = buildCcReviewStatusText({
@@ -870,6 +859,7 @@ export function createWorkflowRuntime(
       displayState: rt.displayState,
       retryState: rt.retryState,
       currentPhase: rt.currentPhase,
+      highestUnresolvedSeverity: getHighestUnresolvedSeverity(snapshot),
     });
     const uiTheme = rt.ctx?.ui?.theme;
     if (uiTheme && typeof uiTheme.fg === "function") {
@@ -878,6 +868,12 @@ export function createWorkflowRuntime(
     } else {
       rt.ctx?.ui?.setStatus?.("cc-review-status", statusText);
     }
+  };
+
+  rt.disposeWorkflowUi = () => {
+    uiController.dispose();
+    uiControllerMounted = false;
+    rt.ctx?.ui?.setStatus?.("cc-review-status", undefined);
   };
 
   // Helper to rt.log and update the widget & rt.onUpdate stream.

@@ -1058,6 +1058,8 @@ export interface CcReviewStatusState {
   displayState: CcReviewDisplayState;
   retryState?: { attempt: number; maxAttempts: number };
   currentPhase?: string;
+  /** Highest unresolved finding severity (P0–P3), when present. */
+  highestUnresolvedSeverity?: string;
 }
 
 export function getStatusColorForDisplayState(displayState: CcReviewDisplayState): "accent" | "success" | "warning" | "error" {
@@ -1113,6 +1115,9 @@ export function buildCcReviewStatusText(state: CcReviewStatusState): string {
   let text = `[CC Review] ${body}`;
   if (state.retryState) {
     text += ` \u27f3${state.retryState.attempt}/${state.retryState.maxAttempts}`;
+  }
+  if (state.highestUnresolvedSeverity) {
+    text += ` · ${state.highestUnresolvedSeverity}`;
   }
   return text;
 }

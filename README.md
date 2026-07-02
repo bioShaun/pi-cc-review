@@ -315,7 +315,7 @@ CC_REVIEW_LOG_FILE=./my-cc-review.log.jsonl pi --mode json -p "Use cc_review to 
 #### Workflow control (`--plan-only`, `--resume`, role models)
 
 - **Plan only**: `/cc-review --plan-only <goal>` or `planOnly: true` — run the planner, write `cc-review-artifacts/<runId>/plan.json`, and exit without subagents or reviewers.
-- **Resume**: `/cc-review --resume <runId> <goal>` or `resumeRunId` — skip tasks already recorded in `checkpoint.json`; use `--from-task N` (0-based) to force a starting index. Checkpoints are updated after each task and on abort.
+- **Resume**: `/cc-review --resume <runId> <goal>` or `resumeRunId` — skip only successfully completed tasks in `checkpoint.json`; failed, blocked, cancelled, and skipped tasks run again. Use `--from-task N` (0-based) to force a starting index. Checkpoints are updated after each task and on abort.
 - **Role models**: `CC_REVIEW_PLANNER_MODEL` and `CC_REVIEW_REVIEWER_MODEL` override provider default models for planning and review only; worker model continues from pi agent settings.
 - **Structured validation**: set `CC_REVIEW_ALLOW_TEXT_VALIDATION=0` or `allowTextValidation: false` to require trailing structured JSON from workers (transition default remains legacy text heuristics enabled).
 

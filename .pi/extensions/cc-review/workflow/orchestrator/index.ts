@@ -215,8 +215,7 @@ export async function runCcReviewWorkflow(
       if (rt.signal) {
         rt.signal.removeEventListener("abort", rt.onAbort);
       }
-      rt.ctx?.ui?.setWidget?.("cc-review-widget", undefined);
-      rt.ctx?.ui?.setStatus?.("cc-review-status", undefined);
+      rt.disposeWorkflowUi();
     }
   } finally {
     exitCcReviewNest();

@@ -55,9 +55,15 @@ export {
   listResumableRunIds,
   restoreBatchTaskExecutions,
   resolveTasksToSkipOnResume,
+  isTaskReusableOnResume,
   writeCheckpoint,
   writePlanArtifact,
 } from "./workflow/checkpoint.ts";
+
+export {
+  mergeTaskResultIntoStateBuffer,
+  rebuildStateBufferFromTaskResults,
+} from "./workflow/session.ts";
 
 export { runPreflight, shouldSkipPreflight, formatPreflightReport } from "./workflow/preflight.ts";
 export { validateSubagentOutput, summarizeValidationParseFailures } from "./workflow/validation.ts";
@@ -256,6 +262,17 @@ export {
   type CompactWidgetRenderOptions,
   type CompactWidgetRenderResult,
 } from "./workflow/ui/compact-widget.ts";
+
+export {
+  buildRuntimeUiSnapshot,
+  type WorkflowUiSource,
+} from "./workflow/ui/runtime-snapshot.ts";
+
+export {
+  createCcReviewUiController,
+  type CcReviewUiController,
+  type CcReviewUiControllerContext,
+} from "./workflow/ui/controller.ts";
 
 export { stripAnsi, delay, isTransientError } from "./workflow/util.ts";
 

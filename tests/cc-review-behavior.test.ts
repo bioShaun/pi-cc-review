@@ -65,6 +65,8 @@ import ccReviewExtension, {
   writeCheckpoint,
   loadCheckpoint,
   restoreBatchTaskExecutions,
+  resolveTasksToSkipOnResume,
+  rebuildStateBufferFromTaskResults,
   resolveCcReviewTracePath,
   getPiSpawnCommand,
   formatResolvedPiCommand,
@@ -138,6 +140,69 @@ function captureWidgetLines(
     return component?.render ? component.render(width) : undefined;
   }
   return undefined;
+}
+
+function createWidgetCaptureUi(options?: {
+  width?: number;
+  theme?: typeof plainWidgetTheme;
+}): {
+  ui: {
+    theme: typeof plainWidgetTheme;
+    setWidget: (id: string, content: Parameters<typeof captureWidgetLines>[0]) => void;
+    setStatus: (id: string, value: string | undefined) => void;
+    requestRender: () => void;
+  };
+  widgetSnapshots: string[][];
+  statusSnapshots: string[];
+  widgetCleared: () => boolean;
+  statusCleared: () => boolean;
+} {
+  const width = options?.width ?? 96;
+  const theme = options?.theme ?? plainWidgetTheme;
+  const widgetSnapshots: string[][] = [];
+  const statusSnapshots: string[] = [];
+  let mountedComponent: { render?: (renderWidth: number) => string[] } | undefined;
+  let widgetWasCleared = false;
+  let statusWasCleared = false;
+
+  const captureRender = () => {
+    const lines = mountedComponent?.render?.(width);
+    if (lines) widgetSnapshots.push(lines);
+  };
+
+  return {
+    widgetSnapshots,
+    statusSnapshots,
+    widgetCleared: () => widgetWasCleared,
+    statusCleared: () => statusWasCleared,
+    ui: {
+      theme,
+      setWidget: (_id: string, content: Parameters<typeof captureWidgetLines>[0]) => {
+        if (content === undefined) {
+          widgetWasCleared = true;
+          mountedComponent = undefined;
+          return;
+        }
+        if (typeof content === "function") {
+          mountedComponent = content({}, theme);
+          captureRender();
+          return;
+        }
+        const lines = captureWidgetLines(content, width);
+        if (lines) widgetSnapshots.push(lines);
+      },
+      setStatus: (_id: string, value: string | undefined) => {
+        if (value === undefined) {
+          statusWasCleared = true;
+          return;
+        }
+        statusSnapshots.push(value);
+      },
+      requestRender: () => {
+        captureRender();
+      },
+    },
+  };
 }
 
 describe("summarizes subagent tool activity for live progress", () => {
@@ -3850,20 +3915,7 @@ describe("CC Review Behavioral Regression Tests", () => {
   });
 
   it("renders explicit widget states for empty logs, warnings, and cancellation", async () => {
-    const widgetSnapshots: string[][] = [];
-    const statusSnapshots: string[] = [];
-    const captureCtx = {
-      cwd: tempTestDir,
-      ui: {
-        setWidget: (_id: string, content: Parameters<typeof captureWidgetLines>[0]) => {
-          const lines = captureWidgetLines(content);
-          if (lines) widgetSnapshots.push(lines);
-        },
-        setStatus: (_id: string, value: string | undefined) => {
-          if (value) statusSnapshots.push(value);
-        },
-      },
-    };
+    const capture = createWidgetCaptureUi();
 
     const mockTasks = [
       { title: "Task 1", description: "Implement feature A", acceptanceCriteria: "A is verified" }
@@ -3906,23 +3958,67 @@ describe("CC Review Behavioral Regression Tests", () => {
       { goal: "Widget state goal" },
       undefined,
       undefined,
-      captureCtx
+      { cwd: tempTestDir, ui: capture.ui },
     );
 
     assert.equal(result.isError, undefined);
-    assert.ok(widgetSnapshots.length > 0, "widget should be rendered at least once");
-    const earliestSnapshot = widgetSnapshots[0].join("\n");
-    // Before logs accumulate the renderer should advertise an explicit empty state OR a planning phase.
-    assert.ok(
-      /No logs yet|Planning tasks|Waiting for planner/.test(earliestSnapshot),
-      `earliest widget snapshot should show an explicit empty/planning state, got:\n${earliestSnapshot}`
+    assert.ok(capture.widgetSnapshots.length > 0, "widget should be rendered at least once");
+    const earliestSnapshot = capture.widgetSnapshots[0].join("\n");
+    assert.match(earliestSnapshot, /● CC Review/, "compact widget should render a header");
+    assert.doesNotMatch(earliestSnapshot, /Live Logs:/, "compact widget should not show live log tail");
+    // Compact widget omits continuous info/debug logs; warnings surface as latest exception.
+    const warningSeen = capture.widgetSnapshots.some((snap) =>
+      snap.some((line) => /review hiccup|Minor review issues|ship_with_warnings|Warning/i.test(line))
     );
-    // Every snapshot should advertise the persisted log file.
-    assert.ok(widgetSnapshots.every((snap) => snap.some((line) => line.includes("workflow-logs.jsonl"))),
-      "every widget snapshot should reference the persisted log file name");
-    // After the reviewer warning we should see the warning marker somewhere in the trail.
-    const warningSeen = widgetSnapshots.some((snap) => snap.some((line) => /Warning:/i.test(line)));
-    assert.ok(warningSeen, "reviewer warning should surface in the widget");
+    assert.ok(warningSeen, "reviewer warning should surface as the latest exception line");
+  });
+
+  it("mounts the compact widget once during a workflow run and omits info log tail", async () => {
+    let setWidgetCalls = 0;
+    const capture = createWidgetCaptureUi();
+    const originalSetWidget = capture.ui.setWidget;
+    capture.ui.setWidget = (id, content) => {
+      if (content !== undefined) setWidgetCalls++;
+      originalSetWidget(id, content);
+    };
+
+    const mockTasks = [
+      { title: "Task 1", description: "Implement feature A", acceptanceCriteria: "A is verified" },
+    ];
+    mockSpawnHandler = (command, args) => {
+      if (command === "codex") {
+        const mockProc = new MockChildProcess();
+        process.nextTick(() => {
+          if (args.includes("-o")) {
+            fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify({ tasks: mockTasks }), "utf8");
+            mockProc.emit("close", 0, null);
+          } else {
+            mockProc.emit("close", 0, null);
+          }
+        });
+        return mockProc;
+      }
+      return null;
+    };
+    mockSubagentHandler = async () => ({
+      content: [{ type: "text", text: "Successfully completed task. All acceptance criteria verified." }],
+      details: { results: [{ exitCode: 0 }] },
+    });
+
+    await registeredTool.execute(
+      "tool-call-compact-widget-once",
+      { goal: "Compact widget mount goal" },
+      undefined,
+      undefined,
+      { cwd: tempTestDir, ui: capture.ui },
+    );
+
+    assert.equal(setWidgetCalls, 1, "runtime should register the widget exactly once");
+    assert.ok(capture.widgetSnapshots.length > 1, "widget should refresh multiple times via invalidate");
+    const widgetText = capture.widgetSnapshots.map((snap) => snap.join("\n")).join("\n");
+    assert.match(widgetText, /● CC Review/);
+    assert.doesNotMatch(widgetText, /Live Logs:/);
+    assert.doesNotMatch(widgetText, /ℹ INFO/);
   });
 
   it("windows the task checklist with '... N more' affordance for large plans", () => {
@@ -4869,29 +4965,10 @@ describe("CC Review Behavioral Regression Tests", () => {
   });
 
   it("transitions state and phase to failed on unrecoverable errors", async () => {
-    const statusSnapshots: string[] = [];
-    const widgetSnapshots: string[][] = [];
-    let widgetCleared = false;
-    let statusCleared = false;
     const uiThemeMock = {
       fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
     };
-
-    const captureCtx = {
-      cwd: tempTestDir,
-      ui: {
-        theme: uiThemeMock,
-        setWidget: (_id: string, content: any) => {
-          if (content === undefined) widgetCleared = true;
-          const lines = captureWidgetLines(content);
-          if (lines) widgetSnapshots.push(lines);
-        },
-        setStatus: (_id: string, value: string | undefined) => {
-          if (value === undefined) statusCleared = true;
-          if (value) statusSnapshots.push(value);
-        },
-      },
-    };
+    const capture = createWidgetCaptureUi({ theme: uiThemeMock });
 
     // 1) verification plan load failure
     fs.writeFileSync(path.join(tempTestDir, ".cc-review-validation.json"), "{ malformed", "utf8");
@@ -4900,21 +4977,21 @@ describe("CC Review Behavioral Regression Tests", () => {
       { goal: "Goal with bad verification plan" },
       undefined,
       undefined,
-      captureCtx
+      { cwd: tempTestDir, ui: capture.ui },
     );
 
     // Verify that the status bar was updated with error-colored failed status text
-    const failedStatus = statusSnapshots.find((s) => s.includes("[error]") && s.includes("Failed"));
+    const failedStatus = capture.statusSnapshots.find((s) => s.includes("[error]") && s.includes("Failed"));
     assert.ok(failedStatus, "Should find error-colored failed status");
     assert.match(failedStatus, /\[error\]\[CC Review\] Failed/);
 
-    // Verify that the widget included 'Workflow failed'
-    const hasWorkflowFailed = widgetSnapshots.some((lines) =>
-      lines.some((line) => line.includes("Workflow failed"))
+    // Verify that the compact widget header reflects the failed state
+    const hasFailedHeader = capture.widgetSnapshots.some((lines) =>
+      lines.some((line) => /● CC Review.*Failed/.test(line))
     );
-    assert.ok(hasWorkflowFailed, "Should find 'Workflow failed' in widget lines");
-    assert.equal(widgetCleared, true, "Failed workflow should clear its widget");
-    assert.equal(statusCleared, true, "Failed workflow should clear its status");
+    assert.ok(hasFailedHeader, "Should find failed state in compact widget header");
+    assert.equal(capture.widgetCleared(), true, "Failed workflow should clear its widget");
+    assert.equal(capture.statusCleared(), true, "Failed workflow should clear its status");
   });
 
   describe("subagent model capture", () => {
@@ -5494,21 +5571,7 @@ System prompt override`
     };
 
     // Capture UI widget rendering calls
-    const widgetSnapshots: string[][] = [];
-    const statusSnapshots: string[] = [];
-    const captureCtx = {
-      cwd: tempTestDir,
-      ui: {
-        setWidget: (_id: string, content: any) => {
-          const lines = captureWidgetLines(content);
-          if (lines) widgetSnapshots.push(lines);
-        },
-        setStatus: (_id: string, value: string | undefined) => {
-          if (value) statusSnapshots.push(value);
-        },
-        theme: plainWidgetTheme,
-      },
-    };
+    const capture = createWidgetCaptureUi();
 
     // Execute the cc_review tool with concurrencyLimit=2 and after-all reviewMode
     const result = await registeredTool.execute(
@@ -5516,7 +5579,7 @@ System prompt override`
       { goal: "Verify parallel models and concurrency", concurrencyLimit: 2, reviewMode: "after-all" },
       undefined,
       undefined,
-      captureCtx
+      { cwd: tempTestDir, ui: capture.ui },
     );
 
     // Verify successful execution with no errors
@@ -5545,9 +5608,9 @@ System prompt override`
     let foundTask2ModelInUI = false;
     let foundUnknownModelWhileRunning = false;
 
-    for (const lines of widgetSnapshots) {
+    for (const lines of capture.widgetSnapshots) {
       for (const line of lines) {
-        if (line.includes("google/gemini-3.5-flash")) {
+        if (line.includes("gemini-3.5-flash")) {
           foundConfiguredModelInUI = true;
         }
         if (line.includes("claude-3-5-sonnet-parallel-1")) {
@@ -6229,6 +6292,60 @@ describe("optimization spec: preflight, validation, logs, checkpoint", () => {
     assert.equal(loaded?.goal, "test goal");
     assert.equal(loaded?.tasks.length, 1);
     fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("resume reruns failed or skipped tasks even when an old checkpoint marks them completed", () => {
+    const tasks = ["failed", "completed", "skipped", "legacy"].map((title) => ({
+      title,
+      description: `${title} task`,
+      acceptanceCriteria: `${title} criterion`,
+    }));
+    const checkpoint = {
+      schemaVersion: 1 as const,
+      runId: "resume-status-test",
+      goal: "resume correctly",
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z",
+      reviewProvider: "codex",
+      reviewMode: "after-all",
+      tasks,
+      taskResults: [
+        { title: "failed", description: "failed task", executionCode: 1, reviewCode: -1, status: "failed" as const },
+        { title: "completed", description: "completed task", executionCode: 0, reviewCode: 0, status: "completed" as const },
+        { title: "skipped", description: "skipped task", executionCode: -1, reviewCode: -1, status: "skipped" as const },
+      ],
+      // Simulates the corrupt format produced before the resume fix.
+      completedTaskIndices: [0, 1, 2, 3],
+      phase: "failed" as const,
+    };
+
+    assert.deepEqual([...resolveTasksToSkipOnResume(checkpoint)].sort((a, b) => a - b), [1, 3]);
+    assert.deepEqual([...resolveTasksToSkipOnResume(checkpoint, 0)].sort((a, b) => a - b), []);
+    assert.deepEqual([...resolveTasksToSkipOnResume(checkpoint, 2)].sort((a, b) => a - b), [0, 1]);
+  });
+
+  it("rebuilding resume state never records failed work as completed", () => {
+    const failedResult = {
+      title: "Broken task",
+      description: "fails",
+      executionCode: 1,
+      reviewCode: -1,
+      status: "failed" as const,
+      unresolvedItems: ["Missing worker credentials"],
+    };
+    const failedState = rebuildStateBufferFromTaskResults("state-test", [failedResult]);
+    assert.deepEqual(failedState.keyDecisions, []);
+    assert.deepEqual(failedState.unresolvedItems, ["Missing worker credentials"]);
+
+    const recoveredState = rebuildStateBufferFromTaskResults("state-test", [{
+      ...failedResult,
+      executionCode: 0,
+      reviewCode: 0,
+      status: "completed" as const,
+      unresolvedItems: [],
+    }]);
+    assert.deepEqual(recoveredState.keyDecisions, ["Broken task: completed"]);
+    assert.deepEqual(recoveredState.unresolvedItems, []);
   });
 
   it("restores compact after-all executions at their task indices", () => {

@@ -77,13 +77,16 @@ export function mergeTaskResultIntoStateBuffer(
   structuredReport?: SubagentStructuredReport | null
 ): WorkflowRunStateBuffer {
   const next = { ...buffer, filesTouched: [...buffer.filesTouched], keyDecisions: [...buffer.keyDecisions], unresolvedItems: [...buffer.unresolvedItems] };
+  const succeeded =
+    taskResult.status === "completed" ||
+    taskResult.status === "completed_with_warnings";
 
   if (structuredReport?.filesChanged?.length) {
     appendUnique(next.filesTouched, structuredReport.filesChanged, 40);
   }
-  if (structuredReport?.summary?.trim()) {
+  if (succeeded && structuredReport?.summary?.trim()) {
     appendUnique(next.keyDecisions, [`${taskResult.title}: ${structuredReport.summary.trim()}`], 20);
-  } else if (taskResult.title) {
+  } else if (succeeded && taskResult.title) {
     appendUnique(next.keyDecisions, [`${taskResult.title}: completed`], 20);
   }
   if (structuredReport?.unresolvedItems?.length) {
@@ -93,6 +96,23 @@ export function mergeTaskResultIntoStateBuffer(
   }
 
   return next;
+}
+
+/** Rebuild derived state after a task result is replaced during retry/resume. */
+export function rebuildStateBufferFromTaskResults(
+  runId: string,
+  taskResults: readonly (TaskResult | undefined)[]
+): WorkflowRunStateBuffer {
+  let buffer = emptyStateBuffer(runId);
+  for (const result of taskResults) {
+    if (!result) continue;
+    buffer = mergeTaskResultIntoStateBuffer(
+      buffer,
+      result,
+      result.structuredReport
+    );
+  }
+  return buffer;
 }
 
 const MAX_STATE_BUFFER_PROMPT_CHARS = 2000;

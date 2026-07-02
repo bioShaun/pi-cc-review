@@ -1,66 +1,96 @@
 {
   "schema": "sprint-contract-v1",
   "story": {
-    "title": "Capture the effective worker model and show it in the summary",
-    "description": "Extend the subagent execution result with optional model information. Use the configured worker model from frontmatter/settings, update it from Pi JSON events when available, display it in the summary report, and ensure missing metadata remains non-fatal."
+    "title": "Inventory remaining weakness candidates",
+    "description": "Audit the CC Review plugin at the working-tree revision pinned by baseline-note.md and produce candidate-inventory.md. The deliverable is a candidate table that covers seven scope areas — planning, concurrent workspace mutation, subagent context continuity, structured result enforcement, review integrity, recovery, and UI observability — with each row scored under weakness-ranking-rubric.md and confirmed against current code."
   },
   "project_file_index": [
-    {
-      "path": ".pi/extensions/cc-review.ts",
-      "role": "Extension entry point containing registered slash commands, tools, and orchestration logic."
-    },
-    {
-      "path": "tests/cc-review-behavior.test.ts",
-      "role": "Behavioral integration test suite."
-    }
+    { "path": "candidate-inventory.md", "role": "Deliverable: the candidate table." },
+    { "path": "baseline-note.md", "role": "Pinned revision + list of already-resolved issues to exclude." },
+    { "path": "weakness-ranking-rubric.md", "role": "Scoring rubric (five dimensions, weighted aggregation, evidence policy)." },
+    { "path": "docs/cc-review-round2-remediation-summary.md", "role": "Closed R1–R8; ineligible for renomination." },
+    { "path": ".pi/extensions/cc-review/workflow/orchestrator/execution-phase.ts", "role": "Concurrent subagent execution (CAND-01)." },
+    { "path": ".pi/extensions/cc-review/workflow/orchestrator/review-phase.ts", "role": "Batch review + stale rerun validation (CAND-04)." },
+    { "path": ".pi/extensions/cc-review/workflow/orchestrator/planning-phase.ts", "role": "Planning entrypoint (CAND-06)." },
+    { "path": ".pi/extensions/cc-review/workflow/session-continuity.ts", "role": "Session continuity default (CAND-02)." },
+    { "path": ".pi/extensions/cc-review/workflow/structured-output.ts", "role": "Strict structured output default (CAND-03)." },
+    { "path": ".pi/extensions/cc-review/workflow/dependencies.ts", "role": "validatePlannerTasks (CAND-06)." },
+    { "path": ".pi/extensions/cc-review/structured.ts", "role": "snapshotWorkspace + parseSubagentStructuredReport (CAND-03, CAND-05)." },
+    { "path": ".pi/extensions/cc-review/workflow/validation.ts", "role": "Text-heuristic bypass path (CAND-03)." },
+    { "path": ".pi/extensions/cc-review/config.ts", "role": "Widget defaults (CAND-08)." },
+    { "path": "tests/cc-review-behavior.test.ts", "role": "Existing coverage cited per row." }
   ],
   "definition_of_done": [
     {
       "id": "DOD-1",
-      "description": "Verify model capture from configured frontmatter and settings.",
+      "description": "candidate-inventory.md exists at repo root and declares its purpose, pins the same revision as baseline-note.md, and cites weakness-ranking-rubric.md.",
       "edge_cases": [
-        "Uses frontmatter model by default",
-        "Settings override takes precedence"
+        "File present at repo root.",
+        "References baseline-note.md and weakness-ranking-rubric.md by path.",
+        "Cites the HEAD commit 05a5fa3a1ecc76f19ef392e8c0c899a5ddf54c8c."
       ],
-      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
-      "timeout_ms": 60000
+      "verify_command": "test -f candidate-inventory.md && grep -q 'baseline-note.md' candidate-inventory.md && grep -q 'weakness-ranking-rubric.md' candidate-inventory.md && grep -q '05a5fa3a1ecc76f19ef392e8c0c899a5ddf54c8c' candidate-inventory.md",
+      "timeout_ms": 10000
     },
     {
       "id": "DOD-2",
-      "description": "Verify model update from runtime Pi JSON events (like model_select and message events).",
+      "description": "The inventory covers every one of the seven required scope areas by name: planning, concurrent workspace mutation, subagent context continuity, structured result enforcement, review integrity, recovery, UI observability.",
       "edge_cases": [
-        "Actual model updates from model_select JSON event",
-        "Actual model updates from message start/update/end JSON events"
+        "Each scope area appears as a labelled candidate (e.g., 'scope: concurrent workspace mutation').",
+        "None of the seven is missing."
       ],
-      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
-      "timeout_ms": 60000
+      "verify_command": "for s in 'planning' 'concurrent workspace mutation' 'subagent context continuity' 'structured result enforcement' 'review integrity' 'recovery' 'UI observability'; do grep -qi \"$s\" candidate-inventory.md || { echo \"missing scope: $s\" >&2; exit 1; }; done",
+      "timeout_ms": 10000
     },
     {
       "id": "DOD-3",
-      "description": "Verify missing model metadata is non-fatal and falls back gracefully.",
+      "description": "At least six candidate rows (CAND-01 … CAND-0N) are present, each with the mandatory rubric fields: source_evidence, user_impact, likelihood, recoverability, safety, reach, overall, high_impact, existing test coverage note, and exclusion_check.",
       "edge_cases": [
-        "Subagents execute successfully without any model metadata"
+        "At least 6 rows CAND-01..CAND-0N.",
+        "Every row includes: source_evidence, user_impact, likelihood, recoverability, safety, reach, overall, high_impact, coverage, exclusion_check."
       ],
-      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
-      "timeout_ms": 60000
+      "verify_command": "python3 -c \"import re,sys; t=open('candidate-inventory.md').read(); rows=re.findall(r'###\\s+CAND-\\d+:', t); assert len(rows)>=6, f'only {len(rows)} candidates'; required=['source_evidence','user_impact','likelihood','recoverability','safety','reach','overall','high_impact','coverage','exclusion_check']; import re as r2; sections=r2.split(r'(?=###\\s+CAND-\\d+:)', t)[1:]; missing=[]\n\nfor sec in sections:\n    for k in required:\n        if not r2.search(r'(?im)^\\s*[-*]?\\s*'+k+r'\\s*:', sec): missing.append((sec.splitlines()[0], k))\nif missing:\n    for m in missing: print('missing', m, file=sys.stderr)\n    sys.exit(1)\"",
+      "timeout_ms": 15000
     },
     {
       "id": "DOD-4",
-      "description": "Verify used subagent models are rendered under tasks in summary report.",
+      "description": "Every candidate's source_evidence names a file that exists in the current tree.",
       "edge_cases": [
-        "Each task lists its used subagent model if available in summary report"
+        "source_evidence uses a repo-relative path.",
+        "Every cited path resolves to an existing file."
       ],
-      "verify_command": "node --experimental-strip-types --test tests/cc-review-behavior.test.ts",
-      "timeout_ms": 60000
+      "verify_command": "python3 -c \"import re,os,sys; t=open('candidate-inventory.md').read(); paths=re.findall(r'source_evidence:\\s*`?([A-Za-z0-9_./-]+\\.(?:ts|mjs|md|js|json))`?', t); assert paths, 'no source_evidence paths found'; missing=[p for p in paths if not os.path.exists(p)]\nif missing:\n    for p in missing: print('missing file:', p, file=sys.stderr)\n    sys.exit(1)\"",
+      "timeout_ms": 10000
     },
     {
       "id": "DOD-5",
-      "description": "Verify strict type-checking compiles with zero diagnostics.",
+      "description": "No candidate re-nominates a resolved R1–R8 issue; the exclusion_check line asserts that on every row.",
       "edge_cases": [
-        "TS files compile cleanly with tsc"
+        "Every candidate has an exclusion_check line stating 'not in {R1..R8}' (or equivalent).",
+        "No candidate title contains 'checkpoint for resume', 'display-state derivation', 'cooperative batch cancellation', 'planner output structural validation', 'de-duplicated execution branches', 'WorkflowRuntime class conversion', 'hasCompletedReview rename', 'first-class batch review result' (the R1–R8 titles)."
       ],
-      "verify_command": "../adversarial/node_modules/.bin/tsc --noEmit --target es2022 --moduleResolution bundler --allowImportingTsExtensions --typeRoots ../adversarial/node_modules/@types --types node --strict true .pi/extensions/cc-review.ts",
-      "timeout_ms": 60000
+      "verify_command": "python3 -c \"import re,sys; t=open('candidate-inventory.md').read(); sections=re.split(r'(?=###\\s+CAND-\\d+:)', t)[1:]; missing=[s.splitlines()[0] for s in sections if not re.search(r'(?im)^\\s*[-*]?\\s*exclusion_check\\s*:.*R1.*R8', s)]\nif missing:\n    for m in missing: print('missing R1..R8 exclusion on:', m, file=sys.stderr)\n    sys.exit(1)\nforbidden=['checkpoint for resume','display-state derivation','cooperative batch cancellation','planner output structural','de-duplicated execution branches','WorkflowRuntime class conversion','hasCompletedReview','first-class batch review result']\nviolations=[]\nfor s in sections:\n    title=s.splitlines()[0].lower()\n    for f in forbidden:\n        if f.lower() in title: violations.append((title,f))\nif violations:\n    for v in violations: print('renominates resolved item:', v, file=sys.stderr)\n    sys.exit(1)\"",
+      "timeout_ms": 10000
+    },
+    {
+      "id": "DOD-6",
+      "description": "The overall score of each candidate matches the rubric formula (3·safety + 3·impact + 2·likelihood + 2·recoverability + 1·reach) computed from the row's own per-dimension integers.",
+      "edge_cases": [
+        "Every row's stated `overall: <n>/33` equals the recomputed weighted sum.",
+        "high_impact is 'yes' iff overall >= 18 or safety == 3."
+      ],
+      "verify_command": "python3 -c \"import re,sys; t=open('candidate-inventory.md').read(); sections=re.split(r'(?=###\\s+CAND-\\d+:)', t)[1:]; errors=[]\n\ndef find(sec,key):\n    m=re.search(r'(?im)^\\s*[-*]?\\s*'+key+r'\\s*:\\s*(\\d+)', sec)\n    return int(m.group(1)) if m else None\nfor sec in sections:\n    title=sec.splitlines()[0]\n    ui=find(sec,'user_impact'); lk=find(sec,'likelihood'); rc=find(sec,'recoverability'); sf=find(sec,'safety'); rh=find(sec,'reach')\n    if None in (ui,lk,rc,sf,rh): errors.append((title,'missing dim')); continue\n    expected=3*sf+3*ui+2*lk+2*rc+1*rh\n    m=re.search(r'(?im)^\\s*[-*]?\\s*overall\\s*:\\s*(\\d+)\\s*/\\s*33', sec)\n    if not m or int(m.group(1))!=expected: errors.append((title,f'overall {m and m.group(1)} != expected {expected}'))\n    hi=re.search(r'(?im)^\\s*[-*]?\\s*high_impact\\s*:\\s*(yes|no)', sec)\n    if not hi: errors.append((title,'missing high_impact'))\n    else:\n        want='yes' if (expected>=18 or sf==3) else 'no'\n        if hi.group(1).lower()!=want: errors.append((title,f'high_impact {hi.group(1)} != {want}'))\nif errors:\n    for e in errors: print('score error:', e, file=sys.stderr)\n    sys.exit(1)\"",
+      "timeout_ms": 10000
+    },
+    {
+      "id": "DOD-7",
+      "description": "Every candidate names at least one existing regression test (file plus test label) OR states 'no direct coverage' with a rationale in its coverage line.",
+      "edge_cases": [
+        "coverage line either contains a tests/… path with a test label, or explicitly says 'no direct coverage'.",
+        "When a tests/… path is cited, that file exists."
+      ],
+      "verify_command": "python3 -c \"import re,os,sys; t=open('candidate-inventory.md').read(); sections=re.split(r'(?=###\\s+CAND-\\d+:)', t)[1:]; errors=[]\n\nfor sec in sections:\n    title=sec.splitlines()[0]\n    m=re.search(r'(?im)^\\s*[-*]?\\s*coverage\\s*:\\s*(.*)$', sec)\n    if not m: errors.append((title,'no coverage line')); continue\n    line=m.group(1)\n    if 'no direct coverage' in line.lower(): continue\n    paths=re.findall(r'tests/[A-Za-z0-9_./-]+\\.(?:ts|mjs)', line)\n    if not paths: errors.append((title,'coverage cites neither test file nor no-direct-coverage')); continue\n    for p in paths:\n        if not os.path.exists(p): errors.append((title,f'test file missing: {p}'))\nif errors:\n    for e in errors: print('coverage error:', e, file=sys.stderr)\n    sys.exit(1)\"",
+      "timeout_ms": 10000
     }
   ]
 }

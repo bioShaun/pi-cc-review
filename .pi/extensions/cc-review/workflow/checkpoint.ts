@@ -19,7 +19,7 @@ export interface WorkflowCheckpoint {
   reviewMode: string;
   tasks: Task[];
   taskResults: TaskResult[];
-  /** 0-based indices of tasks that finished execution (any terminal status). */
+  /** 0-based indices of tasks whose successful result can be reused on resume. */
   completedTaskIndices: number[];
   /** Last phase reached before interruption. */
   phase: "planning" | "executing" | "reviewing" | "complete" | "failed" | "cancelled";
@@ -108,32 +108,38 @@ export function listResumableRunIds(cwd: string): string[] {
   return runIds.sort();
 }
 
-export function isTaskTerminalForResume(status: TaskStatus | undefined): boolean {
-  if (!status) return false;
-  return (
-    status === "completed" ||
-    status === "completed_with_warnings" ||
-    status === "failed" ||
-    status === "validation_failed" ||
-    status === "review_blocked" ||
-    status === "cancelled"
-  );
+export function isTaskReusableOnResume(status: TaskStatus | undefined): boolean {
+  return status === "completed" || status === "completed_with_warnings";
 }
 
-/** Tasks to skip when resuming: completed indices plus any with a terminal artifact result. */
+/** Tasks to skip when resuming: only successful results are reusable. */
 export function resolveTasksToSkipOnResume(
   checkpoint: WorkflowCheckpoint,
   fromTask?: number
 ): Set<number> {
-  const skip = new Set<number>(checkpoint.completedTaskIndices);
-  for (let i = 0; i < checkpoint.taskResults.length; i++) {
-    if (isTaskTerminalForResume(checkpoint.taskResults[i]?.status)) {
-      skip.add(i);
+  const skip = new Set<number>();
+
+  // Preserve compatibility with old checkpoints that only recorded completion
+  // indices, but let an explicit task result override a corrupt legacy index.
+  for (const index of checkpoint.completedTaskIndices) {
+    if (checkpoint.taskResults[index]?.status === undefined) {
+      skip.add(index);
     }
   }
-  if (fromTask !== undefined && Number.isInteger(fromTask) && fromTask >= 0) {
-    for (let i = 0; i < fromTask; i++) {
+  for (let i = 0; i < checkpoint.taskResults.length; i++) {
+    if (isTaskReusableOnResume(checkpoint.taskResults[i]?.status)) {
       skip.add(i);
+    } else if (checkpoint.taskResults[i]?.status !== undefined) {
+      skip.delete(i);
+    }
+  }
+
+  // --from-task is an explicit override: tasks before it are skipped and every
+  // task from that index onward is rerun, even if an old checkpoint says done.
+  if (fromTask !== undefined && Number.isInteger(fromTask) && fromTask >= 0) {
+    for (let i = 0; i < checkpoint.tasks.length; i++) {
+      if (i < fromTask) skip.add(i);
+      else skip.delete(i);
     }
   }
   return skip;

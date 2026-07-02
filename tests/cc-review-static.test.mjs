@@ -568,13 +568,11 @@ test("widget UI helpers export colored lines, adaptive width, and status progres
   assert.match(source, /export function truncateWidgetLine\(/);
   assert.match(source, /export function formatCcReviewSummaryHeadline\(/);
   assert.match(source, /export function countCcReviewTaskOutcomesFromSummary\(/);
-  assert.match(source, /ctx\.ui\.setWidget\("cc-review-widget"/);
+  assert.match(source, /ctx\?\.ui\?\.setWidget\?\./);
   assert.match(source, /buildCcReviewStatusText\(/);
-  // Widget render callback wiring is verified behaviorally by
-  // cc-review-behavior.test.ts which captures widget snapshots at various
-  // widths. Source-grep lock on the render callback shape removed so widget
-  // state shape can change with the state machine (candidate #1).
-  assert.match(source, /buildCcReviewWidgetLines\(/);
+  assert.match(source, /renderCompactWidget\(/);
+  // Legacy widget renderer remains exported for compatibility tests.
+  assert.match(source, /export function buildCcReviewWidgetLines\(/);
 });
 
 test("preview helper is wired into the widget goal and task title path", () => {

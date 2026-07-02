@@ -699,27 +699,22 @@ export async function runExecutionPhase(rt: WorkflowRuntime): Promise<void> {
       }
 
       if (executionError) {
-        const isCancelled =
-          rt.signal?.aborted ||
-          executionError.message?.includes("aborted") ||
-          executionError.message?.includes("timeout") ||
-          executionError.message?.includes("cancel");
-
-        // Fill remaining/unexecuted slots to prevent crash in downstream report/UI code
+        // Fill remaining slots without claiming that tasks which never ran
+        // failed. Started siblings were cancelled; untouched tasks were skipped.
         for (let idx = 0; idx < rt.tasks.length; idx++) {
           if (!rt.taskResults[idx]) {
             const wasStarted = rt.taskStatuses[idx] !== undefined;
-            if (wasStarted || !isCancelled) {
-              rt.taskResults[idx] = {
-                title: rt.tasks[idx].title,
-                description: rt.tasks[idx].description,
-                executionCode: -1,
-                reviewCode: -1,
-                output: "",
-                status: isCancelled ? "cancelled" : "failed",
-                ...rt.buildTaskResultModelState(idx, { configuredModel: rt.resolvedWorkerModel }),
-              };
-            }
+            const status: TaskStatus = wasStarted ? "cancelled" : "skipped";
+            rt.taskStatuses[idx] = status;
+            rt.taskResults[idx] = {
+              title: rt.tasks[idx].title,
+              description: rt.tasks[idx].description,
+              executionCode: -1,
+              reviewCode: -1,
+              output: "",
+              status,
+              ...rt.buildTaskResultModelState(idx, { configuredModel: rt.resolvedWorkerModel }),
+            };
           }
         }
         throw executionError;

@@ -38,6 +38,14 @@ import {
   renderCompactWidget,
 } from "../.pi/extensions/cc-review/workflow/ui/compact-widget.ts";
 import { measureVisibleWidth } from "../.pi/extensions/cc-review/workflow/ui.ts";
+import {
+  buildRuntimeUiSnapshot,
+  type WorkflowUiSource,
+} from "../.pi/extensions/cc-review/workflow/ui/runtime-snapshot.ts";
+import {
+  createCcReviewUiController,
+} from "../.pi/extensions/cc-review/workflow/ui/controller.ts";
+import { emptyFindingsRollup } from "../.pi/extensions/cc-review/structured.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -601,5 +609,192 @@ describe("Compact widget renderer (Spec2 Phase 1)", () => {
     const runningLine = result.lines.find((l) => l.includes("Reviewing"));
     assert.ok(runningLine);
     assert.ok(runningLine!.includes("sonnet"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime snapshot builder tests (Spec2 Phase 1)
+// ---------------------------------------------------------------------------
+
+function makeWorkflowUiSource(overrides: Partial<WorkflowUiSource> = {}): WorkflowUiSource {
+  return {
+    workflowRunId: "run-abc",
+    goal: "Ship parser fix",
+    displayState: "executing",
+    currentPhase: "Executing Task 2/3: Review parser changes",
+    checkpointCreatedAt: "2026-07-01T12:00:00.000Z",
+    currentTaskIndex: 1,
+    tasks: [
+      { title: "Plan", description: "Plan work", acceptanceCriteria: "Plan done" },
+      { title: "Review parser changes", description: "Review", acceptanceCriteria: "Reviewed" },
+      { title: "Add tests", description: "Tests", acceptanceCriteria: "Tests pass" },
+    ],
+    taskStatuses: ["completed", "running", "pending"],
+    taskModels: [
+      { configured: "anthropic/sonnet", effective: "anthropic/sonnet" },
+      { configured: "anthropic/sonnet", effective: "anthropic/sonnet" },
+      { configured: "anthropic/sonnet" },
+    ],
+    batchTaskExecutions: [
+      {
+        taskIndex: 1,
+        startedAt: "2026-07-01T12:01:00.000Z",
+        task: { title: "Review parser changes", description: "Review", acceptanceCriteria: "Reviewed" },
+        subagentResult: { code: 0 },
+        subagentOutputText: "",
+        cachedSubagentResult: {},
+        structuredReport: null,
+        schemaParseStatus: "absent",
+        result: {
+          title: "Review parser changes",
+          description: "Review",
+          executionCode: 0,
+          reviewCode: 0,
+          status: "running",
+        },
+      },
+    ],
+    taskResults: [],
+    collectedTaskFindings: [
+      [
+        {
+          priority: "P1",
+          confidence: 0.9,
+          file: "src/parser.ts",
+          line: 42,
+          message: "Missing null check",
+          status: "unfixed",
+        },
+      ],
+    ],
+    findingsRollup: { ...emptyFindingsRollup(), unfixedP1: 1 },
+    liveLogs: [
+      {
+        id: "log-1",
+        timestamp: "2026-07-01T12:00:01.000Z",
+        severity: "info",
+        source: "planner",
+        pluginId: "cc-review",
+        message: "Planning workflow",
+        sequence: 1,
+      },
+      {
+        id: "log-2",
+        timestamp: "2026-07-01T12:00:02.000Z",
+        severity: "warning",
+        source: "reviewer",
+        pluginId: "cc-review",
+        message: "Validation command failed",
+        sequence: 2,
+      },
+    ],
+    persistedLogPath: "/tmp/workflow-logs.jsonl",
+    artifactRunDir: "/tmp/artifacts/run-abc",
+    ...overrides,
+  };
+}
+
+describe("Runtime UI snapshot builder (Spec2 Phase 1)", () => {
+  it("maps workflow fields into a compact-widget snapshot", () => {
+    const snapshot = buildRuntimeUiSnapshot(makeWorkflowUiSource());
+    assert.equal(snapshot.runId, "run-abc");
+    assert.equal(snapshot.goal, "Ship parser fix");
+    assert.equal(snapshot.tasks.length, 3);
+    assert.equal(snapshot.tasks[1]!.status, "running");
+    assert.equal(snapshot.tasks[1]!.startedAt, "2026-07-01T12:01:00.000Z");
+    assert.equal(snapshot.findings.length, 1);
+    assert.equal(snapshot.findings[0]!.priority, "P1");
+    assert.equal(snapshot.persistedLogPath, "/tmp/workflow-logs.jsonl");
+    assert.equal(snapshot.artifactRunDir, "/tmp/artifacts/run-abc");
+    assert.equal(snapshot.logs.length, 2);
+  });
+
+  it("stable finding ids survive snapshot rebuilds", () => {
+    const source = makeWorkflowUiSource();
+    const first = buildRuntimeUiSnapshot(source);
+    const second = buildRuntimeUiSnapshot(source);
+    assert.equal(first.findings[0]!.id, second.findings[0]!.id);
+  });
+});
+
+describe("Compact widget controller (Spec2 Phase 1)", () => {
+  const plainTheme = { fg: (_color: string, text: string) => text };
+
+  it("registers the widget once and updates via requestRender", () => {
+    let setWidgetCalls = 0;
+    let renderCount = 0;
+    let requestRenderCount = 0;
+    const ctx = {
+      ui: {
+        theme: plainTheme,
+        setWidget: (_id: string, content: unknown) => {
+          setWidgetCalls++;
+          const component =
+            typeof content === "function" ? (content as Function)({}, plainTheme) : content;
+          if (component && typeof component === "object" && "render" in component) {
+            renderCount += (component as { render: (w: number) => string[] }).render(80).length;
+          }
+        },
+        requestRender: () => {
+          requestRenderCount++;
+        },
+      },
+    };
+
+    const controller = createCcReviewUiController(ctx);
+    const snapshot1 = makeSnapshot({ displayState: "planning", phase: "Planning" });
+    const snapshot2 = makeSnapshot({
+      displayState: "executing",
+      tasks: [
+        makeTask(0, { status: "running", title: "Execute", activeForm: "Executing…" }),
+      ],
+      currentTaskIndex: 0,
+    });
+
+    controller.mount(snapshot1);
+    controller.update(snapshot2);
+
+    assert.equal(setWidgetCalls, 1, "widget should mount exactly once");
+    assert.ok(renderCount > 0, "mounted widget should render lines");
+    assert.ok(requestRenderCount >= 1, "updates should request a re-render");
+
+    controller.dispose();
+  });
+
+  it("renders compact widget lines without live-log tail", () => {
+    const rendered: string[][] = [];
+    const ctx = {
+      ui: {
+        theme: plainTheme,
+        setWidget: (_id: string, content: unknown) => {
+          const component =
+            typeof content === "function" ? (content as Function)({}, plainTheme) : content;
+          if (component && typeof component === "object" && "render" in component) {
+            rendered.push((component as { render: (w: number) => string[] }).render(80));
+          }
+        },
+      },
+    };
+
+    const controller = createCcReviewUiController(ctx);
+    controller.mount(
+      makeSnapshot({
+        logs: Array.from({ length: 10 }, (_, index) => ({
+          id: `log-${index}`,
+          timestamp: "2026-07-01T12:00:00.000Z",
+          severity: "info" as const,
+          source: "cc-review",
+          pluginId: "cc-review",
+          message: `Info line ${index}`,
+          sequence: index,
+        })),
+      }),
+    );
+
+    const text = rendered.flat().join("\n");
+    assert.doesNotMatch(text, /Live Logs:/);
+    assert.doesNotMatch(text, /Info line 0/);
+    assert.match(text, /● CC Review/);
+    controller.dispose();
   });
 });

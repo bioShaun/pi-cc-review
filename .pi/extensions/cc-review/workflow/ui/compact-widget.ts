@@ -106,8 +106,9 @@ function formatTaskLine(task: TaskUiRecord, width: number, spinnerFrame?: string
   let suffix = "";
   if (task.status === "running") {
     const parts: string[] = [];
-    if (task.effectiveModel) {
-      const modelShort = task.effectiveModel.split("/").pop() ?? task.effectiveModel;
+    const model = task.effectiveModel ?? task.configuredModel;
+    if (model) {
+      const modelShort = model.split("/").pop() ?? model;
       parts.push(modelShort);
     }
     const duration = formatDuration(task.startedAt);

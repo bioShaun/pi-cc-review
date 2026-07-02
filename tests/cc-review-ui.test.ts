@@ -165,6 +165,16 @@ describe("CC Review UI Regression Tests", () => {
       const text = buildCcReviewStatusText(state);
       assert.match(text, /Timeout/);
     });
+
+    it("appends highest unresolved finding severity when provided", () => {
+      const text = buildCcReviewStatusText({
+        tasks: [{}, {}],
+        currentTaskIndex: 1,
+        displayState: "reviewing",
+        highestUnresolvedSeverity: "P1",
+      });
+      assert.match(text, /P1$/);
+    });
   });
 
   // 1b. Status Bar Color Mapping Tests (getStatusColorForDisplayState)

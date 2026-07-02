@@ -1,9 +1,35 @@
 # pi-cc-review UI 优化实施 Spec
 
-Status: Proposed  
+Status: In Progress  
 Date: 2026-07-01  
+Last updated: 2026-07-02  
 Source: `docs/pi-cc-review-ui-optimization.md`  
 Target: `.pi/extensions/cc-review/`
+
+## 0. 实施进度
+
+| Phase | 状态 | 说明 |
+|---|---|---|
+| Phase 0 — 运行时能力确认和适配层 | **已完成** | `workflow/ui/model.ts`、`selectors.ts`、`pi-adapter.ts`；能力探测与 `/cc-review-details` fallback |
+| Phase 1 — Compact Widget 重构 | **已完成** | Runtime 接入 `buildRuntimeUiSnapshot` + `CcReviewUiController` + `renderCompactWidget`；旧 `buildCcReviewWidgetLines` 保留兼容 |
+| Phase 2 — Overlay MVP | 未开始 | — |
+| Phase 3 — Reviewer / Validation / Attempt 数据补全 | 未开始 | — |
+| Phase 4 — 视觉和可用性收尾 | 未开始 | — |
+
+**Phase 1 已落地文件：**
+
+- `workflow/ui/runtime-snapshot.ts` — 从 workflow runtime 字段构建 `CcReviewUiSnapshot`
+- `workflow/ui/controller.ts` — 单次 `setWidget` 注册、`requestRender` 更新、running spinner timer、`dispose` 清理
+- `workflow/orchestrator/runtime.ts` — `refreshWorkflowUi()` 改走 controller；Status Bar 附加最高未解决 Finding 级别
+- `workflow/ui/compact-widget.ts` — Header / 任务窗口 / Findings 汇总 / 最新异常 / Footer 纯渲染
+- `tests/cc-review-ui-v2.test.ts` — snapshot、selector、controller、40/80/120 列渲染
+- `tests/cc-review-behavior.test.ts` — runtime 单次 mount、`requestRender` 刷新、无 live-log tail 行为
+
+**已知遗留：**
+
+- `CC_REVIEW_UI_V2` 灰度开关未实现；Compact Widget 新路径已作为默认主路径启用。
+- Phase 2 Overlay、`/cc-review-details` 打开详情、Help Overlay 与动态 Footer 尚未接入。
+- `tests/cc-review-behavior.test.ts` 中 `includes a completed forward dependency in the dependent task handoff` 仍失败（`dependsOn` / after-all handoff，与 UI 无关）。
 
 ## 1. 目标
 
@@ -40,9 +66,18 @@ Review Detail Overlay（任务、Findings、日志和尝试记录）
   - 状态色、任务图标、CJK/ANSI 可见宽度处理。
   - 任务窗口、Findings rollup、日志过滤、日志持久化路径。
   - 40/80/120 列回归测试。
+  - `buildCcReviewStatusText` 支持附加最高未解决 Finding 严重级别。
+- `workflow/ui/`（Phase 0–1）
+  - `model.ts` — `CcReviewUiSnapshot`、`TaskUiRecord`、`FindingUiRecord`、`buildUiSnapshot`
+  - `selectors.ts` — Finding 排序/分组、最新 exception log、最高未解决 severity
+  - `compact-widget.ts` — `renderCompactWidget` 纯渲染（无 live-log tail）
+  - `runtime-snapshot.ts` — `buildRuntimeUiSnapshot` 从 orchestrator 状态映射 snapshot
+  - `controller.ts` — `createCcReviewUiController` 单次 mount + invalidate 更新
+  - `pi-adapter.ts` — Pi UI 能力探测与详情入口 fallback
 - `workflow/orchestrator/runtime.ts`
   - 工作流阶段、任务状态、模型、Findings、日志和 retry 状态。
-  - `refreshWorkflowUi()` 同步更新 Widget 与 Status Bar。
+  - `refreshWorkflowUi()` 通过 `CcReviewUiController.update(snapshot)` 同步 Compact Widget 与 Status Bar。
+  - `disposeWorkflowUi()` 在 workflow `finally` 释放 widget、status 与 spinner。
 - `structured.ts`
   - 结构化 `ReviewFinding`、`ReviewResult` 和 task artifact。
 - `workflow/register.ts`
@@ -50,13 +85,13 @@ Review Detail Overlay（任务、Findings、日志和尝试记录）
 
 ### 3.2 主要缺口
 
-- Widget 每次刷新均通过 `setWidget()` 重新注册，没有持久控制器、选择状态和焦点状态。
-- Widget 默认显示日志尾部，信息密度高，任务与 Findings 无法下钻。
-- `CcReviewWidgetState` 只有 Findings 汇总，没有传入完整 Findings。
-- 任务缺少 UI 专用的开始时间、结束时间、active form 和 attempt 历史。
-- 当前插件没有 Overlay 状态机、输入映射和焦点恢复逻辑。
-- 工作流 `finally` 会直接清除 Widget 和 Status Bar，详情界面需要安全关闭并释放订阅。
-- 当前 `ExtensionAPI` 本地类型未声明交互式 UI/shortcut 能力，需要兼容适配层。
+- ~~Widget 每次刷新均通过 `setWidget()` 重新注册~~（Phase 1 已改为 controller 单次注册 + `requestRender`）。
+- ~~Widget 默认显示日志尾部~~（Phase 1 Compact Widget 已移除默认 info/debug tail）。
+- ~~`CcReviewWidgetState` 只有 Findings 汇总，没有传入完整 Findings~~（snapshot 已携带完整 `findings[]`；Overlay 尚未消费）。
+- 任务缺少 UI 专用的结束时间、完整 attempt 历史（Phase 3）；`activeForm` 目前由 `toActiveForm(title)` 保守派生。
+- 当前插件没有 Overlay 状态机、输入映射和焦点恢复逻辑（Phase 2）。
+- 详情界面打开后需要安全关闭并释放订阅（Phase 2）；workflow `finally` 已调用 `disposeWorkflowUi()`。
+- `ExtensionAPI` 本地类型未完整声明交互式 UI/shortcut 能力；`pi-adapter.ts` 已做运行时探测与降级。
 
 ## 4. 产品决策
 
@@ -365,13 +400,15 @@ Overlay 获焦后使用以下按键：
 .pi/extensions/cc-review/workflow/ui/
 ├── model.ts              # Snapshot 和 OverlayState
 ├── selectors.ts          # 分组、排序、过滤、默认选择
+├── runtime-snapshot.ts   # Workflow runtime → CcReviewUiSnapshot（Phase 1）
 ├── compact-widget.ts     # Compact Widget 纯渲染
-├── overlay.ts            # Overlay 控制器和状态转换
-├── overlay-render.ts     # Responsive 页面渲染
-├── input.ts              # 按键映射
-├── log-reader.ts         # JSONL 分页读取
+├── controller.ts         # CcReviewUiController：mount/update/dispose（Phase 1）
+├── overlay.ts            # Overlay 控制器和状态转换（Phase 2，未实现）
+├── overlay-render.ts     # Responsive 页面渲染（Phase 2，未实现）
+├── input.ts              # 按键映射（Phase 2，未实现）
+├── log-reader.ts         # JSONL 分页读取（Phase 2，未实现）
 ├── pi-adapter.ts         # setWidget/custom/shortcut 能力适配
-└── width.ts              # 现有 ANSI/CJK 宽度工具
+└── width.ts              # 现有 ANSI/CJK 宽度工具（暂在 ui.ts re-export）
 ```
 
 迁移规则：
@@ -385,6 +422,8 @@ Overlay 获焦后使用以下按键：
 
 ### Phase 0：运行时能力确认和适配层
 
+**状态：已完成（2026-07-02）**
+
 任务：
 
 1. 确认目标 Pi 版本的 `ctx.ui.custom()`、interactive component、shortcut、focus 和 `requestRender()` 签名。
@@ -394,11 +433,13 @@ Overlay 获焦后使用以下按键：
 
 验收：
 
-- 不支持 shortcut 或 focusable Widget 的运行时仍可通过命令打开详情。
-- 能力缺失只降级入口，不导致 workflow 失败。
-- Widget 注册次数在单次 run 中为 1，dispose 时清理 1 次。
+- [x] 不支持 shortcut 或 focusable Widget 的运行时仍可通过命令打开详情（`pi-adapter.ts` + `registerDetailsCommand`）。
+- [x] 能力缺失只降级入口，不导致 workflow 失败。
+- [x] Widget 注册次数在单次 run 中为 1，dispose 时清理 1 次（`controller.ts` + behavior 测试覆盖）。
 
 ### Phase 1：Compact Widget 重构
+
+**状态：已完成（2026-07-02）**
 
 任务：
 
@@ -410,13 +451,17 @@ Overlay 获焦后使用以下按键：
 
 验收：
 
-- 默认 Widget 不再显示连续 Live Logs。
-- Error/Warning 存在时最多显示最新一条，Error 优先。
-- 40/80/120 列均无越界。
-- Snapshot 更新不重复注册 Widget。
-- 当前已有 UI 测试经更新后全部通过。
+- [x] 默认 Widget 不再显示连续 Live Logs。
+- [x] Error/Warning 存在时最多显示最新一条，Error 优先。
+- [x] 40/80/120 列均无越界（`tests/cc-review-ui-v2.test.ts`）。
+- [x] Snapshot 更新不重复注册 Widget（`tests/cc-review-behavior.test.ts` + `tests/cc-review-ui-v2.test.ts`）。
+- [x] 当前已有 UI 测试经更新后全部通过（`cc-review-ui.test.ts`、`cc-review-ui-v2.test.ts`、`cc-review-static.test.mjs`；`cc-review-behavior.test.ts` 339/340，1 项与 handoff 无关）。
+
+**说明：** 第 3 项中「`L` 或详情命令打开 Logs」依赖 Phase 2 Overlay；Compact Widget Footer 已展示占位提示，实际导航待 Overlay MVP。
 
 ### Phase 2：Overlay MVP
+
+**状态：未开始**
 
 任务：
 
@@ -510,16 +555,17 @@ Overlay 获焦后使用以下按键：
 npm run typecheck
 node tests/cc-review-static.test.mjs
 node --experimental-strip-types tests/cc-review-structured.test.ts
+node --experimental-strip-types tests/cc-review-ui-v2.test.ts
 node --experimental-strip-types tests/cc-review-ui.test.ts
 node --experimental-strip-types tests/cc-review-behavior.test.ts
 ```
 
 ## 14. 向后兼容与发布
 
-- 保留现有 `buildCcReviewWidgetLines`、宽度工具和相关 export，直至调用方迁移完成。
-- 新 UI 默认启用前提供 `CC_REVIEW_UI_V2=1` 灰度开关。
-- `CC_REVIEW_UI_V2=0` 使用现有 Widget；持久化日志和 artifacts 不受影响。
-- 新 UI 至少覆盖成功、warning、review blocked、failed、timeout、cancelled 六类真实 run 后再移除开关。
+- 保留现有 `buildCcReviewWidgetLines`、宽度工具和相关 export，直至调用方迁移完成（`tests/cc-review-ui.test.ts` 仍覆盖旧 renderer）。
+- ~~新 UI 默认启用前提供 `CC_REVIEW_UI_V2=1` 灰度开关。~~ **Phase 1 已将 Compact Widget 新路径作为默认主路径启用**；`CC_REVIEW_UI_V2` 开关尚未实现，后续若需回滚可补 `CC_REVIEW_UI_V2=0` → `buildCcReviewWidgetLines`。
+- 持久化日志和 artifacts 不受 Widget 渲染路径影响。
+- 新 UI 至少覆盖成功、warning、review blocked、failed、timeout、cancelled 六类真实 run 后再考虑移除旧 renderer。
 - 不修改现有 artifact schema 时，Overlay 仅做映射读取；需要新增持久字段时升级 schemaVersion 并提供旧版 reader。
 
 ## 15. 风险与处理
@@ -552,8 +598,8 @@ node --experimental-strip-types tests/cc-review-behavior.test.ts
 
 ## 17. 建议拆分的提交
 
-1. `refactor(ui): add snapshot model and pi capability adapter`
-2. `feat(ui): replace live-log widget with compact review widget`
+1. ~~`refactor(ui): add snapshot model and pi capability adapter`~~ ✅
+2. ~~`feat(ui): replace live-log widget with compact review widget`~~ ✅
 3. `feat(ui): add task findings and file detail overlay`
 4. `feat(ui): add paged logs and attempt navigation`
 5. `feat(ui): expose reviewer and validation details`

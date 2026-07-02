@@ -79,7 +79,7 @@ export const CcReviewParams = {
     },
     resumeRunId: {
       type: "string",
-      description: "Resume a prior workflow run by artifact run id. Skips tasks already recorded in the checkpoint; use fromTask to force a starting index.",
+      description: "Resume a prior workflow run by artifact run id. Skips only successfully completed tasks; failed, blocked, cancelled, and skipped tasks rerun. Use fromTask to force a starting index.",
     },
     fromTask: {
       type: "integer",
